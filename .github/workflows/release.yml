@@ -1,0 +1,58 @@
+# ------------------------------------------------------------------------------------
+#  Release (mixtape)
+#
+#  Builds and publishes a release when a v* tag is pushed. mixtape links Core
+#  Audio and other macOS frameworks through cgo, so the darwin/arm64 and
+#  darwin/amd64 binaries need the macOS SDK: this one job runs on a macOS
+#  runner, while GoFortress (lint, tests, security scans) runs on Linux for
+#  every push and pull request.
+#
+#  Release by pushing a tag:   git tag v0.1.0 && git push origin v0.1.0
+#  Or locally, from a Mac:     GITHUB_TOKEN=... goreleaser release --clean
+# ------------------------------------------------------------------------------------
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build and publish
+    runs-on: macos-15
+    timeout-minutes: 30
+    permissions:
+      contents: write # create the GitHub release and upload its assets
+    steps:
+      - name: Check out the tagged commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # goreleaser builds the changelog from history
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: 1.26.x # the latest patch of the Go line CI tests (GO_PRIMARY_VERSION)
+          cache: true
+
+      - name: Run the tests on macOS
+        run: go test -race -count=1 ./...
+
+      - name: Build and publish with GoReleaser
+        uses: goreleaser/goreleaser-action@a4f02ab5355a589de60d917a659ce617ed19b3de # v7.3.0
+        with:
+          distribution: goreleaser
+          version: v2.19.0
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SKIP_GORELEASER_TESTS: "true" # the step above ran them; magex is not installed here

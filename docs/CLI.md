@@ -55,11 +55,11 @@ failure, one error document. In text mode errors read
 | 0 | | Success: complete, or stopped on request |
 | 1 | `error` | General error (also: `verify` found problems) |
 | 2 | `usage` | Wrong command line: unknown flag or command, bad link, invalid setting |
-| 3 | `not_ready` | A prerequisite is missing: Spotify not running, crossfade on, capture not routed or silent |
+| 3 | `not_ready` | A prerequisite is missing: Spotify not running, crossfade on, capture not routed or silent, no sound reaching mixtape, songs not starting in Spotify |
 | 4 | `not_found` | A link Spotify does not know, or no session |
-| 5 | `permission` | macOS refused: Automation or audio-capture permission, unwritable folder, update refused |
+| 5 | `permission` | macOS refused: Automation or audio-capture permission, a library that cannot be written (also mid-session), update refused |
 | 6 | `busy` | Another recording session (or library writer) holds the lock |
-| 7 | `incomplete` | The session finished with songs not recorded (failed, unavailable, or idle timeout) |
+| 7 | `incomplete` | The session finished with songs not recorded (failed, unavailable, idle timeout, or songs failing in a row for mixed reasons) |
 | 124 | `timeout` | `wait --timeout` expired while the session is still running |
 | 130 | `interrupted` | Forced quit (a second Ctrl-C) |
 
@@ -76,7 +76,9 @@ tagged M4A per song. Links are `open.spotify.com` URLs (share links with
 `?si=` are fine, `/intl-xx/` paths too) or `spotify:track|album|playlist:`
 URIs. Track links go to `Singles` (or `--into`); each album and playlist gets
 its own folder. With no links, mixtape records whatever Spotify plays (live
-mode).
+mode). Liked Songs and the rest of your own library (`spotify:collection:…`),
+artists, podcasts and audiobooks are not supported (exit 2, with what to do
+instead).
 
 For each song the plan decides one action:
 
@@ -102,6 +104,7 @@ For each song the plan decides one action:
 | `--device NAME` | Capture device (substring) for `--capture device` |
 | `--mute` | Tap only: silence Spotify on the speakers while recording (volume raised to 100 meanwhile) |
 | `--idle-timeout D` | End after D with nothing to record (default 10m; 0 = never) |
+| `--max-failures N` | End after N songs in a row could not be recorded (default 3; 0 = never) |
 | `--allow-crossfade` | Record even though crossfade is on (songs will overlap) |
 
 **Before anything plays** mixtape checks that Spotify is installed and
@@ -111,8 +114,20 @@ When every song is already done, nothing plays and none of that is needed.
 
 **During the session** shuffle is turned off (and repeat on, to follow a
 long playlist), and restored at the end. Spotify is paused when the queue is
-done. Songs that were not captured start to finish are discarded and retried
-once. Keys on a terminal: `space` pause/resume, `n` skip the song (not
+done, and the Mac is kept from idle-sleeping until then (closing the lid
+still sleeps it). Songs that were not captured start to finish are discarded
+and retried once. A false start (Spotify jumping elsewhere before the song
+really began) is requested again without counting as an attempt.
+
+**When nothing can work** the session stops early instead of trying every
+song: after `--max-failures` songs (or attempts) in a row could not be
+recorded, it ends with `no_sound` causes (`songs keep playing without any
+sound reaching mixtape`: Spotify plays on another device or is muted;
+exit 3), `songs keep not starting in Spotify` (signed out or offline; exit
+3), or `the songs keep failing` (mixed causes; exit 7). A library that
+cannot take a file (an unplugged drive, a full disk) ends the session at
+once (exit 5), as does audio that cannot be buffered to disk (exit 1). Songs
+not saved stay pending for the next run. Keys on a terminal: `space` pause/resume, `n` skip the song (not
 retried), `q` quit; Ctrl-C quits after the current song is settled, a second
 Ctrl-C forces it. SIGTERM (what `mixtape stop` sends) is a graceful stop;
 SIGHUP and SIGPIPE are ignored.
@@ -190,8 +205,8 @@ mixtape status [--follow]
 ```
 
 Shows the running session, or the last one. `-o json` prints
-`{"running": bool, "stale": bool, "session": {...}}`, where `session` is
-`session.json`:
+`{"running": bool, "stale": true, "session": {...}}` (`stale` only when
+true), where `session` is `session.json`:
 
 ```json
 {
@@ -215,7 +230,9 @@ Shows the running session, or the last one. `-o json` prints
 
 `phase` is `starting`, `recording`, `paused`, `stopping` or `finished`; a
 finished session adds `result`, `exit_code`, `finished_at` and possibly
-`error`. `stale: true` means the session stopped without finishing (killed
+`error` (also when it failed or was stopped while still setting up). A
+`spotify` object records the Spotify settings the session changed and
+whether they were restored. `stale: true` means the session stopped without finishing (killed
 or crashed); the next `record` resumes it. `--follow` streams the event log
 until the session ends. No session at all exits 4.
 
@@ -237,9 +254,11 @@ mixtape stop [--no-wait]
 ```
 
 Sends SIGTERM to the process that holds the recorder lock (never to a bare
-PID), waits for it to exit (up to 2 minutes), and prints the summary. The
-song in progress is discarded, Spotify is paused and its settings restored.
-`--no-wait` returns once the signal is sent. Nothing running exits 4.
+PID), waits for it to exit (up to 2 minutes), and prints the summary (the
+`status` JSON). The song in progress is discarded, Spotify is paused and its
+settings restored. `--no-wait` returns once the signal is sent, with
+`{"stopping": true, "session_id", "pid"}`. A session that ended just before
+the signal is reported as it finished. Nothing running exits 4.
 
 <br>
 
@@ -266,8 +285,8 @@ mixtape verify [--fix [--force]]
 
 Checks every done song: the file exists, its tags name the right track, its
 audio hash matches the manifest. Finds files that moved (by hash) and files
-no manifest mentions (orphans). Exits 1 when problems other than orphans
-remain.
+no manifest mentions (orphans). Exits 1 when problems remain; orphans alone
+are reported but do not fail it.
 
 `--fix` re-points files moved within their folder, sets missing or damaged
 songs back to pending (the next `record` records them), refreshes stale
@@ -340,10 +359,14 @@ and reported as warnings.
 | `device` | `MIXTAPE_DEVICE` | `BlackHole` | Capture device name (substring) |
 | `artwork` | `MIXTAPE_ARTWORK` | `false` | Embed album artwork |
 | `idle_timeout` | `MIXTAPE_IDLE_TIMEOUT` | `10m0s` | End a session after this long with nothing to record |
+| `max_failures` | `MIXTAPE_MAX_FAILURES` | `3` | End a session after this many songs in a row could not be recorded (0 = never) |
 
 Other environment variables: `MIXTAPE_HOME`, `MIXTAPE_OUTPUT`, `NO_COLOR`,
-`MIXTAPE_GITHUB_TOKEN` (for `update` while the repository is private),
-`MIXTAPE_NO_UPDATE_CHECK=1` (no passive update notice).
+`MIXTAPE_GITHUB_TOKEN` (a GitHub token for `update`, which otherwise uses a
+signed-in `gh` or no authentication), `MIXTAPE_NO_UPDATE_CHECK=1` (no
+passive update notice; `NO_UPDATE_CHECK=1` and `CI=true` turn it off too),
+and `MIXTAPE_UPDATE_CHECK_INTERVAL` (how often the passive check runs, e.g.
+`24h`).
 
 <br>
 
@@ -362,8 +385,11 @@ when stderr is not a terminal. `update` prints text in every output mode.
 
 ## version, completion
 
-`mixtape version` prints `{"version","commit","date"}` (text on a terminal).
-`mixtape completion bash|zsh|fish|powershell` prints a completion script.
+`mixtape version` (or `mixtape --version`) prints `{"version","commit","date"}`
+(text on a terminal). A binary built with `go install …@vX.Y.Z` reports that
+version; other source builds report `dev`.
+`mixtape completion bash|zsh|fish|powershell` prints a completion script; the
+README shows how to load it.
 
 <br>
 
@@ -377,6 +403,7 @@ when stderr is not a terminal. `update` prints text in every output mode.
 | `~/.mixtape/spool/` | Captured audio of the running session (deleted at the end) |
 | `~/.mixtape/work/` | Encoding scratch; `failed/` keeps WAVs whose encode failed |
 | `~/Library/Caches/mixtape/recorder.lock` | The recorder lock |
+| `~/Library/Application Support/mixtape/` | The passive update check's cache |
 | `<library>/<Folder>/mixtape.json` | A folder's manifest |
 | `<library>/<Folder>/<Folder>.m3u8` | The folder's playlist, in collection order |
 | `<library>/.mixtape.lock` | The library writer lock |
@@ -395,7 +422,8 @@ when stderr is not a terminal. `update` prints text in every output mode.
   "tracks": [
     {"position": 1, "requested_id": "…", "played_id": "…", "title": "…", "artist": "…", "album": "…",
      "album_artist": "…", "duration_ms": 213573, "status": "recorded", "file": "Artist-Title.m4a",
-     "recorded_ms": 213573, "audio_sha256": "…", "recorded_at": "…", "track_number": 1, "disc_number": 1}
+     "recorded_ms": 213573, "audio_sha256": "…", "recorded_at": "…", "track_number": 1, "disc_number": 1,
+     "release_date": "1987-07-27"}
   ]
 }
 ```

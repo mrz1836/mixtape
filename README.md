@@ -2,13 +2,14 @@
 
 # 📼&nbsp;&nbsp;Mixtape
 
-**Record Spotify tracks, albums and playlists on macOS into tagged, per-song M4A files**
+**Record what the Spotify desktop app plays on your Mac into tagged, per-song M4A files**
 
 <br/>
 
-> ⚠️ **For educational use only.** Mixtape is a personal-archiving and learning project.
-> We do not condone breaking any rules: respect Spotify's Terms of Use, artists' rights,
-> and the copyright law where you live. Not affiliated with or endorsed by Spotify.
+> ⚠️ **For educational and personal use only.** Mixtape is a learning project about audio
+> capture and media files on macOS. We do not condone breaking any rules: respect Spotify's
+> Terms of Use, artists' rights, and the copyright law where you live. Do not share
+> recordings. Not affiliated with or endorsed by Spotify.
 
 <br/>
 
@@ -68,7 +69,11 @@ mixtape record https://open.spotify.com/playlist/37i9dQZF1DXcBWIGoYBM5M
 - **No accounts, no API keys.** Mixtape drives the Spotify app over
   AppleScript and reads public track lists from Spotify's embed pages.
 - **Two ways to hear Spotify.** A Core Audio process tap (macOS 14.2+, nothing
-  to install, records Spotify alone) or BlackHole (any macOS).
+  to install, records Spotify alone) or BlackHole (macOS 13+).
+- **Unattended.** Long playlists run on their own: the Mac stays awake, Spotify
+  quitting or relaunching is ridden out, and when songs keep failing the same
+  way (no sound arriving, songs not starting) the session stops early and says
+  why instead of trying every song.
 - **Built for people and agents.** A live status line and single-key controls
   on a terminal; NDJSON events, detached sessions and stable exit codes for
   scripts.
@@ -76,6 +81,9 @@ mixtape record https://open.spotify.com/playlist/37i9dQZF1DXcBWIGoYBM5M
 <br/>
 
 ## 🚀 Installation
+
+**Requirements:** macOS 13 Ventura or later (the process tap needs macOS 14.2+)
+and the Spotify desktop app.
 
 Mixtape is a single binary for macOS (Apple Silicon and Intel). Install the
 latest release into `~/.local/bin`, verified against the release's published
@@ -97,11 +105,10 @@ mixtape version
 If `mixtape` isn't found afterward, add `~/.local/bin` to your `PATH`
 (`export PATH="$HOME/.local/bin:$PATH"` in `~/.zshrc`).
 
-> **While the repository is private** the release downloads need GitHub
-> authorization: use `gh release download --repo mrz1836/mixtape --pattern
-> "mixtape_*_darwin_$(uname -m | sed 's/x86_64/amd64/').tar.gz"` with a
-> signed-in [`gh`](https://cli.github.com), and give `mixtape update` a token
-> through `MIXTAPE_GITHUB_TOKEN` (or a signed-in `gh`).
+The binaries are not notarized by Apple. Installed as above (or with `gh` or
+`mixtape update`) that does not matter; if you download the archive in a web
+browser instead, macOS quarantines it, and this lets it run:
+`xattr -d com.apple.quarantine ~/.local/bin/mixtape`.
 
 <details>
 <summary><strong>Build from source (contributors)</strong></summary>
@@ -110,11 +117,17 @@ Requires Go 1.26+ and the Xcode Command Line Tools (the capture backends use
 cgo).
 
 ```bash
+go install github.com/mrz1836/mixtape/cmd/mixtape@latest   # → $GOPATH/bin (usually ~/go/bin)
+
+# or from a clone, with mage-x
 git clone https://github.com/mrz1836/mixtape.git && cd mixtape
 go install github.com/mrz1836/mage-x/cmd/magex@latest
-magex build      # → ./cmd/mixtape/mixtape
-magex install    # → ~/.local/bin/mixtape
+magex build:dev  # → ~/.local/bin/mixtape
+magex install    # → $GOPATH/bin/mixtape
 ```
+
+A binary in `$GOPATH/bin` is yours to manage: `mixtape update` leaves it alone
+(exit 5), so update it the same way you built it.
 
 </details>
 
@@ -147,13 +160,22 @@ mixtape setup     # capture method, permissions, library folder (guided)
 mixtape doctor    # every prerequisite, with fixes (exit 3 when not ready)
 ```
 
-Two Spotify settings matter:
+A recording sounds exactly as Spotify plays it, so a few Spotify settings
+matter:
 
-- **Crossfade off:** Spotify → Settings → Playback → *Crossfade songs*.
-  Crossfaded songs overlap and cannot be cut; Mixtape stops (exit 3) when it
-  sees it.
+- **Crossfade off** (required): Spotify → Settings → Playback → *Crossfade
+  songs*. Crossfaded songs overlap and cannot be cut; Mixtape stops (exit 3)
+  when it sees it.
 - **Volume at maximum:** recordings are made at Spotify's own volume slider
-  (the Mac's volume does not matter).
+  (the Mac's volume does not matter). With the process tap, `--mute` does
+  this for you and silences the speakers while it records.
+- **Streaming quality as high as your account allows:** Settings → Audio
+  quality → *Streaming quality*. *Automatic* can drop the quality mid-song on
+  a slow connection.
+- **Normalize volume and the equalizer:** both change the sound that is
+  recorded. Turn them off to keep each song as it was mastered.
+- **Play on this Mac:** with Spotify Connect playing on another device, no
+  sound reaches Mixtape.
 
 ### 2. Record
 
@@ -238,9 +260,9 @@ Mixtape is designed to be driven unattended:
   | 0 | Complete, or stopped on request |
   | 1 | General error |
   | 2 | Usage error (bad flag or link) |
-  | 3 | Not ready: Spotify not running, crossfade on, capture not routed or silent |
+  | 3 | Not ready: Spotify not running, crossfade on, capture not routed or silent, songs not starting |
   | 4 | Not found: unknown link, no session |
-  | 5 | Permission: Automation or audio-capture permission, unwritable folder |
+  | 5 | Permission: Automation or audio-capture permission, a library that cannot be written |
   | 6 | Busy: another session is recording |
   | 7 | Incomplete: finished with songs not recorded; run it again to retry |
   | 124 | `wait` timed out; the session is still running |
@@ -249,6 +271,10 @@ Mixtape is designed to be driven unattended:
 - **Errors explain themselves.** Every failure is
   `{"error":{"code","message","hint","exit_code"}}` on stderr; `hint` says
   what to do.
+- **It stops when nothing can work.** After three songs in a row could not be
+  recorded (`--max-failures`, or `max_failures` in the config; `0` never
+  stops), the session ends with a cause: no sound reaching Mixtape, songs not
+  starting in Spotify, or repeated failures.
 - **Safe to retry.** `record` is idempotent: run the same command again and
   only what is missing happens. `--dry-run` previews it.
 - **Sessions are on disk.** `~/.mixtape/session.json` (live state) and
@@ -271,7 +297,8 @@ tagged, hashed, and written atomically into the library with its manifest and
 For a list of links Mixtape plays each song in its album or playlist context,
 so the songs flow on naturally, and steps in only when Spotify plays
 something else. It turns shuffle off for the session and puts your settings
-back afterwards, even after a crash.
+back afterwards, even after a crash. While a session plays, the Mac is kept
+from idle-sleeping (closing the lid still sleeps it).
 
 The details, including the timing measurements behind every constant, are in
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
@@ -322,9 +349,12 @@ choose it as the sound output. `mixtape doctor` checks the routing.
 ```
 
 Files are tagged with title, artist, album, album artist, track and disc
-numbers, the collection name (grouping) and the Spotify URL (comment), plus
-`SPOTIFY_ID` and `MIXTAPE_AUDIO_SHA256`. Album artwork is opt-in
-(`--artwork`, or `mixtape config set artwork true`).
+numbers, the release date (shown as the year), the collection name
+(grouping) and the Spotify URL (comment), plus `SPOTIFY_ID` and
+`MIXTAPE_AUDIO_SHA256`. Album and playlist pages do not date their songs, so
+Mixtape reads each recorded song's own page for its release date (one small
+request per song). Album artwork is opt-in (`--artwork`, or `mixtape config
+set artwork true`).
 
 <br/>
 
@@ -335,8 +365,14 @@ numbers, the collection name (grouping) and the Spotify URL (comment), plus
 | `crossfade appears to be on` (exit 3) | Spotify → Settings → Playback → turn off *Crossfade songs*. Spotify keeps this setting where it cannot be read directly, so Mixtape detects it from playback. |
 | `… may not record system audio yet` or `the process tap is silent` (exit 5) | Run `mixtape setup`, or add your terminal app under *System Audio Recording Only* (see above; not the screen-recording list). If it is already there, quit and reopen the terminal app. Or use `--capture device`. |
 | `the capture device is silent` (exit 3) | Select the Multi-Output Device (with BlackHole) as the Mac's sound output. |
+| `spotify is playing, but no sound reaches mixtape` or `songs keep playing without any sound reaching mixtape` (exit 3) | Spotify is playing somewhere else: click the speaker icon at the bottom right of Spotify and choose this Mac. Also check that Spotify's own volume is not at 0. |
+| `the songs keep not starting in Spotify` (exit 3) | Check that Spotify is signed in and online, and that a song plays when you click it. |
+| `could not save the recording` (exit 5) | The library folder is gone or full: reconnect the drive or free some space, then run the same command again. Songs not saved stay pending. |
+| `could not write the captured audio to disk` (exit 1) | Free some disk space on the drive that holds `~/.mixtape`. |
+| `Liked Songs … are private to your account` (exit 2) | Mixtape cannot read your library's track lists. Add the songs to a playlist and link that, or play them in Spotify and run `mixtape record` with no link. |
 | `not allowed to control Spotify` (exit 5) | System Settings → Privacy & Security → Automation → your terminal app → enable Spotify. |
-| Recordings are quiet | Set Spotify's volume slider to the maximum. |
+| Recordings are quiet | Set Spotify's volume slider to the maximum, or record with `--mute` (process tap). |
+| A long session stopped overnight | The Mac slept: keep the lid open (or use an external display) and leave it on power. |
 | `another mixtape recording session is running` (exit 6) | `mixtape status`, then `mixtape stop`. |
 | A song keeps failing | `mixtape list <link>` shows the reason. Songs unavailable in your country are marked `unavailable`. |
 | Anything else | `mixtape doctor`; `mixtape record -v` prints timing diagnostics. |
@@ -346,14 +382,16 @@ numbers, the collection name (grouping) and the Spotify URL (comment), plus
 ## Limits
 
 - **macOS only**, with the Spotify desktop app. Playback must be on this Mac:
-  Spotify Connect to another device records nothing (and Mixtape notices).
+  Spotify Connect to another device records nothing (Mixtape stops and says
+  so).
 - **Real time.** A playlist takes as long as it plays. Ads (free accounts) play
   and are not recorded.
 - **Track lists** come from Spotify's public, undocumented embed page. It lists
   at most 100 songs of a playlist; for longer playlists Mixtape follows the
   playlist in Spotify until it loops. If the page changes or fails, Mixtape
   falls back to the oEmbed endpoint (the name only) and follows the playlist
-  the same way. Private playlists cannot be read.
+  the same way. Private playlists, Liked Songs and the rest of your own
+  library cannot be read; podcasts and audiobooks are not supported.
 - One recording session at a time per Mac.
 
 <br/>
@@ -375,10 +413,47 @@ magex build        # build ./cmd/mixtape/mixtape
 ```
 
 Tests never touch Spotify or Core Audio: the engine runs against a simulated
-Spotify and replays real timing traces (`internal/engine/testdata`). Tests that
-encode real audio skip themselves when the AAC encoder is unavailable (inside a
+Spotify and replays real timing traces (`internal/engine/testdata`), and the
+suite passes on Linux too, where CI runs it. Tests that encode real audio skip
+themselves when the AAC encoder is unavailable (off macOS, or inside a
 sandbox). Live capture checks run only with both `-tags captureintegration`
 and `MIXTAPE_LIVE_CAPTURE=1`, with Spotify playing.
+
+**Releasing.** Push a `vX.Y.Z` tag: `.github/workflows/release.yml` tests and
+builds both macOS binaries on a macOS runner and publishes the release with
+GoReleaser. From a Mac, `GITHUB_TOKEN=… goreleaser release --clean` does the
+same locally.
+
+</details>
+
+<details>
+<summary><strong>Shell completion</strong></summary>
+
+```bash
+# zsh (the macOS default): add to ~/.zshrc
+eval "$(mixtape completion zsh)"
+
+# bash 4+ (Homebrew's bash; macOS ships 3.2): add to ~/.bashrc
+eval "$(mixtape completion bash)"
+
+# fish
+mixtape completion fish > ~/.config/fish/completions/mixtape.fish
+```
+
+</details>
+
+<details>
+<summary><strong>Uninstall</strong></summary>
+
+```bash
+rm ~/.local/bin/mixtape          # the binary (or wherever you installed it)
+rm -rf ~/.mixtape                # settings, session logs, and audio buffers
+rm -rf ~/Library/Caches/mixtape  # the recorder lock
+rm -rf ~/Library/"Application Support"/mixtape  # the update-check cache
+```
+
+Your recordings in `~/Music/Mixtape` are yours: delete that folder only if you
+no longer want them.
 
 </details>
 

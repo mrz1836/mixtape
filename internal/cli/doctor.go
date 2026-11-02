@@ -7,7 +7,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -147,7 +146,7 @@ func failed(checks []check) int {
 }
 
 func (a *app) checkMacOS() check {
-	v, err := syscall.Sysctl("kern.osproductversion")
+	v, err := osProductVersion()
 	if err != nil || v == "" {
 		return check{ID: "macos", Name: "macOS", Status: checkWarn, Detail: "version unknown"}
 	}

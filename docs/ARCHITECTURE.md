@@ -191,8 +191,27 @@ An incomplete song is discarded (or kept and flagged with
 
 If Spotify plays for 10 s and the capture has not yet seen one sample above
 the silence floor in the whole session, capture is not working: the device
-is not routed (exit 3) or the tap is not permitted (exit 5). After the first
-audible sample, silence only invalidates the song it falls in.
+is not routed (exit 3) or the tap is not permitted (exit 5). When macOS
+reports the tap's permission as granted, the same silence means the sound
+goes somewhere else (Spotify Connect, a muted Spotify), and the error says
+so (exit 3). After the first audible sample, silence only invalidates the
+song it falls in.
+
+**Failures in a row.** Each song (or attempt) that cannot be recorded for a
+reason outside mixtape's and the listener's control is a setback: a silent
+song, a request Spotify does not start, a cut-short take, a failed render.
+A skip, a stop, or mixtape's own restart is not. After `MaxFailures` (3)
+setbacks in a row the session ends with what they have in common:
+`ErrNoSound` (all silent), `ErrNotStarting` (none started), or `ErrFailing`.
+A recorded song resets the count. Without this, a signed-out Spotify would
+burn two 15 s waits on every song, and Spotify Connect would play every song
+twice in silence, while the idle timeout never fired.
+
+**Disk problems** end the session at once: a spool write error (the capture
+would silently stop advancing) and a recording or copy the library cannot
+store (an unplugged drive, a full disk) would otherwise fail every further
+song the same way. Nothing is leaked: a WAV that will not be referenced is
+removed, and the songs stay pending.
 
 <br>
 
@@ -202,8 +221,14 @@ For each song to record, in order:
 
 - If Spotify is already playing it from the top, recording simply continues.
 - Otherwise mixtape sends `play track <uri> in context <album or playlist>`,
-  so the next songs usually flow on with no gap, and waits up to 15 s (plus
-  45 s while an ad plays).
+  so the next songs usually flow on with no gap, and waits up to 15 s; time
+  an ad break takes does not count. A track link has no context, and then
+  Spotify may resume where it last left off (see *Resume* above): a mid-song
+  start is seeked to 0, and a jump to another song before the requested one
+  really began is a false start, requested again without counting as an
+  attempt.
+- A song too long for a WAV (the 4 GiB RIFF limit: about 6 h at 48 kHz) is
+  failed before it is played.
 - A relinked track (another ID with the same normalized title and lead
   artist, duration within 2 s) is accepted and its played ID recorded.
 - If Spotify jumps past the requested song to a later one, the requested
@@ -214,13 +239,20 @@ For each song to record, in order:
 Shuffle is turned off for the session. Spotify is paused when the queue is
 done. Every setting changed is saved to `session.json` first and restored at
 the end, but only where Spotify still holds the value mixtape set; a crashed
-session's changes are restored by the next `record`.
+session's changes are restored by the next `record` (any `record`, even one
+that only copies). When they cannot be put back yet (Spotify is closed, or
+does not answer), the new session carries them in its own `session.json`
+and restores them when it ends.
 
 **Follow mode.** The public embed page lists at most 100 tracks. For a
 longer playlist (or when the embed page fails), mixtape records the listed
 songs, then follows the playlist in Spotify with repeat on, recording each
-new song, until the playlist's first song is followed by its second: it has
-looped.
+new song, until it loops. Once a song past the listed ones has played, two
+listed songs playing one after the other in order mean the context wrapped
+around (playback beyond the list never returns to it otherwise). Spotify
+skips the same unplayable songs on every pass, so this holds even when the
+first song never plays. Without a list, the first two songs seen repeating
+mark the loop.
 
 **Live mode.** With no links, mixtape records whatever plays into `Singles`
 (or `--into`). Songs already in that folder are skipped with "next"; songs
@@ -237,7 +269,15 @@ leaves the rest alone.
   records the time of the last audible block (an atomic).
 - One **worker goroutine** performs every library operation (encode, tag,
   copy, manifest writes) in order, so the library needs no locking and
-  encoding never delays the observation of the next song.
+  encoding never delays the observation of the next song. Its queue is
+  unbounded, so the engine never blocks submitting (a run can start with
+  hundreds of copies), and each job carries a copy of its song's data, which
+  the engine may still update.
+- Writing a song's WAV reads the spool without the engine's spool lock:
+  rendering, pruning and reopening all run on the engine goroutine, and the
+  spool guards its own appends, so capture never waits for a WAV write.
+- While a session plays, a `caffeinate -i -w <pid>` child holds macOS's
+  idle-sleep assertion; it ends with the process, even after `kill -9`.
 
 <br>
 
@@ -265,16 +305,26 @@ leaves the rest alone.
   relinked) and `MIXTAPE_AUDIO_SHA256`: the SHA-256 of the AAC `mdat`
   payload, which retagging never changes. A song done in one folder is
   copied, not recorded, into another.
+- The release date goes into `©day` (Music apps show its year) and the
+  manifest's `release_date`. Track pages carry it; album and playlist pages
+  do not date their songs, so a song recorded without one has its own track
+  page read when it is saved (one small request, 10 s at most; without an
+  answer the file has no year).
 
 **Commit pipeline.** Render the ranges to a WAV in `~/.mixtape/work` →
 `afconvert -f m4af -d aac -b 256000` → hash `mdat` → tag → write into the
 folder (temp file, fsync, rename) → manifest (atomic) → `.m3u8`. If encoding
 fails, the WAV moves to `work/failed/`, the song is `encode_failed`, and the
-next run encodes it again without recording.
+next run encodes it again without recording. A partial take (`--keep-partial`)
+never replaces a complete file of the same song: it is discarded instead.
 
 **Crash consistency.** A song whose file exists with matching tags but whose
 manifest entry is not done (a crash between rename and manifest write) is
-reconciled to recorded. Stale temp files are removed by the next writer.
+reconciled to recorded. Stale temp files, and kept WAVs such a repair made
+unnecessary, are removed by the next writer: opening the library only reads.
+An embed page without a track list is never taken for an empty collection
+(which would mark every song removed); mixtape follows the collection in
+Spotify instead.
 `verify --fix` refuses to rewrite manifests when the library looks
 unmounted (missing, or more than half of its files missing) unless `--force`.
 

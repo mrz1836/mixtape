@@ -168,6 +168,9 @@ func TestOutputRateChangeReportedAsDeviceChangeKeepsRecording(t *testing.T) {
 
 func TestUnwritableLibraryEndsTheSession(t *testing.T) {
 	t.Parallel()
+	if os.Geteuid() == 0 {
+		t.Skip("root writes into read-only folders")
+	}
 	s := newSim(t, songA, songB)
 	pl := s.playlist("pl0000000000000000000w", "Gone", true, songA, songB)
 	// The playlist's folder (created before the session starts) turns

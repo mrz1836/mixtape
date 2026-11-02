@@ -326,6 +326,9 @@ func TestPartialNeverReplacesACompleteRecording(t *testing.T) {
 
 func TestCommitIntoAnUnwritableFolderIsAStoreError(t *testing.T) {
 	t.Parallel()
+	if os.Geteuid() == 0 {
+		t.Skip("root writes into read-only folders")
+	}
 	requireAAC(t)
 	f := newFixture(t, nil)
 	c := f.collection(Spec{Kind: KindSingles})

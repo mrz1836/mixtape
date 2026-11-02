@@ -3,6 +3,7 @@ package cli
 import (
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -222,4 +223,26 @@ func TestUpdateConfig(t *testing.T) {
 	for _, p := range cfg.Platforms {
 		assert.Equal(t, "darwin", p.OS)
 	}
+}
+
+func TestReleaseVersionFromBuildInfo(t *testing.T) {
+	t.Parallel()
+	for v, want := range map[string]bool{
+		"v0.1.0":                             true,
+		"v1.2.3-beta.1":                      true,
+		"(devel)":                            false,
+		"":                                   false,
+		"v0.0.0-20261102181358-dd1387f547b6": false,
+		"v0.0.0-20261102181358-dd1387f547b6+dirty": false,
+		"v0.1.1-0.20261102181358-dd1387f547b6":     false,
+	} {
+		assert.Equal(t, want, releaseVersion(v), v)
+	}
+	b := BuildInfo{}.withBuildInfo(&debug.BuildInfo{
+		Main:     debug.Module{Version: "v0.1.0"},
+		Settings: []debug.BuildSetting{{Key: "vcs.revision", Value: "abc"}, {Key: "vcs.time", Value: "2026-11-02T00:00:00Z"}},
+	})
+	assert.Equal(t, BuildInfo{Version: "0.1.0", Commit: "abc", Date: "2026-11-02T00:00:00Z"}, b)
+	assert.Equal(t, "1.0.0", BuildInfo{Version: "1.0.0"}.withBuildInfo(&debug.BuildInfo{Main: debug.Module{Version: "v0.1.0"}}).Version,
+		"-ldflags win")
 }

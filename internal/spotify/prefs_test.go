@@ -3,6 +3,7 @@ package spotify
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
@@ -94,6 +95,9 @@ func TestFirstDir(t *testing.T) {
 
 func TestIsRunningDoesNotFail(t *testing.T) {
 	t.Parallel()
+	if runtime.GOOS != "darwin" {
+		t.Skip("the Spotify process check is macOS-only")
+	}
 	// The process table is readable without any permission; whether
 	// Spotify is running on this machine is not asserted.
 	_, err := IsRunning()

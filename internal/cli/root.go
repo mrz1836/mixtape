@@ -10,6 +10,8 @@ import (
 	"context"
 	"io"
 	"os"
+	"regexp"
+	"runtime/debug"
 	"slices"
 	"strings"
 	"time"
@@ -37,8 +39,13 @@ type BuildInfo struct {
 	Date    string
 }
 
-// resolved returns info with "dev"/"unknown" in place of empty fields.
+// resolved fills what -ldflags left empty: from the Go build info (a `go
+// install …@v0.1.0` build knows its version and commit), else "dev" and
+// "unknown".
 func (b BuildInfo) resolved() BuildInfo {
+	if bi, ok := debug.ReadBuildInfo(); ok {
+		b = b.withBuildInfo(bi)
+	}
 	if b.Version == "" {
 		b.Version = "dev"
 	}
@@ -49,6 +56,32 @@ func (b BuildInfo) resolved() BuildInfo {
 		b.Date = "unknown"
 	}
 	return b
+}
+
+// withBuildInfo fills empty fields from the module's build information.
+func (b BuildInfo) withBuildInfo(bi *debug.BuildInfo) BuildInfo {
+	if v := bi.Main.Version; b.Version == "" && releaseVersion(v) {
+		b.Version = strings.TrimPrefix(v, "v")
+	}
+	for _, s := range bi.Settings {
+		switch {
+		case s.Key == "vcs.revision" && b.Commit == "":
+			b.Commit = s.Value
+		case s.Key == "vcs.time" && b.Date == "":
+			b.Date = s.Value
+		}
+	}
+	return b
+}
+
+// pseudoVersion matches the versions Go stamps on untagged builds
+// (v0.0.0-20261102181358-dd1387f547b6).
+var pseudoVersion = regexp.MustCompile(`-(\d+\.)?\d{14}-[0-9a-f]{12}`)
+
+// releaseVersion reports a module version that names a release: not empty,
+// not "(devel)", not a pseudo-version, not a dirty tree.
+func releaseVersion(v string) bool {
+	return strings.HasPrefix(v, "v") && !strings.Contains(v, "+") && !pseudoVersion.MatchString(v)
 }
 
 // Execute runs mixtape with the process's arguments and streams and
@@ -187,7 +220,10 @@ Start with 'mixtape setup', then 'mixtape doctor' to confirm you are ready.`,
   mixtape record --detach <link> && mixtape wait --timeout 9m`,
 		SilenceUsage:  true,
 		SilenceErrors: true,
+		Version:       a.deps.info.Version,
 	}
+	root.Flags().Bool("version", false, "Print the version (as 'mixtape version' does)")
+	root.SetVersionTemplate("mixtape {{.Version}}\n")
 	root.CompletionOptions.DisableDefaultCmd = true
 	a.addGlobalFlags(root)
 	root.PersistentPreRunE = func(cmd *cobra.Command, _ []string) error { return a.prepare(cmd) }

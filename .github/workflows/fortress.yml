@@ -55,8 +55,8 @@ on:
     branches:
       - master # (Default) Main branch for production
       - main # (Secondary) Main branch for production
-    tags:
-      - "v*" # Tags starting with 'v' (e.g., v1.0.0) trigger the workflow
+      # mixtape: no tag trigger. GoFortress runs on Linux runners, which cannot
+      # build the macOS cgo binaries; release.yml releases tags on macOS.
   pull_request:
     branches:
       - "**" # All branches for PRs

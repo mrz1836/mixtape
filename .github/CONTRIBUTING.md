@@ -31,8 +31,12 @@ Tests should be:
 * Focused on one behavior
 * Fast
 
-This project aims for >= **90% code coverage**. Every code path must be tested to
-keep the Codecov badge green and CI passing.
+New behavior comes with tests, and CI runs the whole suite with the race
+detector on every push and pull request. The engine is tested against a
+simulated Spotify and capture device (`internal/engine/sim_test.go`), so most
+changes can be tested without audio hardware. The code that talks to Core Audio
+has integration tests that need a Mac with Spotify and audio:
+`go test -tags captureintegration ./internal/capture/...`.
 
 <br/>
 

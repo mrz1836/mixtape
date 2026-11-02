@@ -107,7 +107,7 @@ say so with the output — never claim done on a red run.
 ## Project-specific CI / build config: `.github/env/90-project.env`
 
 [env/90-project.env](env/90-project.env) is **the** home for settings unique to
-this repo (Go version pins, macOS runners, coverage provider). The lower-numbered
+this repo (Go version pins, runners, coverage provider). The lower-numbered
 `.github/env/` files are **synced across repos via go-broadcast** and get
 overwritten; `90-project.env` loads last, overrides them, and is excluded from
 the sync. Local, gitignored overrides go in `99-local.env`.
@@ -116,13 +116,24 @@ The same applies repo-wide: files delivered by go-broadcast (workflows, actions,
 tech-conventions, community docs, `.vscode/`, editor configs) are edited in the
 go-broadcast source, not here.
 
+**Releases** are the one exception. GoFortress runs on Linux runners (the
+module builds and tests there), which cannot build the macOS cgo binaries, so
+`fortress.yml` has no tag trigger in this repo and
+[workflows/release.yml](workflows/release.yml) releases `v*` tags on a macOS
+runner. If go-broadcast ever syncs workflows into this repo, keep that change
+(or exclude `fortress.yml`): otherwise a tag also starts a Fortress release
+that fails on Linux.
+
 <br>
 
 ## Don't
 
 - Don't commit recordings or traces of personal listening. `*.wav`, `*.m4a` and
   `bin/` are gitignored; fixtures in `testdata/` hold public track IDs only.
-- Don't add Spotify credentials, API keys, or new network calls.
+- Don't add Spotify credentials or API keys. The only network calls are
+  Spotify's public embed and oEmbed pages (track lists, and a song's release
+  date when it is saved), artwork images with `--artwork`, and GitHub releases
+  for `update`; don't add others.
 - Don't let Go code run on Core Audio's real-time thread.
 - Don't run raw `go test` / `golangci-lint` directly in place of `magex`.
 - Don't use `--no-verify` on commits.

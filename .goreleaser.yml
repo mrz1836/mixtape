@@ -4,6 +4,10 @@
 # ---------------------------
 version: 2
 
+# Pinned: `mixtape update` looks for mixtape_<version>_checksums.txt, so the
+# name must not follow the git remote.
+project_name: mixtape
+
 before:
   hooks:
     - |
@@ -86,6 +90,7 @@ archives:
     files:
       - LICENSE
       - README.md
+      - THIRD_PARTY_NOTICES.md
 
 # ---------------------------
 # Checksum
