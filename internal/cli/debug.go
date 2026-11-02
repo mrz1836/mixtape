@@ -319,27 +319,37 @@ func interpolateFrame(audio []traceLine, t int64, rate int) float64 {
 	return float64(a.Frame) + float64(t-a.T)/1e9*float64(rate)
 }
 
-// audioOnset finds the first loud frame after at least 200 ms of silence
-// following time from; -1 when there is none within 5 s.
+// audioOnset finds where sound starts after time from (the last
+// observation before playback started): the first audible block after at
+// least 200 ms of silence, confirmed when the sound turns loud. The silence
+// may begin before from (a pause). Spotify fades a resumed song in, so the
+// sound rises through moderate levels and can dip back to quiet on the
+// way; only another 200 ms of silence means it died away and was not the
+// start. -1 when there is none within 5 s.
 func audioOnset(audio []traceLine, from int64) float64 {
 	const loud, quiet = 300, 16
-	var silentSince int64 = -1
+	const silence = int64(200 * time.Millisecond)
+	quietSince := int64(-1) // start of the current run of quiet blocks
+	rise := -1.0            // first frame of sound after a long enough silence
 	for _, a := range audio {
-		if a.T < from {
-			continue
-		}
 		if a.T-from > int64(5*time.Second) {
 			return -1
 		}
-		switch {
-		case a.Peak <= quiet:
-			if silentSince < 0 {
-				silentSince = a.T
+		if a.Peak <= quiet {
+			if quietSince < 0 {
+				quietSince = a.T
 			}
-		case a.Peak >= loud && silentSince >= 0 && a.T-silentSince >= int64(200*time.Millisecond):
-			return float64(a.Frame)
-		default:
-			silentSince = -1
+			if rise >= 0 && a.T-quietSince >= silence {
+				rise = -1 // the sound died away again
+			}
+			continue
+		}
+		if rise < 0 && quietSince >= 0 && a.T-quietSince >= silence && a.T >= from {
+			rise = float64(a.Frame)
+		}
+		quietSince = -1
+		if rise >= 0 && a.Peak >= loud {
+			return rise
 		}
 	}
 	return -1

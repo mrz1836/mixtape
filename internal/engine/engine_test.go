@@ -844,3 +844,19 @@ func TestWarnOnceIsKeyed(t *testing.T) {
 	e.warn("same")
 	assert.Equal(t, []string{"could not delete a.pcm", "same"}, got)
 }
+
+func TestTheTrackSpotifyLeavesIsNotTakenForASkip(t *testing.T) {
+	t.Parallel()
+	s := newSim(t, songA, songB, songC)
+	pl := s.playlist("pl0000000000000000000j", "Resumed", true, songA, songB, songC)
+	// As seen live: Spotify sits paused on the playlist's last song when
+	// the session starts, and reports it once more after "play track" for
+	// the first one. That is no sign Spotify jumped past the first song.
+	s.spotify.queue, s.spotify.idx, s.spotify.pos = []string{songA.id, songB.id, songC.id}, 2, 3*time.Second
+	s.spotify.oldTrackOnPlay = 1
+
+	_, res := s.run([]spotify.Collection{pl}, Options{}, nil)
+	requireComplete(t, res)
+	assert.Equal(t, 3, res.Counts.Recorded)
+	assert.Empty(t, s.eventsOf(EventTrackFailed))
+}

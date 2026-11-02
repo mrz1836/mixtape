@@ -63,9 +63,10 @@ mixtape record https://open.spotify.com/playlist/37i9dQZF1DXcBWIGoYBM5M
   they are recognized even after renames.
 - **Exact cuts, complete songs.** Every song is cut out of a continuous capture
   by matching Spotify's playback position to the audio, to within a few
-  milliseconds. Pauses are cut out. A song that was not captured start to
-  finish (a skip, a seek, a glitch) is never kept as done; it is recorded
-  again.
+  milliseconds. Pauses are cut out (Spotify fades the sound out and back in
+  around a pause, so the spot stays audible). A song that was not captured
+  start to finish (a skip, a seek, a glitch) is never kept as done; it is
+  recorded again.
 - **No accounts, no API keys.** Mixtape drives the Spotify app over
   AppleScript and reads public track lists from Spotify's embed pages.
 - **Two ways to hear Spotify.** A Core Audio process tap (macOS 14.2+, nothing

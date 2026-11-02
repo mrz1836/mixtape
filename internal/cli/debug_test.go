@@ -430,13 +430,17 @@ func TestAudioOnsetNeedsSilenceFirst(t *testing.T) {
 		from  int64
 		want  float64
 	}{
-		"loud after 300 ms of silence":            {blocks(0, 0, 0, 500), 0, 300},
-		"near-silent samples count as silence":    {blocks(16, 16, 16, 300), 0, 300},
-		"100 ms of silence is a gap, not a start": {blocks(500, 0, 500, 500), 0, -1},
-		"a moderate level breaks the silence":     {blocks(0, 0, 0, 100, 500), 0, -1},
-		"silence before from does not count":      {blocks(0, 0, 0, 500, 500), 3e8, -1},
-		"never loud":                              {blocks(0, 0, 0, 0), 0, -1},
-		"an onset past 5 s is not this start's":   {blocks(append(make([]int, 55), 500)...), 0, -1},
+		"loud after 300 ms of silence":                {blocks(0, 0, 0, 500), 0, 300},
+		"near-silent samples count as silence":        {blocks(16, 16, 16, 300), 0, 300},
+		"100 ms of silence is a gap, not a start":     {blocks(500, 0, 500, 500), 0, -1},
+		"a fade-in starts at its first audible block": {blocks(0, 0, 0, 100, 500), 0, 300},
+		"sound that falls quiet again was no start":   {blocks(0, 0, 0, 100, 0, 0, 0, 500), 0, 700},
+		"too little silence before a fade-in":         {blocks(500, 0, 100, 500), 0, -1},
+		"a fade-in may dip back to quiet":             {blocks(0, 0, 0, 100, 0, 100, 500), 0, 300},
+		"the silence may begin before from":           {blocks(0, 0, 0, 500, 500), 3e8, 300},
+		"a rise before from is not this start's":      {blocks(0, 0, 500, 500, 500), 3e8, -1},
+		"never loud":                                  {blocks(0, 0, 0, 0), 0, -1},
+		"an onset past 5 s is not this start's":       {blocks(append(make([]int, 55), 500)...), 0, -1},
 	}
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {

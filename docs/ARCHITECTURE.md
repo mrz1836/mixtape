@@ -133,8 +133,9 @@ watch.
 ## Measured Spotify behavior
 
 These come from `mixtape debug trace` runs against Spotify 1.2 on macOS 15
-(BlackHole at 48 kHz, 100 ms polls). A trimmed trace is the golden fixture
-`internal/engine/testdata/trace-complete.ndjson`.
+(BlackHole at 48 kHz, 100 ms polls) and, for the pause and old-track rows,
+recordings with the process tap on macOS 15.8. A trimmed trace is the golden
+fixture `internal/engine/testdata/trace-complete.ndjson`.
 
 | Behavior | Measurement | Consequence |
 |---|---|---|
@@ -147,6 +148,8 @@ These come from `mixtape debug trace` runs against Spotify 1.2 on macOS 15
 | Track blips | while it loads a song, Spotify can report another track for 1–11 polls | a change away from a take with no believable position, or to a track that appears mid-song, counts once it holds for 1 s |
 | Track change | the new title and duration can appear one poll before the new URI | half-updated snapshots are ignored |
 | Paused load | `play track` shows the new track paused for one poll before it plays | the take starts recording when it plays |
+| Old track after `play track` | Spotify can report the track it is leaving, as it was (even paused), for a poll before the new one | while a request waits, that track is not taken for Spotify skipping the requested song |
+| Pause and resume | Spotify fades the sound out over ~0.5 s when paused and back in on resume; just after a resume its position runs 0.4–0.6 s ahead of the sound | the pause is cut out, but a song paused mid-way keeps an audible dip of ~0.7 s there (about 0.2 s of it silence): for a seamless file, do not pause |
 | Crossfade | the reported duration drops by the crossfade time ~1.4 s into a song; albums are exempt | detected from the first song (exit 3) |
 | Prefs | `audio.crossfade_v2` in `prefs` is stale once `audio.crossfade_migrated_to_ps=true` | it is a warning, not a verdict |
 | Settings writes | `set shuffling`/`set repeating` take effect, but a read in the same script still returns the old value | settings are read back on the next observation, never right after a write |

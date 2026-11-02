@@ -81,6 +81,12 @@ type fakeSpotify struct {
 	hold     time.Duration // position frozen at 0 while it re-buffers
 	// ignorePlay makes "play track" do nothing (signed out, offline).
 	ignorePlay bool
+	// oldTrackOnPlay replays Spotify reporting the track it is leaving, as
+	// it was, for this many observations after "play track" (seen live:
+	// paused on a later album track when the session started).
+	oldTrackOnPlay int
+	oldTrack       spotify.Snapshot
+	oldTrackLeft   int
 	// cutEarly lists tracks Spotify moves on from this long before their
 	// end without reporting a shorter duration first: a blend the duration
 	// check cannot see.
@@ -188,6 +194,12 @@ func (f *fakeSpotify) snapshot() spotify.Snapshot {
 		f.failNext--
 		return spotify.Snapshot{At: f.now(), Err: f.failErr}
 	}
+	if f.oldTrackLeft > 0 {
+		f.oldTrackLeft--
+		old := f.oldTrack
+		old.At = f.now()
+		return old
+	}
 	s := spotify.Snapshot{At: f.now(), State: spotify.StatePaused, Volume: f.volume, Shuffle: f.shuffle, Repeat: f.repeat}
 	if f.playing {
 		s.State = spotify.StatePlaying
@@ -281,6 +293,12 @@ func (f *fakeSpotify) PlayTrack(_ context.Context, uri, ctxURI string) error {
 	f.log("play " + uri + " in " + ctxURI)
 	if err := f.refused("play"); err != nil {
 		return err
+	}
+	if f.oldTrackOnPlay > 0 {
+		f.mu.Unlock()
+		f.oldTrack = f.snapshot()
+		f.mu.Lock()
+		f.oldTrackLeft = f.oldTrackOnPlay
 	}
 	if f.ignorePlay {
 		return nil

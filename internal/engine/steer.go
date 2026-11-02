@@ -15,6 +15,10 @@ import (
 type request struct {
 	item *Item
 	at   time.Time
+	// left is the track Spotify reported when the request was sent. Until
+	// the song starts, Spotify can report it once more: that is the old
+	// track, not a jump past the song.
+	left string
 }
 
 // relinkTolerance is how far a relinked track's duration may differ.
@@ -22,6 +26,9 @@ const relinkTolerance = 2 * time.Second
 
 // beginQueued decides what a new track means in queue and follow mode.
 func (e *Engine) beginQueued(ctx context.Context, t *take, s spotify.Snapshot) {
+	if w := e.waiting; w != nil && w.left != "" && s.Track.URI == w.left && s.Track.ID != w.item.Track.ID {
+		return // the track Spotify is leaving, reported once more
+	}
 	it := e.match(s.Track)
 	if it == nil && e.follow != nil && e.follow.active {
 		it = e.followTrack(ctx, s)
@@ -178,7 +185,7 @@ func (e *Engine) request(ctx context.Context, it *Item, at time.Time) {
 	if err != nil {
 		e.warn("spotify play: " + err.Error())
 	}
-	e.waiting = &request{item: it, at: at}
+	e.waiting = &request{item: it, at: at, left: e.last.Track.URI}
 	e.lastActive = at
 }
 
