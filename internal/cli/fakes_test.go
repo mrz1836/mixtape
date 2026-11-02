@@ -139,6 +139,7 @@ type fakeWorld struct {
 	killErr    error // returned by kill after onKill
 	awake      int   // keepAwake holds not yet released
 	awakeCalls int
+	onSleep    func() // runs after each fake sleep
 	// perms answers permission checks (missing kinds are granted); grantAfter
 	// flips a kind to granted after that many checks, like a user switching
 	// it on in System Settings.
@@ -222,6 +223,12 @@ func (w *fakeWorld) services(h *harness) services {
 		},
 		sleep: func(ctx context.Context, d time.Duration) bool {
 			h.advance(d)
+			w.mu.Lock()
+			fn := w.onSleep
+			w.mu.Unlock()
+			if fn != nil {
+				fn()
+			}
 			return ctx.Err() == nil
 		},
 		runScript: func(_ context.Context, name string, args ...string) error {

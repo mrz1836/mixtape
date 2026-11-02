@@ -263,6 +263,72 @@ func TestStopRacingTheSessionsEndReportsItsResult(t *testing.T) {
 	assert.Equal(t, "complete", h.json()["session"].(map[string]any)["result"])
 }
 
+func TestStatusFollowStreamsTheEventsUntilTheSessionEnds(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	home := h.env["MIXTAPE_HOME"]
+	lock, err := session.Acquire(h.world.lockPath, session.LockInfo{PID: 4242, SessionID: "s1", Home: home})
+	require.NoError(t, err)
+	log, err := session.OpenEventLog(session.EventsPath(home, "s1"))
+	require.NoError(t, err)
+	code := 0
+	for _, ev := range []engine.Event{
+		{Type: engine.EventTrackStarted, Track: &engine.EventTrack{Title: "Song", Artist: "Band", DurationMS: 64333}},
+		{Type: engine.EventTrackSaved, Track: &engine.EventTrack{Title: "Song", Artist: "Band", File: "Singles/Band-Song.m4a"}},
+		{Type: engine.EventSessionFinished, Result: engine.OutcomeComplete, Counts: &session.Counts{Total: 1, Recorded: 1}, ExitCode: &code},
+	} {
+		require.NoError(t, log.Write(ev))
+	}
+	require.NoError(t, log.Close())
+	require.NoError(t, session.WriteState(home, session.State{
+		ID: "s1", PID: 4242, Phase: session.PhaseRecording, StartedAt: h.now(), Events: session.EventsPath(home, "s1"),
+	}))
+	// The session ends while status follows it.
+	h.world.onSleep = func() { _ = lock.Release() }
+
+	h.deps.stdoutTTY = true
+	require.Equal(t, ExitOK, h.run("status", "--follow", "--no-color"))
+	out := h.stdout.String()
+	assert.Contains(t, out, "▶ Band — Song (1:04)")
+	assert.Contains(t, out, "✓ saved Band — Song → Singles/Band-Song.m4a")
+	assert.Contains(t, out, "complete: 1 recorded")
+}
+
+func TestCrashLeftSpotifySettingsSurviveARunThatCannotRestoreThem(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	home := h.env["MIXTAPE_HOME"]
+	ref := h.world.addPlaylist("Done List", songs()...)
+	spec := library.Spec{Kind: library.KindPlaylist, SpotifyID: ref.ID, Name: "Done List"}
+	for _, s := range songs() {
+		recordDone(t, h.env["MIXTAPE_LIBRARY"], spec, library.Track{ID: s.ID, Title: s.Title, Artist: s.Artist, DurationMS: s.Duration.Milliseconds()})
+	}
+	vol, set := 47, 100
+	crashed := session.State{ID: "old", Phase: session.PhaseRecording, Spotify: &session.SpotifyState{
+		Original: session.PlayerSettings{Volume: &vol}, Set: session.PlayerSettings{Volume: &set},
+	}}
+	require.NoError(t, session.WriteState(home, crashed))
+	h.world.running = false // Spotify is closed: nothing can be put back now
+	h.world.player.snap = spotify.Snapshot{Err: spotify.ErrNotRunning}
+
+	require.Equal(t, ExitOK, h.run("record", plURL), "a copy-only run needs no Spotify")
+	st, err := session.ReadState(home)
+	require.NoError(t, err)
+	assert.NotEqual(t, "old", st.ID)
+	require.NotNil(t, st.Spotify, "the unrestored settings are carried into the new session")
+	assert.True(t, st.Spotify.NeedsRestore())
+	assert.Equal(t, 47, *st.Spotify.Original.Volume)
+}
+
+func TestChildFlagsForwardRecordFlagsOnly(t *testing.T) {
+	t.Parallel()
+	a := &app{}
+	cmd := newRecordCmd(a)
+	require.NoError(t, cmd.ParseFlags([]string{"--detach", "--mute", "--limit", "3", "--max-failures", "5"}))
+	got := childFlags(cmd)
+	assert.ElementsMatch(t, []string{"--mute=true", "--limit=3", "--max-failures=5"}, got)
+}
+
 func TestWaitReturnsTheSessionExitCode(t *testing.T) {
 	t.Parallel()
 	h := newHarness(t)

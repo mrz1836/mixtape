@@ -136,6 +136,36 @@ func TestSetRoundTrip(t *testing.T) {
 	assert.Equal(t, os.FileMode(0o600), info.Mode().Perm())
 }
 
+func TestMaxFailures(t *testing.T) {
+	t.Parallel()
+	s, err := Resolve(File{}, env(nil), Overrides{}, testHome)
+	require.NoError(t, err)
+	assert.Equal(t, DefaultMaxFailures, s.MaxFailures)
+	assert.Equal(t, "3", s.Value(KeyMaxFailures))
+
+	s, err = Resolve(File{MaxFailures: ptr(5)}, env(map[string]string{EnvMaxFailures: "2"}), Overrides{}, testHome)
+	require.NoError(t, err)
+	assert.Equal(t, 2, s.MaxFailures, "env beats file")
+	s, err = Resolve(File{MaxFailures: ptr(5)}, env(nil), Overrides{MaxFailures: ptr(0)}, testHome)
+	require.NoError(t, err)
+	assert.Equal(t, 0, s.MaxFailures, "a flag beats both; 0 means never")
+	assert.Equal(t, SourceFlag, s.Sources[KeyMaxFailures])
+
+	for _, bad := range []string{"-1", "lots", "1.5"} {
+		_, badErr := Resolve(File{}, env(map[string]string{EnvMaxFailures: bad}), Overrides{}, testHome)
+		require.ErrorIs(t, badErr, ErrInvalidValue, bad)
+	}
+
+	path := filepath.Join(t.TempDir(), "config.json")
+	require.NoError(t, Set(path, KeyMaxFailures, "4", testHome))
+	data, err := os.ReadFile(path)
+	require.NoError(t, err)
+	assert.Contains(t, string(data), `"max_failures": 4`, "stored as a number")
+	f, _, err := Load(path)
+	require.NoError(t, err)
+	assert.Equal(t, 4, *f.MaxFailures)
+}
+
 func TestSetKeepsUnknownKeys(t *testing.T) {
 	t.Parallel()
 	path := filepath.Join(t.TempDir(), "config.json")

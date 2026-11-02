@@ -428,6 +428,48 @@ func TestStopDiscardsThePartialSong(t *testing.T) {
 	assert.Contains(t, s.spotify.Commands(), "pause")
 }
 
+func TestSkipKeySkipsTheSongForGood(t *testing.T) {
+	t.Parallel()
+	s := newSim(t, songA, songB)
+	controls := make(chan Control, 1)
+	s.at[2*time.Second] = func(*sim) { controls <- ControlNext }
+	pl := s.playlist("pl0000000000000000000k", "Skip", true, songA, songB)
+
+	_, res := s.run([]spotify.Collection{pl}, Options{MaxFailures: 3}, controls)
+	requireComplete(t, res)
+	assert.Equal(t, 1, res.Counts.Recorded)
+	assert.Equal(t, 1, res.Counts.Skipped)
+	skipped := s.eventsOf(EventTrackSkipped)
+	require.Len(t, skipped, 1)
+	assert.Equal(t, songA.id, skipped[0].Track.ID)
+	assert.Equal(t, "skipped by you", skipped[0].Reason)
+	assert.Contains(t, s.spotify.Commands(), "next")
+}
+
+func TestPauseKeyPausesAndResumes(t *testing.T) {
+	t.Parallel()
+	s := newSim(t, songC)
+	controls := make(chan Control, 2)
+	s.at[2*time.Second] = func(*sim) { controls <- ControlPlayPause }
+	s.at[4*time.Second] = func(*sim) { controls <- ControlPlayPause }
+
+	_, res := s.run(singles(songC), Options{}, controls)
+	requireComplete(t, res)
+	assert.Equal(t, 1, res.Counts.Recorded, "the pause is cut out of a complete song")
+	assert.Equal(t, 2, strings.Count(strings.Join(s.spotify.Commands(), ","), "playpause"))
+}
+
+func TestSpotifyGoneForAMinuteEndsTheSession(t *testing.T) {
+	t.Parallel()
+	s := newSim(t, songA)
+	s.at[2*time.Second] = func(s *sim) {
+		s.spotify.user(func(f *fakeSpotify) { f.failNext, f.failErr = 1<<20, spotify.ErrNotRunning })
+	}
+	_, res := s.run(singles(songA), Options{}, nil)
+	require.ErrorIs(t, res.Err, ErrSpotifyGone)
+	assert.Equal(t, 1, res.Counts.Remaining)
+}
+
 func TestKeepPartialSavesAFlaggedFile(t *testing.T) {
 	t.Parallel()
 	s := newSim(t, songA)

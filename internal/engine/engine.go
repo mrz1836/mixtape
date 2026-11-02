@@ -404,6 +404,12 @@ func (e *Engine) onTick(ctx context.Context) {
 	if e.stopping {
 		return
 	}
+	// A Spotify that is gone is the more specific reason, so it is checked
+	// before the idle timeout.
+	if !e.goneSince.IsZero() && now.Sub(e.goneSince) > spotifyGoneAfter {
+		e.fail(fmt.Errorf("%w for %s", ErrSpotifyGone, spotifyGoneAfter))
+		return
+	}
 	if d := e.opts.IdleTimeout; d > 0 && now.Sub(e.lastActive) > d {
 		e.warn(fmt.Sprintf("nothing to record for %s; ending the session", d.Round(time.Second)))
 		if e.plan.Mode == ModeLive {
@@ -411,10 +417,6 @@ func (e *Engine) onTick(ctx context.Context) {
 		} else {
 			e.stop(OutcomeIncomplete)
 		}
-		return
-	}
-	if !e.goneSince.IsZero() && now.Sub(e.goneSince) > spotifyGoneAfter {
-		e.fail(fmt.Errorf("%w for %s", ErrSpotifyGone, spotifyGoneAfter))
 		return
 	}
 	if e.last.Err == nil && !e.last.At.IsZero() {
