@@ -332,10 +332,15 @@ func (s *setupFlow) ensure(ctx context.Context, k permission.Kind) bool {
 	}
 	app := svc.hostApp()
 	s.say("%s %s needs permission: %s.", s.a.out.paint(colorYellow, "!"), app, permission.Instructions(k, app))
+	if k == permission.SystemAudio {
+		s.say("%s", systemAudioSteps(app, svc.permission(permission.ScreenRecording) == permission.Granted))
+	}
 	s.say("  Opening System Settings there…")
 	_ = svc.runScript(ctx, "open", permission.SettingsURL(k))
 	s.say("  Waiting for the switch (up to %s; Ctrl-C to stop)…", permissionWait)
-	deadline := s.a.deps.now().Add(permissionWait)
+	start := s.a.deps.now()
+	deadline := start.Add(permissionWait)
+	next := start.Add(waitReminder)
 	for s.a.deps.now().Before(deadline) {
 		if !svc.sleep(ctx, time.Second) {
 			return false
@@ -344,9 +349,31 @@ func (s *setupFlow) ensure(ctx context.Context, k permission.Kind) bool {
 			s.say("%s %s may now %s", s.a.out.paint(colorGreen, "✓"), app, permissionVerb(k))
 			return true
 		}
+		if now := s.a.deps.now(); !now.Before(next) {
+			s.say("  still waiting (%s)… %s", mmss(now.Sub(start)), permission.Where(k))
+			next = now.Add(waitReminder)
+		}
 	}
 	s.say("%s still not granted", s.a.out.paint(colorRed, "✗"))
 	return false
+}
+
+// waitReminder is how often setup says it is still waiting.
+const waitReminder = 30 * time.Second
+
+// systemAudioSteps spells out the one permission macOS lets nobody prompt
+// for. listedAbove reports the common mistake: the app switched on in the
+// screen-recording list, which does not cover a process tap.
+func systemAudioSteps(app permission.HostApp, listedAbove bool) string {
+	steps := "  In the System Settings window that opens:\n" +
+		"    1. Scroll to the second list, \"System Audio Recording Only\".\n" +
+		"    2. Click + under it, choose " + app.String() + " (in Applications), and make sure its switch is on.\n" +
+		"    3. If macOS offers to quit " + app.String() + ", choose \"Later\": setup continues as soon as the switch is on."
+	if listedAbove {
+		steps += "\n  " + app.String() + " is already on in the first list, \"Screen & System Audio Recording\":" +
+			" that one is for screen recording and does not let a process tap hear Spotify."
+	}
+	return steps
 }
 
 func permissionVerb(k permission.Kind) string {

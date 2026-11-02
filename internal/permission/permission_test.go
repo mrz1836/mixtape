@@ -50,7 +50,7 @@ func TestFromCode(t *testing.T) {
 func TestChecksAnswer(t *testing.T) {
 	t.Parallel()
 	valid := []State{Granted, Denied, Undecided, Unknown}
-	for _, k := range []Kind{SystemAudio, Microphone, Automation} {
+	for _, k := range []Kind{SystemAudio, Microphone, Automation, ScreenRecording} {
 		st := Check(k)
 		t.Logf("%s: %s", k, st)
 		assert.Contains(t, valid, st, k)

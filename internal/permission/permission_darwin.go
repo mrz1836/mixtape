@@ -24,6 +24,8 @@ func Check(k Kind) State {
 		return fromCode(int(C.mt_perm_microphone()))
 	case Automation:
 		return automation(false)
+	case ScreenRecording:
+		return fromCode(int(C.mt_perm_screen_recording()))
 	}
 	return Unknown
 }
@@ -38,7 +40,7 @@ func Request(k Kind) State {
 		return fromCode(int(C.mt_perm_request_microphone(requestTimeout)))
 	case Automation:
 		return automation(true)
-	case SystemAudio:
+	case SystemAudio, ScreenRecording:
 	}
 	return Check(k)
 }

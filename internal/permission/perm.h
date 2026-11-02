@@ -5,6 +5,7 @@
 
 // States: 0 granted, 1 denied, 2 undecided, -1 unknown.
 int mt_perm_system_audio(void);
+int mt_perm_screen_recording(void);
 int mt_perm_microphone(void);
 // mt_perm_request_microphone shows the microphone prompt when undecided and
 // waits for the answer (up to timeout_seconds).

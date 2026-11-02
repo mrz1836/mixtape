@@ -452,6 +452,7 @@ func TestDoctorNamesTheMissingSystemAudioPermission(t *testing.T) {
 	require.NotNil(t, found, "the tap method reports its permission")
 	assert.Equal(t, "fail", found["status"])
 	assert.Contains(t, found["detail"], "iTerm has not been allowed")
+	assert.Contains(t, found["detail"], "on in the screen-recording list, which does not cover the tap")
 	assert.Contains(t, found["fix"], "add iTerm under")
 	assert.Contains(t, found["fix"], "System Audio Recording Only")
 }
@@ -489,12 +490,18 @@ func TestSetupOpensSettingsAndWaitsForTheTapPermission(t *testing.T) {
 	h := newHarness(t)
 	h.deps.stdinTTY, h.deps.stdoutTTY = true, true
 	h.world.perms[permission.SystemAudio] = permission.Undecided
-	h.world.grantAfter[permission.SystemAudio] = 4 // switched on a few seconds later
+	h.world.perms[permission.ScreenRecording] = permission.Granted // the common mix-up
+	h.world.grantAfter[permission.SystemAudio] = 65                // switched on about a minute later
 	h.deps.services.openCapture = func(captureRequest) (capture.Source, error) { return &loudSource{}, nil }
 
 	require.Equal(t, ExitOK, h.run("setup", "--yes"), h.stderr.String())
 	out := h.stdout.String()
 	assert.Contains(t, out, "iTerm needs permission: add iTerm under")
+	assert.Contains(t, out, "Click + under it, choose iTerm")
+	assert.Contains(t, out, `iTerm is already on in the first list, "Screen & System Audio Recording"`)
+	assert.Contains(t, out, `choose "Later"`)
+	assert.Contains(t, out, "still waiting (0:30)")
+	assert.Contains(t, out, "still waiting (1:00)")
 	assert.Contains(t, out, "iTerm may now record system audio")
 	assert.Contains(t, out, "saved capture = tap")
 	assert.Contains(t, h.world.scripts, "open "+permission.SettingsURL(permission.SystemAudio))

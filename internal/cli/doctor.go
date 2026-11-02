@@ -212,6 +212,9 @@ func (a *app) permissionCheck(k permission.Kind) check {
 		if k == permission.Microphone {
 			c.Status, c.Fix = checkWarn, "macOS asks the first time; 'mixtape setup' shows the prompt"
 		}
+		if k == permission.SystemAudio && a.deps.services.permission(permission.ScreenRecording) == permission.Granted {
+			c.Detail += "; it is on in the screen-recording list, which does not cover the tap"
+		}
 	case permission.Denied:
 		c.Status, c.Detail = checkFail, app.String()+" is not allowed to "+what
 		c.Fix = permission.Instructions(k, app)

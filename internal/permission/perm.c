@@ -45,6 +45,8 @@ static int preflight(CFStringRef service) {
 
 int mt_perm_system_audio(void) { return preflight(CFSTR("kTCCServiceAudioCapture")); }
 
+int mt_perm_screen_recording(void) { return preflight(CFSTR("kTCCServiceScreenCapture")); }
+
 int mt_perm_microphone(void) { return preflight(CFSTR("kTCCServiceMicrophone")); }
 
 int mt_perm_request_microphone(int timeout_seconds) {

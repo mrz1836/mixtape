@@ -24,6 +24,10 @@ const (
 	Microphone Kind = "microphone"
 	// Automation lets mixtape control Spotify over Apple Events.
 	Automation Kind = "automation"
+	// ScreenRecording is the top list of the same Settings pane. mixtape
+	// does not need it; it is checked only because people switch the
+	// terminal on there and expect that to cover the tap. It does not.
+	ScreenRecording Kind = "screen_recording"
 )
 
 // State is what macOS answers for a permission.
