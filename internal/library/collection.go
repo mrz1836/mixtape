@@ -94,7 +94,7 @@ func (c *Collection) Sync(tracks []Track, complete bool) {
 		if used[i] {
 			continue
 		}
-		if complete {
+		if complete && len(tracks) > 0 { // an empty list is never trusted to remove everything
 			e.Status = StatusRemoved
 		}
 		e.Position = len(out) + 1

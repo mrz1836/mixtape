@@ -111,4 +111,10 @@ var (
 	ErrUnsafeFix = errors.New("refusing to rewrite manifests: the library looks unmounted or mostly missing")
 	// ErrBadManifest reports a mixtape.json that cannot be read.
 	ErrBadManifest = errors.New("unreadable manifest")
+	// ErrStore reports a recording that could not be written into the
+	// library (an unplugged drive, a full disk, no permission).
+	ErrStore = errors.New("could not save the recording")
+	// ErrKeptComplete reports a partial recording that was not stored
+	// because a complete one is already in place.
+	ErrKeptComplete = errors.New("a complete recording is already in place; the partial take was not kept")
 )

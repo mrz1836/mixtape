@@ -95,6 +95,10 @@ var (
 	errTimeout      = errors.New("timed out waiting for the session")
 )
 
+// hintNoSound is the fix for Spotify playing while no sound reaches mixtape.
+const hintNoSound = "check that Spotify plays on this Mac, not on another device (Spotify Connect: the speaker icon at the bottom right of Spotify), " +
+	"and that Spotify's volume is not at 0"
+
 // Error is a failure with a stable contract: a machine code, a one-line
 // message, an optional hint telling the user how to fix it, and the exit
 // code. Every error a command returns is resolved to one by [mapErr].
@@ -157,7 +161,18 @@ func rules() []rule {
 		{tap.ErrNoProcess, ExitNotReady, "start playing something in Spotify, then run again"},
 		{
 			engine.ErrSilentDevice, ExitNotReady,
-			"route Spotify's output to the capture device with a Multi-Output Device (see 'mixtape setup')",
+			"route Spotify's output to the capture device with a Multi-Output Device (see 'mixtape setup'), " +
+				"and check that Spotify plays on this Mac, not on another device",
+		},
+		{errTapHearsNothing, ExitNotReady, hintNoSound},
+		{engine.ErrNoSound, ExitNotReady, hintNoSound},
+		{
+			engine.ErrNotStarting, ExitNotReady,
+			"check that Spotify is signed in and online, and that a song plays when you click it in Spotify",
+		},
+		{
+			engine.ErrFailing, ExitIncomplete,
+			"run 'mixtape doctor', check that Spotify plays on this Mac, then run the same command again",
 		},
 		{errNotReady, ExitNotReady, "run 'mixtape setup' to fix what failed"},
 
@@ -192,6 +207,11 @@ func rules() []rule {
 
 		// Errors with a fix.
 		{library.ErrUnsafeFix, ExitError, "check that the library drive is mounted; --force rewrites anyway"},
+		{
+			library.ErrStore, ExitPermission,
+			"check that the library folder is still there and writable (an external drive may be unplugged) and that the disk has free space; the song stays pending for the next run",
+		},
+		{engine.ErrSpoolWrite, ExitError, "free some disk space (captured audio is buffered in the mixtape home's spool folder) and run the command again"},
 		{spotify.ErrCatalog, ExitError, "check your internet connection and try again"},
 		{engine.ErrSpotifyGone, ExitError, "check that Spotify is still open, then run the command again"},
 		{errTimeout, ExitTimeout, "the session is still running: wait again, or 'mixtape stop' it"},

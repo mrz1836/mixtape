@@ -43,6 +43,8 @@ type take struct {
 	midSince time.Time
 	// announced: track_started was emitted for this take.
 	announced bool
+	// silent: the song played on while capture heard nothing.
+	silent bool
 }
 
 func (t *take) lastPos() float64 {
@@ -296,7 +298,12 @@ func (e *Engine) parked(s spotify.Snapshot) bool {
 // onPlayerError handles a failed observation.
 func (e *Engine) onPlayerError(s spotify.Snapshot) {
 	switch {
-	case isAny(s.Err, spotify.ErrNotAuthorized, spotify.ErrAppleEventsBlocked):
+	case isAny(s.Err, spotify.ErrNotAuthorized),
+		// Blocked Apple Events are fatal only before Spotify ever answered.
+		// Mid-session the same error is Spotify quitting or relaunching (its
+		// process is still listed but no longer answers): it gets the grace
+		// period of a Spotify that is gone.
+		isAny(s.Err, spotify.ErrAppleEventsBlocked) && e.last.At.IsZero():
 		e.fail(s.Err)
 	case isAny(s.Err, spotify.ErrPromptPending):
 		e.warn("macOS is asking whether mixtape may control Spotify: approve the prompt")
@@ -479,6 +486,7 @@ func (e *Engine) settle(t *take, seg Segment) {
 		if err != nil {
 			it.state = itemPending
 			e.failItem(it, "render: "+err.Error())
+			e.setback(setbackOther, "render: "+err.Error())
 			return
 		}
 		e.submitCommit(it, t, path, !complete, seg.Covered)
@@ -545,6 +553,13 @@ func (e *Engine) discardOrRetry(t *take, reason string, kept bool) {
 	if !kept {
 		e.counts.Discarded++
 		e.emit(Event{Type: EventTrackDiscarded, Track: t.eventTrack(), Reason: reason})
+	}
+	if !t.userSkipped && !t.endedByUs {
+		kind := setbackOther
+		if t.silent {
+			kind = setbackSilent
+		}
+		e.setback(kind, reason)
 	}
 	switch {
 	case t.userSkipped:
@@ -660,8 +675,8 @@ func itemTrack(it *Item) *EventTrack {
 
 // libraryTrack merges what the plan knew with what Spotify reported while
 // the song played.
-func libraryTrack(it *Item, played spotify.Track) library.Track {
-	t := it.Track
+func libraryTrack(it *Item, base library.Track, played spotify.Track) library.Track {
+	t := base
 	if played.ID != "" && played.ID != t.ID {
 		t.PlayedID = played.ID
 	}
@@ -702,4 +717,49 @@ func isAny(err error, targets ...error) bool {
 		}
 	}
 	return false
+}
+
+// setbackKind classifies a song that could not be recorded.
+type setbackKind int
+
+const (
+	setbackOther      setbackKind = iota // cut short, drifted, failed to save
+	setbackSilent                        // played, but no sound reached mixtape
+	setbackNotStarted                    // Spotify did not start it
+)
+
+// setback counts a song (or one attempt at it) that could not be recorded
+// for a reason outside mixtape's and the listener's control. After
+// MaxFailures in a row the session ends with an error naming the likely
+// cause, instead of trying every song the same way: signed out, offline,
+// playing on another device, or muted. A recorded song resets the count.
+func (e *Engine) setback(kind setbackKind, reason string) {
+	if e.opts.MaxFailures <= 0 || e.plan.Mode == ModeLive || e.stopping {
+		return
+	}
+	e.streak = append(e.streak, kind)
+	e.lastSetback = reason
+	if len(e.streak) >= e.opts.MaxFailures {
+		e.fail(e.streakError())
+	}
+}
+
+// streakError names what the setbacks in a row have in common.
+func (e *Engine) streakError() error {
+	n := len(e.streak)
+	all := func(k setbackKind) bool {
+		for _, s := range e.streak {
+			if s != k {
+				return false
+			}
+		}
+		return true
+	}
+	switch {
+	case all(setbackSilent):
+		return fmt.Errorf("%w (%d in a row)", ErrNoSound, n)
+	case all(setbackNotStarted):
+		return fmt.Errorf("%w (%d in a row)", ErrNotStarting, n)
+	}
+	return fmt.Errorf("%w (%d in a row; the last: %s)", ErrFailing, n, e.lastSetback)
 }

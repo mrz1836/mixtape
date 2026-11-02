@@ -9,6 +9,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/mrz1836/mixtape/internal/mp4tag"
 )
 
 func TestOpenCreatesRoot(t *testing.T) {
@@ -141,6 +143,19 @@ func ids(c *Collection) []string {
 	return out
 }
 
+func TestSyncNeverRemovesEverythingForAnEmptyList(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t, nil)
+	c := f.collection(playlistSpec())
+	c.Sync([]Track{trackTime(), trackMoney()}, true)
+	c.Sync(nil, true)
+	for _, e := range c.Manifest.Tracks {
+		assert.NotEqual(t, StatusRemoved, e.Status, e.Title)
+	}
+	c.Sync([]Track{trackTime()}, true)
+	assert.Equal(t, StatusRemoved, c.Entry(trackMoney().ID).Status, "a non-empty complete list still removes")
+}
+
 func TestSyncMatchesRelinkedIDs(t *testing.T) {
 	t.Parallel()
 	f := newFixture(t, nil)
@@ -265,6 +280,40 @@ func TestCommitNameCollisionAndRedo(t *testing.T) {
 	entries, err := os.ReadDir(c.Dir)
 	require.NoError(t, err)
 	assert.Len(t, entries, 4, "two songs, a manifest and a playlist")
+}
+
+func TestPartialNeverReplacesACompleteRecording(t *testing.T) {
+	t.Parallel()
+	requireAAC(t)
+	f := newFixture(t, nil)
+	c := f.collection(Spec{Kind: KindSingles})
+	good := f.commit(c, trackTime(), 440, CommitOptions{})
+
+	wav := f.wav(550)
+	got, err := f.lib.Commit(t.Context(), c, trackTime(), wav, CommitOptions{Partial: true})
+	require.ErrorIs(t, err, ErrKeptComplete)
+	assert.Equal(t, good.AudioSHA256, got.AudioSHA256, "the complete entry is reported back unchanged")
+	assert.Equal(t, good.AudioSHA256, c.Entry(trackTime().ID).AudioSHA256)
+	assert.False(t, c.Entry(trackTime().ID).Partial)
+	hash, err := mp4tag.HashFile(c.Path(c.Entry(trackTime().ID)))
+	require.NoError(t, err)
+	assert.Equal(t, good.AudioSHA256, hash, "the file on disk is the complete recording")
+	assert.NoFileExists(t, wav, "the partial's WAV is not left behind")
+}
+
+func TestCommitIntoAnUnwritableFolderIsAStoreError(t *testing.T) {
+	t.Parallel()
+	requireAAC(t)
+	f := newFixture(t, nil)
+	c := f.collection(Spec{Kind: KindSingles})
+	require.NoError(t, f.lib.Save(c))
+	require.NoError(t, os.Chmod(c.Dir, 0o500))
+	t.Cleanup(func() { _ = os.Chmod(c.Dir, 0o700) })
+
+	wav := f.wav(440)
+	_, err := f.lib.Commit(t.Context(), c, trackTime(), wav, CommitOptions{})
+	require.ErrorIs(t, err, ErrStore)
+	assert.NoFileExists(t, wav, "the WAV is not leaked")
 }
 
 func TestPartialIsNotDone(t *testing.T) {

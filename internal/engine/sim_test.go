@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"cmp"
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
@@ -18,6 +19,7 @@ import (
 
 	"github.com/mrz1836/mixtape/internal/capture"
 	"github.com/mrz1836/mixtape/internal/library"
+	"github.com/mrz1836/mixtape/internal/session"
 	"github.com/mrz1836/mixtape/internal/spotify"
 	"github.com/mrz1836/mixtape/internal/wav"
 )
@@ -75,6 +77,11 @@ type fakeSpotify struct {
 	resumeIn int
 	resumeTo resumeSpot
 	hold     time.Duration // position frozen at 0 while it re-buffers
+	// ignorePlay makes "play track" do nothing (signed out, offline).
+	ignorePlay bool
+	// failNext makes the next observations fail with failErr.
+	failNext int
+	failErr  error
 	shuffle  bool
 	repeat   bool
 	volume   int
@@ -135,9 +142,11 @@ func (f *fakeSpotify) advance(d time.Duration) {
 	}
 	f.pos = 0
 	f.idx++
+	f.skipUnplayable()
 	if f.idx >= len(f.queue) {
 		if f.repeat && len(f.queue) > 0 {
 			f.idx = 0
+			f.skipUnplayable()
 			return
 		}
 		f.idx = len(f.queue) - 1
@@ -145,9 +154,21 @@ func (f *fakeSpotify) advance(d time.Duration) {
 	}
 }
 
+// skipUnplayable moves past tracks Spotify cannot play here, as the app
+// does on every pass through a context.
+func (f *fakeSpotify) skipUnplayable() {
+	for f.idx < len(f.queue) && f.unplayable[f.queue[f.idx]] {
+		f.idx++
+	}
+}
+
 func (f *fakeSpotify) snapshot() spotify.Snapshot {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.failNext > 0 {
+		f.failNext--
+		return spotify.Snapshot{At: f.now(), Err: f.failErr}
+	}
 	s := spotify.Snapshot{At: f.now(), State: spotify.StatePaused, Volume: f.volume, Shuffle: f.shuffle, Repeat: f.repeat}
 	if f.playing {
 		s.State = spotify.StatePlaying
@@ -228,6 +249,9 @@ func (f *fakeSpotify) PlayTrack(_ context.Context, uri, ctxURI string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.log("play " + uri + " in " + ctxURI)
+	if f.ignorePlay {
+		return nil
+	}
 	if f.stalePlay {
 		f.stalePos, f.staleFor = f.pos+12*time.Second, 3
 	}
@@ -298,8 +322,10 @@ func (f *fakeSpotify) Next(context.Context) error {
 	f.log("next")
 	f.pos = 0
 	f.idx++
+	f.skipUnplayable()
 	if f.idx >= len(f.queue) {
 		f.idx = 0
+		f.skipUnplayable()
 		if !f.repeat {
 			f.playing = false
 		}
@@ -352,13 +378,18 @@ type fakeSource struct {
 	sink   func(capture.Block)
 	events chan capture.Event
 	silent bool
+	rate   int // capture rate; 0 is testRate
 }
 
 func newFakeSource() *fakeSource { return &fakeSource{events: make(chan capture.Event, 4)} }
 
-func (s *fakeSource) Name() string                 { return "fake" }
-func (s *fakeSource) Method() capture.Method       { return capture.MethodDevice }
-func (s *fakeSource) Format() capture.Format       { return capture.Format{Rate: testRate, Channels: 2} }
+func (s *fakeSource) Name() string           { return "fake" }
+func (s *fakeSource) Method() capture.Method { return capture.MethodDevice }
+func (s *fakeSource) Format() capture.Format {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return capture.Format{Rate: cmp.Or(s.rate, testRate), Channels: 2}
+}
 func (s *fakeSource) Events() <-chan capture.Event { return s.events }
 func (s *fakeSource) Close() error                 { return nil }
 
@@ -451,6 +482,9 @@ type sim struct {
 	// at runs scripted user actions keyed by simulated time offset.
 	at    map[time.Duration]func(*sim)
 	start time.Time
+	eng   *Engine // the running engine, for actions that inject faults
+	// pending is an interrupted session's Spotify state to put back.
+	pending *session.SpotifyState
 }
 
 func newSim(t *testing.T, tracks ...simTrack) *sim {
@@ -507,7 +541,7 @@ func (s *sim) run(cols []spotify.Collection, o Options, controls chan Control) (
 	eng, err := New(Config{
 		Player: s.spotify, Source: s.source, Library: s.lib,
 		SpoolDir: filepath.Join(s.home, "spool"), WorkDir: filepath.Join(s.home, "work"),
-		Options: o, Now: s.now,
+		Options: o, Now: s.now, PendingSpotify: s.pending,
 		Emit: func(ev Event) {
 			s.mu.Lock()
 			s.events = append(s.events, ev)
@@ -516,6 +550,9 @@ func (s *sim) run(cols []spotify.Collection, o Options, controls chan Control) (
 	})
 	require.NoError(s.t, err)
 
+	s.mu.Lock()
+	s.eng = eng
+	s.mu.Unlock()
 	ctx, cancel := context.WithTimeout(s.t.Context(), 30*time.Second)
 	defer cancel()
 	done := make(chan struct{})
@@ -559,7 +596,7 @@ func (s *sim) drive(ctx context.Context, done <-chan struct{}, eng *Engine) {
 		loud := ok && s.spotify.playing
 		s.spotify.mu.Unlock()
 		s.spotify.advance(stepDur)
-		s.source.emit(int(stepDur.Seconds()*testRate), now.Add(-stepDur), loud)
+		s.source.emit(int(stepDur.Seconds()*float64(s.source.Format().Rate)), now.Add(-stepDur), loud)
 
 		sincePoll += stepDur
 		if sincePoll < pollDur {

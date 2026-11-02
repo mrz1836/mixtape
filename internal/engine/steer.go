@@ -102,21 +102,24 @@ func (e *Engine) steer(ctx context.Context, s spotify.Snapshot) {
 		return
 	}
 	t := e.cur
-	if t != nil && (t.ad || t.recording) {
+	if t != nil && t.ad {
+		if w := e.waiting; w != nil {
+			w.at = s.At // an ad break does not count against the song's start
+		}
+		return
+	}
+	if t != nil && t.recording {
 		return
 	}
 	if e.userPaused(s) {
 		return
 	}
 	if w := e.waiting; w != nil {
-		limit := e.opts.StartTimeout
-		if t != nil && t.ad {
-			limit += adGrace
-		}
-		if s.At.Sub(w.at) < limit {
+		if s.At.Sub(w.at) < e.opts.StartTimeout {
 			return
 		}
 		e.waiting = nil
+		e.setback(setbackNotStarted, "Spotify did not start it")
 		if w.item.attempts >= maxTakes {
 			e.failItem(w.item, "Spotify did not start it")
 		} else {
@@ -213,9 +216,13 @@ func (e *Engine) underway() int {
 // its known songs, mixtape follows the playlist in Spotify (shuffle off,
 // repeat on) until it loops back to its first two songs.
 type followState struct {
-	group      *Group
-	active     bool
-	first      string // ID of the playlist's first song
+	group  *Group
+	active bool
+	// known maps the songs listed before following began to their order;
+	// beyond is set once a song past them played.
+	known      map[string]int
+	beyond     bool
+	first      string // ID of the first song seen while following
 	second     string
 	lastID     string // the previous track seen while following
 	skipNextOf string // press next when this track begins
@@ -236,14 +243,10 @@ func (e *Engine) steerFollow(ctx context.Context, s spotify.Snapshot) bool {
 	if g == nil {
 		return false
 	}
-	fs := &followState{group: g, active: true, startedAt: s.At}
+	fs := &followState{group: g, active: true, startedAt: s.At, known: knownOrder(g)}
 	if n := len(g.Items); n > 0 && e.flowedOn(g.Items[n-1]) {
 		// The last known song just played out: Spotify is already moving
 		// on through the playlist, so follow from here.
-		fs.first = g.Items[0].Track.ID
-		if n > 1 {
-			fs.second = g.Items[1].Track.ID
-		}
 		fs.lastID = g.Items[n-1].Track.ID
 		e.follow = fs
 		if t := e.cur; t != nil && !t.ad && !t.recording {
@@ -254,10 +257,6 @@ func (e *Engine) steerFollow(ctx context.Context, s spotify.Snapshot) bool {
 		return true
 	}
 	if n := len(g.Items); n > 0 {
-		fs.first = g.Items[0].Track.ID
-		if n > 1 {
-			fs.second = g.Items[1].Track.ID
-		}
 		last := g.Items[n-1]
 		fs.skipNextOf = last.Track.ID
 		e.releaseCur()
@@ -273,6 +272,37 @@ func (e *Engine) steerFollow(ctx context.Context, s spotify.Snapshot) bool {
 	e.follow = fs
 	e.lastActive = s.At
 	return true
+}
+
+// knownOrder indexes the songs the catalog listed, by requested and
+// played ID.
+func knownOrder(g *Group) map[string]int {
+	m := make(map[string]int, len(g.Items))
+	for i, it := range g.Items {
+		m[it.Track.ID] = i
+		if it.Track.PlayedID != "" {
+			m[it.Track.PlayedID] = i
+		}
+	}
+	return m
+}
+
+// looped reports that Spotify is back at the start of the playlist. With
+// a known head of the list, that is two of its songs playing one after the
+// other in order: playback past the known list never returns to them until
+// the context wraps around. Whichever songs Spotify skips (unplayable here),
+// it skips on every pass, so this holds when the first song never plays.
+// Without a known list, it is the first two songs seen repeating.
+func (fs *followState) looped(prev, id string) bool {
+	pi, prevKnown := fs.known[prev]
+	ci, curKnown := fs.known[id]
+	if !curKnown && id != "" {
+		fs.beyond = true
+	}
+	if fs.beyond && prevKnown && curKnown && ci > pi {
+		return true
+	}
+	return fs.first != "" && fs.second != "" && id == fs.second && prev == fs.first
 }
 
 func (e *Engine) nextFollowGroup() *Group {
@@ -307,7 +337,7 @@ func (e *Engine) followTrack(ctx context.Context, t *take, s spotify.Snapshot) *
 		fs.skipNextOf = ""
 		e.next(ctx)
 		return nil
-	case fs.first != "" && id == fs.second && prev == fs.first:
+	case fs.looped(prev, id):
 		fs.active = false // looped: the whole playlist has been seen
 		e.stop("")
 		return nil

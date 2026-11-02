@@ -350,7 +350,14 @@ func (s *Source) rebuild(kind capture.EventKind, detail string) {
 		}
 		return
 	}
-	if kind == capture.EventFormatChanged && s.Format().Rate == oldRate {
+	// What changed is decided by the rates: a new output device can run at
+	// another rate (headphones at 44.1 kHz after speakers at 48 kHz), and a
+	// rate event can leave the rate as it was.
+	switch rate := s.Format().Rate; {
+	case rate != oldRate:
+		kind = capture.EventFormatChanged
+		detail += fmt.Sprintf(" (%d Hz → %d Hz)", oldRate, rate)
+	case kind == capture.EventFormatChanged:
 		kind = capture.EventDeviceChanged
 	}
 	s.emit(kind, detail)

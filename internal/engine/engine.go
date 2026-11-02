@@ -64,6 +64,17 @@ var (
 	// ErrCrossfade reports songs that keep changing a few seconds before
 	// their end, the signature of Spotify's crossfade.
 	ErrCrossfade = errors.New("songs keep ending early: Spotify's crossfade appears to be on")
+	// ErrSpoolWrite reports that captured audio could not be written to the
+	// spool (usually a full disk).
+	ErrSpoolWrite = errors.New("could not write the captured audio to disk")
+	// ErrNoSound reports songs that kept playing without any sound reaching
+	// mixtape: Spotify plays on another device, or its volume is at 0.
+	ErrNoSound = errors.New("songs keep playing without any sound reaching mixtape")
+	// ErrNotStarting reports songs Spotify kept not starting: signed out,
+	// offline, or stuck.
+	ErrNotStarting = errors.New("the songs keep not starting in Spotify")
+	// ErrFailing reports songs that kept failing in a row for other reasons.
+	ErrFailing = errors.New("the songs keep failing")
 )
 
 // Options tune a session.
@@ -86,6 +97,9 @@ type Options struct {
 	Poll time.Duration
 	// StartTimeout is how long a requested song may take to start.
 	StartTimeout time.Duration
+	// MaxFailures ends a queue session after this many songs in a row
+	// could not be recorded (silent, not started, cut short); 0 never does.
+	MaxFailures int
 	// Verbose emits boundary diagnostics.
 	Verbose bool
 	// AllowCrossfade records even though Spotify blends songs together.
@@ -106,7 +120,10 @@ type Config struct {
 	// SaveSpotify persists the player settings before the session
 	// changes them, so a crash can still put them back.
 	SaveSpotify func(session.SpotifyState) error
-	Now         func() time.Time
+	// PendingSpotify is what an interrupted session left changed in Spotify
+	// and could not put back yet; this session's restore finishes the job.
+	PendingSpotify *session.SpotifyState
+	Now            func() time.Time
 }
 
 // Result is how a session ended.
@@ -135,8 +152,7 @@ type Progress struct {
 const (
 	defaultPoll         = 150 * time.Millisecond
 	defaultStartTimeout = 15 * time.Second
-	adGrace             = 45 * time.Second // extra start wait while an ad plays
-	maxTakes            = 2                // a song is tried at most this often
+	maxTakes            = 2 // a song is tried at most this often
 	silenceWindow       = 10 * time.Second
 	silenceFloor        = 64 // |sample| at or below this counts as silence
 	spotifyGoneAfter    = time.Minute
@@ -154,14 +170,19 @@ type Engine struct {
 	now  func() time.Time
 	plan *Plan
 
-	spoolMu sync.Mutex
-	spool   *spool.Spool
+	spoolMu  sync.Mutex
+	spool    *spool.Spool
+	spoolErr error // the first spool write error (guarded by spoolMu)
+
+	// streak holds the setbacks since the last song recorded (see setback).
+	streak      []setbackKind
+	lastSetback string
 	// capStart is when capture began; loudAt is the offset from it of the
 	// last block above the silence floor (−1 before any).
 	capStart time.Time
 	loudAt   atomic.Int64
 
-	jobs     chan job
+	jobs     *jobQueue
 	results  chan result
 	inflight int // jobs submitted and not yet reported
 	// working mirrors inflight for other goroutines (the test simulator
@@ -219,7 +240,7 @@ func New(cfg Config) (*Engine, error) {
 	}
 	e := &Engine{
 		cfg: cfg, opts: o, tn: cfg.Tuning, now: cfg.Now,
-		jobs: make(chan job, 64), results: make(chan result, 64),
+		jobs: newJobQueue(), results: make(chan result, 64),
 		warned: map[string]bool{},
 	}
 	e.loudAt.Store(-1)
@@ -376,6 +397,7 @@ func (e *Engine) command(ctx context.Context, name string, fn func(context.Conte
 func (e *Engine) onTick(ctx context.Context) {
 	now := e.now()
 	e.lastTick = now
+	e.checkSpool()
 	e.finalizeReady(false)
 	e.checkSilence(now)
 	e.pruneSpool()

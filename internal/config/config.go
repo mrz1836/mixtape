@@ -30,6 +30,7 @@ const (
 	KeyDevice      = "device"
 	KeyArtwork     = "artwork"
 	KeyIdleTimeout = "idle_timeout"
+	KeyMaxFailures = "max_failures"
 )
 
 // Environment variables.
@@ -40,6 +41,7 @@ const (
 	EnvDevice      = "MIXTAPE_DEVICE"
 	EnvArtwork     = "MIXTAPE_ARTWORK"
 	EnvIdleTimeout = "MIXTAPE_IDLE_TIMEOUT"
+	EnvMaxFailures = "MIXTAPE_MAX_FAILURES"
 )
 
 // Capture methods accepted by the capture setting.
@@ -55,6 +57,7 @@ const (
 	DefaultLibraryDir  = "Music/Mixtape"
 	DefaultDevice      = "BlackHole"
 	DefaultIdleTimeout = 10 * time.Minute
+	DefaultMaxFailures = 3
 	fileName           = "config.json"
 )
 
@@ -86,6 +89,7 @@ type File struct {
 	Device      *string `json:"device,omitempty"`
 	Artwork     *bool   `json:"artwork,omitempty"`
 	IdleTimeout *string `json:"idle_timeout,omitempty"`
+	MaxFailures *int    `json:"max_failures,omitempty"`
 }
 
 // Overrides carries the values of command-line flags that were set. A nil
@@ -96,6 +100,7 @@ type Overrides struct {
 	Device      *string
 	Artwork     *bool
 	IdleTimeout *time.Duration
+	MaxFailures *int
 }
 
 // Settings is the resolved configuration.
@@ -105,6 +110,7 @@ type Settings struct {
 	Device      string
 	Artwork     bool
 	IdleTimeout time.Duration
+	MaxFailures int
 	// Sources maps each setting name to the layer that supplied it.
 	Sources map[string]Source
 }
@@ -125,6 +131,10 @@ func Keys() []Key {
 		{KeyDevice, EnvDevice, DefaultDevice, "Capture device name (substring) for the device method"},
 		{KeyArtwork, EnvArtwork, "false", "Embed album artwork in each file (one image download per song)"},
 		{KeyIdleTimeout, EnvIdleTimeout, DefaultIdleTimeout.String(), "End a session after this long with nothing recording (0 = never)"},
+		{
+			KeyMaxFailures, EnvMaxFailures, strconv.Itoa(DefaultMaxFailures),
+			"End a session after this many songs in a row could not be recorded (0 = never)",
+		},
 	}
 }
 
@@ -170,6 +180,7 @@ func Resolve(f File, getenv func(string) string, o Overrides, userHome string) (
 		Capture:     CaptureAuto,
 		Device:      DefaultDevice,
 		IdleTimeout: DefaultIdleTimeout,
+		MaxFailures: DefaultMaxFailures,
 		Sources:     map[string]Source{},
 	}
 	for _, k := range Keys() {
@@ -212,6 +223,8 @@ func (s Settings) Value(key string) string {
 		return strconv.FormatBool(s.Artwork)
 	case KeyIdleTimeout:
 		return s.IdleTimeout.String()
+	case KeyMaxFailures:
+		return strconv.Itoa(s.MaxFailures)
 	}
 	return ""
 }
@@ -292,6 +305,12 @@ func applySetting(s *Settings, key, value, userHome string) error {
 			return fmt.Errorf("%w: idle_timeout %q (want a duration such as 10m, or 0)", ErrInvalidValue, value)
 		}
 		s.IdleTimeout = d
+	case KeyMaxFailures:
+		n, err := strconv.Atoi(strings.TrimSpace(value))
+		if err != nil || n < 0 {
+			return fmt.Errorf("%w: max_failures %q (want a whole number, or 0 for never)", ErrInvalidValue, value)
+		}
+		s.MaxFailures = n
 	default:
 		return fmt.Errorf("%w %q", ErrUnknownKey, key)
 	}
@@ -328,6 +347,9 @@ func fileValues(f File) map[string]string {
 	if f.Artwork != nil {
 		m[KeyArtwork] = strconv.FormatBool(*f.Artwork)
 	}
+	if f.MaxFailures != nil {
+		m[KeyMaxFailures] = strconv.Itoa(*f.MaxFailures)
+	}
 	return m
 }
 
@@ -361,6 +383,9 @@ func flagValues(o Overrides) map[string]string {
 	if o.IdleTimeout != nil {
 		m[KeyIdleTimeout] = o.IdleTimeout.String()
 	}
+	if o.MaxFailures != nil {
+		m[KeyMaxFailures] = strconv.Itoa(*o.MaxFailures)
+	}
 	return m
 }
 
@@ -372,6 +397,13 @@ func encodeValue(key, value string) (json.RawMessage, error) {
 			return nil, fmt.Errorf("%w: artwork %q", ErrInvalidValue, value)
 		}
 		return json.Marshal(b)
+	}
+	if key == KeyMaxFailures {
+		n, err := strconv.Atoi(strings.TrimSpace(value))
+		if err != nil {
+			return nil, fmt.Errorf("%w: max_failures %q", ErrInvalidValue, value)
+		}
+		return json.Marshal(n)
 	}
 	v := strings.TrimSpace(value)
 	if key == KeyCapture {

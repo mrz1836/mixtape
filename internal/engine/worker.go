@@ -3,7 +3,9 @@ package engine
 import (
 	"context"
 	"errors"
+	"fmt"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/mrz1836/mixtape/internal/library"
@@ -28,8 +30,12 @@ const (
 
 // job is one library operation. Only the worker touches the library.
 type job struct {
-	kind    jobKind
-	item    *Item
+	kind jobKind
+	item *Item
+	// track is the item's song as it was when the job was queued: the
+	// engine may still update the item (a relinked ID) while the worker
+	// runs, so the worker reads only this copy.
+	track   library.Track
 	take    *take
 	played  spotify.Track
 	wav     string
@@ -50,21 +56,72 @@ type result struct {
 	err      error
 }
 
+// jobQueue is the worker's unbounded queue. Submitting never blocks: the
+// engine goroutine can queue any number of jobs (hundreds of copies at the
+// start of a run) while the worker waits for it to take results.
+type jobQueue struct {
+	mu     sync.Mutex
+	cond   *sync.Cond
+	jobs   []job
+	closed bool
+}
+
+func newJobQueue() *jobQueue {
+	q := &jobQueue{}
+	q.cond = sync.NewCond(&q.mu)
+	return q
+}
+
+func (q *jobQueue) push(j job) {
+	q.mu.Lock()
+	q.jobs = append(q.jobs, j)
+	q.mu.Unlock()
+	q.cond.Signal()
+}
+
+// pop waits for the next job; ok is false once the queue is closed and empty.
+func (q *jobQueue) pop() (job, bool) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	for len(q.jobs) == 0 && !q.closed {
+		q.cond.Wait()
+	}
+	if len(q.jobs) == 0 {
+		return job{}, false
+	}
+	j := q.jobs[0]
+	q.jobs[0] = job{}
+	q.jobs = q.jobs[1:]
+	return j, true
+}
+
+func (q *jobQueue) close() {
+	q.mu.Lock()
+	q.closed = true
+	q.mu.Unlock()
+	q.cond.Broadcast()
+}
+
 // startWorker launches the library worker.
 func (e *Engine) startWorker(ctx context.Context) {
 	wctx := context.WithoutCancel(ctx) // finish in-flight encodes even when stopping
 	e.wg.Go(func() {
-		for j := range e.jobs {
+		for {
+			j, ok := e.jobs.pop()
+			if !ok {
+				return
+			}
 			e.results <- e.runJob(wctx, j)
 		}
 	})
 }
 
-// submit queues a job for the worker.
+// submit queues a job for the worker; it never blocks.
 func (e *Engine) submit(j job) {
 	e.inflight++
 	e.working.Add(1)
-	e.jobs <- j
+	j.track = j.item.Track
+	e.jobs.push(j)
 }
 
 // drainWorker processes every outstanding result (which may submit more
@@ -74,7 +131,7 @@ func (e *Engine) drainWorker(ctx context.Context) {
 	for e.inflight > 0 {
 		e.onResult(ctx, <-e.results)
 	}
-	close(e.jobs)
+	e.jobs.close()
 	e.wg.Wait()
 }
 
@@ -85,7 +142,7 @@ func (e *Engine) runJob(ctx context.Context, j job) result {
 	c := j.item.Group.Collection
 	switch j.kind {
 	case jobCommit:
-		t := libraryTrack(j.item, j.played)
+		t := libraryTrack(j.item, j.track, j.played)
 		c.Ensure(t)
 		r.entry, r.err = lib.Commit(ctx, c, t, j.wav, library.CommitOptions{
 			Artwork: e.opts.Artwork, KeepWAV: e.opts.KeepWAV, Partial: j.partial,
@@ -95,22 +152,22 @@ func (e *Engine) runJob(ctx context.Context, j job) result {
 			r.loc = &library.Location{Collection: c, Entry: r.entry, Path: c.Path(&r.entry)}
 		}
 	case jobCopy:
-		c.Ensure(j.item.Track)
-		r.entry, r.err = lib.Copy(ctx, c, j.item.Track, *j.from)
+		c.Ensure(j.track)
+		r.entry, r.err = lib.Copy(ctx, c, j.track, *j.from)
 		if r.err == nil {
 			r.loc = &library.Location{Collection: c, Entry: r.entry, Path: c.Path(&r.entry)}
 		}
 	case jobEncode:
-		r.entry, r.err = lib.RetryEncode(ctx, c, j.item.Track.ID, library.CommitOptions{
+		r.entry, r.err = lib.RetryEncode(ctx, c, j.track.ID, library.CommitOptions{
 			Artwork: e.opts.Artwork, KeepWAV: e.opts.KeepWAV,
 		})
 	case jobMark:
-		c.Ensure(j.item.Track)
-		r.err = lib.Mark(c, j.item.Track.ID, j.status, j.reason)
+		c.Ensure(j.track)
+		r.err = lib.Mark(c, j.track.ID, j.status, j.reason)
 	case jobLookup:
-		c.Ensure(j.item.Track)
-		r.inFolder = c.Done(j.item.Track.ID)
-		for _, loc := range lib.Find(j.item.Track.ID) {
+		c.Ensure(j.track)
+		r.inFolder = c.Done(j.track.ID)
+		for _, loc := range lib.Find(j.track.ID) {
 			if loc.Collection.Dir != c.Dir {
 				r.from = &loc
 				break
@@ -141,6 +198,10 @@ func (e *Engine) onResult(ctx context.Context, r result) {
 	case jobCommit, jobEncode:
 		e.onSaved(r)
 	case jobCopy:
+		if errors.Is(r.err, library.ErrStore) {
+			e.storeFailed(it, r.err)
+			return
+		}
 		if r.err != nil {
 			e.failItem(it, "copy: "+r.err.Error())
 			return
@@ -160,6 +221,16 @@ func (e *Engine) onResult(ctx context.Context, r result) {
 func (e *Engine) onSaved(r result) {
 	it := r.item
 	if r.err != nil {
+		if errors.Is(r.err, library.ErrKeptComplete) {
+			// The partial take was not kept: the complete file stays.
+			e.counts.Discarded++
+			e.emit(Event{Type: EventTrackDiscarded, Track: itemTrack(it), Reason: r.err.Error()})
+			return
+		}
+		if errors.Is(r.err, library.ErrStore) {
+			e.storeFailed(it, r.err)
+			return
+		}
 		if errors.Is(r.err, library.ErrEncode) {
 			// The library kept the WAV and marked the song encode_failed;
 			// the next run encodes it again without recording.
@@ -183,10 +254,21 @@ func (e *Engine) onSaved(r result) {
 	it.state = itemDone
 	e.counts.Recorded++
 	e.recorded++
+	e.streak = e.streak[:0] // a song made it: whatever went wrong before has passed
 	e.copyTwins(it, r.loc)
 	if e.limitReached() && e.plan.Mode == ModeLive {
 		e.stop("") // --limit: enough songs recorded
 	}
+}
+
+// storeFailed ends the session when the library cannot take files (an
+// unplugged drive, a full disk): every further song would be lost the same
+// way. The song stays pending for the next run.
+func (e *Engine) storeFailed(it *Item, err error) {
+	if it.state == itemBusy {
+		it.state = itemPending
+	}
+	e.fail(fmt.Errorf("%s: %w", it.Track.Title, err))
 }
 
 // copyTwins copies a song just finished into the other folders of the plan

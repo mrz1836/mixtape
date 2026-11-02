@@ -89,6 +89,16 @@ func (l *Library) Commit(ctx context.Context, c *Collection, t Track, wavPath st
 	if t.ID == "" {
 		return Entry{}, fmt.Errorf("%w: track without an ID", errSpec)
 	}
+	if o.Partial {
+		// Never trade a complete recording for a partial one (--redo with
+		// --keep-partial when the new take falls short).
+		if cur := c.match(t); cur != nil && cur.complete() && exists(c.Path(cur)) {
+			if !o.KeepWAV {
+				_ = os.Remove(wavPath)
+			}
+			return *cur, ErrKeptComplete
+		}
+	}
 	e := c.Ensure(t)
 	e.merge(t, true) // metadata captured while recording is authoritative
 	id := e.RequestedID
@@ -136,7 +146,10 @@ func (l *Library) Commit(ctx context.Context, c *Collection, t Track, wavPath st
 
 	name := c.fileName(e)
 	if err := fileutil.WriteAtomic(filepath.Join(c.Dir, name), tagged, audioPerm); err != nil {
-		return *e, fmt.Errorf("store %s: %w", name, err)
+		if !o.KeepWAV {
+			_ = os.Remove(wavPath) // nothing will reference it: do not leak it
+		}
+		return *e, fmt.Errorf("%w: %s: %w", ErrStore, name, err)
 	}
 
 	now := l.opts.Now().UTC().Round(0)
@@ -148,11 +161,12 @@ func (l *Library) Commit(ctx context.Context, c *Collection, t Track, wavPath st
 	e.RecordedMS = o.RecordedMS
 	e.CopiedFrom, e.FailReason, e.PendingWAV = "", "", ""
 	result := *e
-	if err := l.Save(c); err != nil {
-		return result, err
-	}
+	saveErr := l.Save(c) // the file is in place either way: the next run adopts it by its tags
 	if !o.KeepWAV {
 		_ = os.Remove(wavPath)
+	}
+	if saveErr != nil {
+		return result, fmt.Errorf("%w: %w", ErrStore, saveErr)
 	}
 	return result, nil
 }
@@ -232,7 +246,7 @@ func (l *Library) Copy(_ context.Context, c *Collection, t Track, src Location) 
 	}
 	name := c.fileName(e)
 	if err := fileutil.WriteAtomic(filepath.Join(c.Dir, name), tagged, audioPerm); err != nil {
-		return *e, fmt.Errorf("store %s: %w", name, err)
+		return *e, fmt.Errorf("%w: %s: %w", ErrStore, name, err)
 	}
 
 	e = c.Entry(id)
@@ -249,7 +263,10 @@ func (l *Library) Copy(_ context.Context, c *Collection, t Track, src Location) 
 	}
 	e.FailReason, e.PendingWAV = "", ""
 	result := *e
-	return result, l.Save(c)
+	if err := l.Save(c); err != nil {
+		return result, fmt.Errorf("%w: %w", ErrStore, err)
+	}
+	return result, nil
 }
 
 // tags returns the full tag set for e in c.

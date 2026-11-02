@@ -212,6 +212,26 @@ func TestResolveFallsBackToOEmbed(t *testing.T) {
 	assert.Equal(t, CatalogTrack{ID: testTrackID, Title: "From oEmbed", Playable: true, Position: 1}, col.Tracks[0])
 }
 
+func TestResolveEmptyTrackListIsNotAnEmptyCollection(t *testing.T) {
+	t.Parallel()
+	pages := map[string]page{
+		// The page still names the playlist, but its list is gone (renamed
+		// key, or emptied): it must not read as a complete, empty playlist.
+		"playlist/" + testPlaylistID: {status: http.StatusOK, body: embedHTML(t, map[string]any{"type": "playlist", "name": "Road Trip"})},
+		"album/" + testAlbumID: {status: http.StatusOK, body: embedHTML(t, map[string]any{
+			"type": "album", "name": "Empty", "trackList": []any{},
+		})},
+	}
+	_, c := newCatalogServer(t, pages, page{status: http.StatusOK, body: `{"title":"Road Trip","html":"<iframe>"}`})
+
+	for _, ref := range []Ref{{KindPlaylist, testPlaylistID}, {KindAlbum, testAlbumID}} {
+		col, err := c.Resolve(t.Context(), ref)
+		require.NoError(t, err, ref)
+		assert.Equal(t, SourceOEmbed, col.Source, "falls back to following it in Spotify: %v", ref)
+		assert.False(t, col.Complete, ref)
+	}
+}
+
 func TestResolveOEmbedErrors(t *testing.T) {
 	t.Parallel()
 	tests := map[string]struct {

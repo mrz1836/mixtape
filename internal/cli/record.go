@@ -29,7 +29,7 @@ import (
 type recordFlags struct {
 	detach, dryRun, redo, keepPartial, keepWAV, mute, allowCrossfade bool
 	artwork                                                          bool
-	limit                                                            int
+	limit, maxFailures                                               int
 	match, into, capture, device                                     string
 	idleTimeout                                                      time.Duration
 }
@@ -37,6 +37,9 @@ type recordFlags struct {
 var (
 	errCrossfade   = errors.New("spotify crossfade is on, so songs overlap and cannot be cut cleanly")
 	errNoAfconvert = errors.New("afconvert (macOS) was not found")
+	// errTapHearsNothing is a silent tap while macOS reports the audio
+	// permission granted: the sound goes somewhere else.
+	errTapHearsNothing = errors.New("spotify is playing, but no sound reaches mixtape (the audio permission is granted)")
 )
 
 func newRecordCmd(a *app) *cobra.Command {
@@ -93,6 +96,8 @@ Exit codes: 0 complete or stopped, 2 usage, 3 not ready, 4 link not found,
 	fl.StringVar(&f.device, "device", "", "Capture device name for --capture device (config: device)")
 	fl.BoolVar(&f.mute, "mute", false, "Tap only: silence Spotify on the speakers while recording")
 	fl.DurationVar(&f.idleTimeout, "idle-timeout", 0, "End after this long with nothing recording (config: idle_timeout)")
+	fl.IntVar(&f.maxFailures, "max-failures", config.DefaultMaxFailures,
+		"End after this many songs in a row could not be recorded; 0 = never (config: max_failures)")
 	fl.BoolVar(&f.allowCrossfade, "allow-crossfade", false, "Record even though Spotify's crossfade is on")
 	return cmd
 }
@@ -112,6 +117,9 @@ func (f *recordFlags) overrides(cmd *cobra.Command) config.Overrides {
 	}
 	if fl.Changed("idle-timeout") {
 		o.IdleTimeout = &f.idleTimeout
+	}
+	if fl.Changed("max-failures") {
+		o.MaxFailures = &f.maxFailures
 	}
 	return o
 }
@@ -280,9 +288,7 @@ func (a *app) record(ctx context.Context, cmd *cobra.Command, lib *library.Libra
 	defer func() { _ = lock.Release() }()
 
 	p := svc.player()
-	if playback {
-		a.recoverSpotify(ctx, p)
-	}
+	pending := a.recoverSpotify(ctx, p) // even when nothing plays: a copy-only run must not lose it
 	unlock, err := lib.Lock()
 	if err != nil {
 		return err
@@ -295,7 +301,7 @@ func (a *app) record(ctx context.Context, cmd *cobra.Command, lib *library.Libra
 			return err
 		}
 	}
-	rec, err := a.newRecorder(id, plan, settings, src, args)
+	rec, err := a.newRecorder(id, plan, settings, src, args, pending)
 	if err != nil {
 		closeSource(src)
 		return err
@@ -396,22 +402,27 @@ func (a *app) selectCapture(s config.Settings) (capture.Method, error) {
 }
 
 // recoverSpotify puts back Spotify settings an interrupted session left
-// changed. The recorder lock is held, so that session is gone.
-func (a *app) recoverSpotify(ctx context.Context, p player) {
+// changed. The recorder lock is held, so that session is gone. What it
+// cannot put back yet (Spotify is closed, or did not answer) is returned:
+// the new session keeps it and restores it when it ends.
+func (a *app) recoverSpotify(ctx context.Context, p player) *session.SpotifyState {
 	st, err := session.ReadState(a.home)
 	if err != nil || !st.Spotify.NeedsRestore() {
-		return
+		return nil
 	}
 	restored, err := session.Restore(ctx, p, *st.Spotify)
 	if err != nil {
-		a.out.Warn("could not restore Spotify settings from session %s: %v", st.ID, err)
-		return
+		if !errors.Is(err, spotify.ErrNotRunning) {
+			a.out.Warn("could not restore Spotify settings from session %s yet: %v", st.ID, err)
+		}
+		return st.Spotify
 	}
 	st.Spotify.Restored = true
 	_ = session.WriteState(a.home, st)
 	if len(restored) > 0 {
 		a.out.Warn("restored Spotify %s changed by interrupted session %s", strings.Join(restored, ", "), st.ID)
 	}
+	return nil
 }
 
 // detach re-runs this record command in the background and reports how to
@@ -496,7 +507,9 @@ type recorder struct {
 	closed bool
 }
 
-func (a *app) newRecorder(id string, plan *engine.Plan, s config.Settings, src capture.Source, args []string) (*recorder, error) {
+func (a *app) newRecorder(
+	id string, plan *engine.Plan, s config.Settings, src capture.Source, args []string, pending *session.SpotifyState,
+) (*recorder, error) {
 	log, err := session.OpenEventLog(session.EventsPath(a.home, id))
 	if err != nil {
 		return nil, err
@@ -511,6 +524,7 @@ func (a *app) newRecorder(id string, plan *engine.Plan, s config.Settings, src c
 		StartedAt: now, UpdatedAt: now, Library: s.Library,
 		Capture: captureName, Targets: args,
 		Events: log.Path(), Counts: session.Counts{Total: len(plan.Items)},
+		Spotify: pending, // kept until a session puts it back
 	}}
 	if a.deps.getenv(session.EnvDetached) != "" {
 		r.state.Log = session.LogPath(a.home, id)
@@ -545,11 +559,12 @@ func (r *recorder) run(ctx context.Context, lib *library.Library, plan *engine.P
 		Options: engine.Options{
 			Redo: f.redo, KeepPartial: f.keepPartial, KeepWAV: f.keepWAV, Artwork: s.Artwork, Mute: f.mute,
 			Limit: f.limit, Match: f.match, IdleTimeout: s.IdleTimeout, Verbose: a.out.Verbose(),
-			AllowCrossfade: f.allowCrossfade,
+			AllowCrossfade: f.allowCrossfade, MaxFailures: s.MaxFailures,
 		},
-		Emit:        r.emit,
-		SaveSpotify: r.saveSpotify,
-		Now:         a.deps.now,
+		Emit:           r.emit,
+		SaveSpotify:    r.saveSpotify,
+		PendingSpotify: r.pendingSpotify(),
+		Now:            a.deps.now,
 	})
 	if err != nil {
 		return err
@@ -579,6 +594,9 @@ func (r *recorder) run(ctx context.Context, lib *library.Library, plan *engine.P
 	r.write()
 	stopProgress := r.keepProgress()
 	res := eng.Run(runCtx, plan, controls)
+	if errors.Is(res.Err, engine.ErrSilentTap) && a.deps.services.permission(permission.SystemAudio) == permission.Granted {
+		res.Err = errTapHearsNothing
+	}
 	stopProgress()
 	if r.ui != nil {
 		r.ui.close()
@@ -723,6 +741,18 @@ const progressEvery = 2 * time.Second
 
 // saveSpotify persists the player settings the session is about to
 // change (and later, that they were restored).
+// pendingSpotify is the Spotify state an interrupted session left to put
+// back, if any.
+func (r *recorder) pendingSpotify() *session.SpotifyState {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !r.state.Spotify.NeedsRestore() {
+		return nil
+	}
+	st := *r.state.Spotify
+	return &st
+}
+
 func (r *recorder) saveSpotify(st session.SpotifyState) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()

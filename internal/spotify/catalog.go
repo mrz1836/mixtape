@@ -222,6 +222,12 @@ func collectionFromEntity(ref Ref, e *embedEntity) (Collection, error) {
 		return col, nil
 	}
 
+	if len(e.TrackList) == 0 {
+		// An album always has songs, and a playlist page without any is far
+		// more likely a changed page than an empty playlist: never take it
+		// for a complete, empty list (that would mark every song removed).
+		return Collection{}, fmt.Errorf("%w: no track list in the page", errEmbed)
+	}
 	col.Owner = e.Subtitle
 	for _, t := range e.TrackList {
 		id := parseTrackURI(t.URI)

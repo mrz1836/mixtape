@@ -56,7 +56,20 @@ func (e *Engine) sink(b capture.Block) {
 	if e.spool == nil || e.cfg.Source.Format() != e.spool.Format() {
 		return // a format change is being handled; the take is already invalid
 	}
-	_ = e.spool.Append(b)
+	if err := e.spool.Append(b); err != nil && e.spoolErr == nil {
+		e.spoolErr = err // the session loop ends the session: nothing more is captured
+	}
+}
+
+// checkSpool ends the session when the spool could not be written (a full
+// disk): from then on no audio is captured, so every song would fail.
+func (e *Engine) checkSpool() {
+	e.spoolMu.Lock()
+	err := e.spoolErr
+	e.spoolMu.Unlock()
+	if err != nil && e.fatal == nil {
+		e.fail(fmt.Errorf("%w: %w", ErrSpoolWrite, err))
+	}
 }
 
 // peak returns the largest absolute sample in interleaved PCM16LE data.
@@ -99,30 +112,42 @@ func (e *Engine) onCaptureEvent(ev capture.Event) {
 	switch ev.Kind {
 	case capture.EventStopped:
 		e.fail(fmt.Errorf("%w: %s", ErrCaptureStopped, ev.Detail))
-	case capture.EventFormatChanged:
-		e.reopenSpool()
-	case capture.EventDeviceChanged, capture.EventProcessChanged, capture.EventOverflow:
+	case capture.EventFormatChanged, capture.EventDeviceChanged, capture.EventProcessChanged, capture.EventOverflow:
+		// Whatever the event says, a source whose format no longer matches
+		// the spool needs a new spool: until then every block is dropped.
+		if ev.Kind == capture.EventFormatChanged || e.formatChanged() {
+			e.reopenSpool()
+		}
 	}
 	e.warn(reason)
+}
+
+// formatChanged reports whether the source's format differs from the
+// spool's (or there is no spool).
+func (e *Engine) formatChanged() bool {
+	e.spoolMu.Lock()
+	defer e.spoolMu.Unlock()
+	return e.spool == nil || e.spool.Format() != e.cfg.Source.Format()
 }
 
 // reopenSpool replaces the spool after a format change. Every song that
 // touched the old spool has already been invalidated.
 func (e *Engine) reopenSpool() {
 	e.finalizeReady(true)
+	if err := e.swapSpool(); err != nil {
+		e.fail(fmt.Errorf("reopen spool: %w", err))
+	}
+}
+
+func (e *Engine) swapSpool() error {
 	e.spoolMu.Lock()
 	defer e.spoolMu.Unlock()
 	if e.spool != nil {
 		_ = e.spool.Close()
 	}
 	sp, err := spool.Open(e.cfg.SpoolDir, e.cfg.Source.Format())
-	if err != nil {
-		e.spool = nil
-		e.fatal = fmt.Errorf("reopen spool: %w", err)
-		e.stopping = true
-		return
-	}
 	e.spool = sp
+	return err
 }
 
 // checkSilence enforces the silence invariant: Spotify playing a song for
@@ -153,6 +178,7 @@ func (e *Engine) checkSilence(now time.Time) {
 		}
 		return
 	}
+	t.silent = true
 	if t.invalid == "" {
 		t.invalid = "no audio was captured for 10 s while the song played"
 	}
@@ -212,6 +238,7 @@ func (e *Engine) setupSpotify(ctx context.Context) error {
 	if e.plan.Mode == ModeLive {
 		st = session.SpotifyState{} // live mode leaves the listener's settings alone
 	}
+	st = mergePending(st, e.cfg.PendingSpotify, snap)
 	if st.Set.Empty() {
 		return nil
 	}
@@ -251,3 +278,30 @@ func (e *Engine) restoreSpotify(ctx context.Context) {
 }
 
 func ptr[T any](v T) *T { return &v }
+
+// mergePending carries forward what an interrupted session left changed and
+// could not put back. Where Spotify still holds the value that session set,
+// this session's restore puts the original back; where the listener has
+// changed it since, the listener's value stays.
+func mergePending(st session.SpotifyState, pending *session.SpotifyState, snap spotify.Snapshot) session.SpotifyState {
+	if pending == nil || pending.Restored {
+		return st
+	}
+	carry := func(orig, set **bool, pOrig, pSet *bool, now bool) {
+		if pOrig != nil && pSet != nil && now == *pSet {
+			*orig = pOrig
+			if *set == nil {
+				*set = pSet
+			}
+		}
+	}
+	carry(&st.Original.Shuffle, &st.Set.Shuffle, pending.Original.Shuffle, pending.Set.Shuffle, snap.Shuffle)
+	carry(&st.Original.Repeat, &st.Set.Repeat, pending.Original.Repeat, pending.Set.Repeat, snap.Repeat)
+	if po, ps := pending.Original.Volume, pending.Set.Volume; po != nil && ps != nil && snap.Volume == *ps {
+		st.Original.Volume = po
+		if st.Set.Volume == nil {
+			st.Set.Volume = ps
+		}
+	}
+	return st
+}
