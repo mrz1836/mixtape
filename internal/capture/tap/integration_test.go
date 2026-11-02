@@ -1,14 +1,14 @@
 //go:build captureintegration && darwin && cgo
 
-// These tests open a real process tap on Spotify. They trigger the macOS
-// "record system audio" prompt for the host app the first time, so they
-// run only on request, with Spotify playing:
+// These tests open a real process tap on Spotify. The host app (the
+// terminal that runs them) needs the System Audio Recording permission, so
+// they run only on request, with Spotify playing:
 //
-//	MIXTAPE_LIVE_CAPTURE=1 go test -tags captureintegration -run Integration -v ./internal/capture/...
+//	MIXTAPE_LIVE_CAPTURE=1 magex test
 //
-// The build tag alone is not enough: tools that enable every discovered
-// tag (magex test) must never open live audio, so the environment variable
-// is required too.
+// magex test enables every build tag it finds, captureintegration
+// included, so the tag alone must stay harmless: the environment variable
+// is what opens live audio.
 package tap
 
 import (

@@ -61,6 +61,7 @@ This repo uses MAGE-X, not raw `go` invocations. Full reference:
 | `magex test` | Fast unit tests (default development loop) |
 | `magex test:race` | Race detector — required for goroutine-touching changes |
 | `magex build` | Build the `mixtape` binary into `./cmd/mixtape` |
+| `magex build:dev` | Build and install this checkout as `mixtape` in `~/.local/bin` (version `dev`) |
 
 `magex build` injects `version`, `commit` and `buildDate` through the ldflags in
 [../.mage.yaml](../.mage.yaml); `mixtape version` prints them.
@@ -68,10 +69,13 @@ This repo uses MAGE-X, not raw `go` invocations. Full reference:
 **Sandboxes.** Tests that encode real AAC skip themselves when `afconvert`
 cannot see its AAC encoder (it can't inside an agent sandbox); run the suite
 outside the sandbox before calling a change done. Never run anything that
-plays Spotify or opens a capture device without the owner present: live checks
-need both `-tags captureintegration` and `MIXTAPE_LIVE_CAPTURE=1` (`magex test`
-enables every build tag it finds, so the tag alone must stay harmless), and
-timing traces come from `mixtape debug trace`.
+plays Spotify or opens a capture device without the owner present. With the
+owner's go-ahead, live checks are `MIXTAPE_LIVE_CAPTURE=1 magex test` (`magex
+test` enables every build tag it finds, `captureintegration` included, so the
+tag alone must stay harmless), `magex build:dev` installs the build under test
+as `mixtape`, and timing traces come from `mixtape debug trace`. Point
+`MIXTAPE_HOME` and `MIXTAPE_LIBRARY` at a scratch folder to keep live
+recordings out of the owner's library.
 
 <br>
 
