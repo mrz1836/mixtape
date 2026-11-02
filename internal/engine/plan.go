@@ -70,9 +70,10 @@ type Item struct {
 	Twin   *Item             // an earlier item recording the same song; copy from it
 	Hint   string
 
-	state    itemState
-	attempts int
-	reason   string
+	state       itemState
+	attempts    int
+	falseStarts int // takes that ended before the song really began
+	reason      string
 }
 
 type itemState int

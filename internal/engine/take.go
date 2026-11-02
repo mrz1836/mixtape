@@ -38,6 +38,11 @@ type take struct {
 	// invalid holds the first capture or silence problem seen.
 	invalid  string
 	waitedAt time.Time // when the take first waited for its audio
+	// midSince: when the song began playing from the middle, as Spotify
+	// resuming it where it was last left (see checkResumed).
+	midSince time.Time
+	// announced: track_started was emitted for this take.
+	announced bool
 }
 
 func (t *take) lastPos() float64 {
@@ -64,28 +69,47 @@ func (t *take) eventTrack() *EventTrack {
 	return et
 }
 
-// onSnapshot folds one player observation into the session. A different
-// track for a single observation is a blip, not a change: while it loads a
-// song Spotify can report the next track of the queue for one poll. A change
-// is accepted when the next observation confirms it, and is still dated to
-// its first observation.
+// blipWindow is how long another track must persist before a take that has
+// not really started gives way to it.
+const blipWindow = time.Second
+
+// onSnapshot folds one player observation into the session.
+//
+// Another track for a moment is a blip, not a change: while it loads a song,
+// Spotify can report the next queued track, or the previously played one at
+// its old position, for a few polls. A change from a take that is clearly
+// playing to a track that starts at its top is accepted on the next
+// observation; any other change (the take has no believable position yet,
+// or the other track appears mid-song) only once the other track persists
+// for blipWindow. The held observations are then replayed, so the change
+// keeps its first observation's time and the new take loses nothing.
 func (e *Engine) onSnapshot(ctx context.Context, s spotify.Snapshot) {
 	if s.Err != nil {
 		e.onPlayerError(s)
 		return
 	}
-	if t := e.cur; t != nil && s.Track.URI != t.key {
-		if p := e.pending; p == nil || p.Track.URI != s.Track.URI {
-			e.pending = &s
-			return
-		}
-		first := *e.pending
+	t := e.cur
+	if t == nil || s.Track.URI == t.key {
 		e.pending = nil
-		e.observe(ctx, first)
-	} else {
-		e.pending = nil
+		e.observe(ctx, s)
+		return
 	}
-	e.observe(ctx, s)
+	if len(e.pending) > 0 && e.pending[0].Track.URI != s.Track.URI {
+		e.pending = e.pending[:0] // a different track again: start over
+	}
+	e.pending = append(e.pending, s)
+	window := time.Duration(0)
+	if !e.believable(t) || e.pending[0].Position >= blipWindow.Seconds() {
+		window = blipWindow
+	}
+	if len(e.pending) < 2 || s.At.Sub(e.pending[0].At) < window {
+		return
+	}
+	held := e.pending
+	e.pending = nil
+	for _, p := range held {
+		e.observe(ctx, p)
+	}
 }
 
 // observe applies one accepted observation.
@@ -115,6 +139,12 @@ func (e *Engine) observe(ctx context.Context, s spotify.Snapshot) {
 			e.lastActive = s.At
 		}
 		e.promote(ctx, s)
+		if e.cur == t {
+			e.checkResumed(ctx, t, s)
+		}
+		if e.cur == t && t.recording && e.believable(t) {
+			e.announce(t)
+		}
 	}
 	e.prevAt = s.At
 	e.finalizeReady(false)
@@ -149,23 +179,70 @@ const (
 // song that began with the take could have reached. After "play track",
 // Spotify can report the previous track's position under the new URI for a
 // moment, then jump to 0; that jump is a false start, not a restart.
-func (e *Engine) believable(t *take) bool {
+func (e *Engine) believable(t *take) bool { return e.reached(t) > 0 }
+
+// reached is the furthest position t believably played: positions beyond
+// what a song that began with the take could have reached (the previous
+// track's, or one Spotify resumed from) do not count.
+func (e *Engine) reached(t *take) float64 {
+	best := 0.0
 	for _, o := range t.obs {
-		if !o.Playing || o.Position <= 0 {
+		if !o.Playing || o.Position <= best {
 			continue
 		}
-		if t.before.IsZero() || o.Position <= o.At.Sub(t.before).Seconds()+e.tn.StaleSlack.Seconds() {
-			return true
+		if e.plausible(t, o.At, o.Position) {
+			best = o.Position
 		}
 	}
-	return false
+	return best
+}
+
+// plausible reports whether a song that began with t could be at pos by at.
+func (e *Engine) plausible(t *take, at time.Time, pos float64) bool {
+	return t.before.IsZero() || pos <= at.Sub(t.before).Seconds()+e.tn.StaleSlack.Seconds()
+}
+
+// checkResumed restarts a requested song that Spotify resumed from the
+// middle. Without a context to play it in, "play track" picks a song up
+// where it was last left, so it plays from there on. A stale position
+// lasts a moment; one that holds for blipWindow is a resume, and the song
+// is started over from the top in a fresh take.
+func (e *Engine) checkResumed(ctx context.Context, t *take, s spotify.Snapshot) {
+	mid := e.plan.Mode != ModeLive && t.item != nil && t.item.state == itemPending && !t.ad && !e.stopping &&
+		s.State == spotify.StatePlaying && s.Position > e.tn.StartSlack.Seconds()+2*e.opts.Poll.Seconds() &&
+		!e.plausible(t, s.At, s.Position) && e.reached(t) < earlyRestart
+	switch {
+	case !mid:
+		t.midSince = time.Time{}
+	case t.midSince.IsZero():
+		t.midSince = s.At
+	case s.At.Sub(t.midSince) >= blipWindow:
+		it := t.item
+		e.abandon()
+		e.command(ctx, "restart", func(c context.Context) error { return e.cfg.Player.SetPosition(c, 0) })
+		e.waiting = &request{item: it, at: s.At}
+	}
+}
+
+// abandon drops the current take without settling it: a false start that
+// mixtape is about to redo. Its song stays pending.
+func (e *Engine) abandon() {
+	t := e.cur
+	e.cur = nil
+	t.endAt, t.endedByUs = e.now(), true
+	e.lastEnded = t
 }
 
 // resetTake discards the observations of a false start, keeping the take
-// (and whether it records) as it is.
+// (and whether it records) as it is. After a believable start the song
+// began again at the restart; after only stale positions it may have been
+// playing since the take began, so the earlier bound stays.
 func (e *Engine) resetTake(s spotify.Snapshot) {
 	t := e.cur
-	t.obs, t.before, t.startedAt = nil, e.prevAt, s.At
+	if e.believable(t) {
+		t.before = e.prevAt
+	}
+	t.obs, t.startedAt = nil, s.At
 }
 
 // transitional reports a snapshot taken while Spotify was switching
@@ -285,7 +362,18 @@ func (e *Engine) adopt(t *take, it *Item, at time.Time) {
 	t.item, t.recording = it, true
 	e.waiting = nil
 	e.lastActive = at
-	e.emit(Event{Type: EventTrackStarted, Track: t.eventTrack()})
+	if e.believable(t) {
+		e.announce(t)
+	}
+}
+
+// announce emits track_started for t once. It waits until the song is
+// believably playing, so a false start leaves no trace.
+func (e *Engine) announce(t *take) {
+	if !t.announced {
+		t.announced = true
+		e.emit(Event{Type: EventTrackStarted, Track: t.eventTrack()})
+	}
 }
 
 // releaseCur ends the current take as mixtape's doing, just before a
@@ -361,6 +449,13 @@ func (e *Engine) segment(t *take) Segment {
 // discard it (and retry or fail the song).
 func (e *Engine) settle(t *take, seg Segment) {
 	it := t.item
+	if e.falseStart(t, seg) {
+		if e.opts.Verbose {
+			e.emitBoundary(t, seg)
+		}
+		return
+	}
+	e.announce(t) // whatever becomes of the take follows its start
 	it.attempts++
 	reason := t.invalid
 	if reason == "" {
@@ -391,6 +486,26 @@ func (e *Engine) settle(t *take, seg Segment) {
 		it.state = itemPending
 		e.discardOrRetry(t, reason, false)
 	}
+}
+
+// maxFalseStarts bounds how often a song may start falsely before its
+// takes count as attempts.
+const maxFalseStarts = 3
+
+// falseStart recognizes a take of a song that never really began: Spotify
+// moved on (to the track it resumed, say) before the song believably played
+// earlyRestart seconds. That is no attempt and nothing to report; the song
+// is simply requested again. A take the session's end cut short is
+// discarded as usual.
+func (e *Engine) falseStart(t *take, seg Segment) bool {
+	it := t.item
+	if seg.Complete || t.userSkipped || t.invalid != "" || e.stopping || e.plan.Mode == ModeLive ||
+		e.reached(t) >= earlyRestart || it.falseStarts >= maxFalseStarts {
+		return false
+	}
+	it.falseStarts++
+	it.state = itemPending
+	return true
 }
 
 // crossfadeWindow bounds how early a crossfaded song changes (Spotify's

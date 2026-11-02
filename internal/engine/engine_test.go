@@ -410,6 +410,40 @@ func TestStalePositionAfterPlayIsAFalseStart(t *testing.T) {
 	assert.Empty(t, s.eventsOf(EventTrackDiscarded), "a stale position then 0 is not a failed take")
 }
 
+func TestResumedSongIsStartedOverFromTheTop(t *testing.T) {
+	t.Parallel()
+	s := newSim(t, songA)
+	// Without a context, "play track" picks Alpha up where it was last left.
+	s.spotify.resume = map[string]resumeSpot{songA.id: {pos: 3 * time.Second}}
+
+	_, res := s.run(singles(songA), Options{}, nil)
+	requireComplete(t, res)
+	assert.Equal(t, 1, res.Counts.Recorded)
+	assert.Empty(t, s.eventsOf(EventTrackDiscarded), "a resume is not a failed take")
+	assert.Len(t, s.eventsOf(EventTrackStarted), 1, "the abandoned take was never announced")
+	assert.Contains(t, s.spotify.Commands(), "seek", "the song is started over")
+	saved := s.eventsOf(EventTrackSaved)
+	require.Len(t, saved, 1)
+	assert.Equal(t, 1, saved[0].Track.Attempt, "the resume did not count as an attempt")
+}
+
+func TestSpotifyResumingAnotherTrackIsAFalseStart(t *testing.T) {
+	t.Parallel()
+	s := newSim(t, songA, songB)
+	// As seen live: the first play resumes another track, mid-song, where
+	// Spotify last left it; it plays on until mixtape asks again.
+	s.spotify.resume = map[string]resumeSpot{songA.id: {track: songB.id, pos: 2500 * time.Millisecond}}
+
+	_, res := s.run(singles(songA), Options{}, nil)
+	requireComplete(t, res)
+	assert.Equal(t, 1, res.Counts.Recorded)
+	assert.Empty(t, s.eventsOf(EventTrackDiscarded), "a false start is not a failed take")
+	assert.Len(t, s.eventsOf(EventTrackStarted), 1, "a false start leaves no trace")
+	saved := s.eventsOf(EventTrackSaved)
+	require.Len(t, saved, 1)
+	assert.Equal(t, 1, saved[0].Track.Attempt)
+}
+
 func TestNextTrackBlipIsIgnored(t *testing.T) {
 	t.Parallel()
 	s := newSim(t, songA, songB)
@@ -427,6 +461,21 @@ func TestNextTrackBlipIsIgnored(t *testing.T) {
 		}
 	}
 	assert.Equal(t, 1, plays, "the song is requested once")
+}
+
+func TestPreviousTrackBlipBeforeTheSongStartsIsIgnored(t *testing.T) {
+	t.Parallel()
+	s := newSim(t, songA, songB)
+	// As seen live: three observations of another track at an old position
+	// while the requested song is still at 0:00.
+	s.spotify.blipOnPlay, s.spotify.blipLen, s.spotify.blipPos = true, 3, 23*time.Second
+	s.spotify.startGlitch = true
+	pl := s.playlist("pl0000000000000000000i", "Blip3", true, songA, songB)
+
+	_, res := s.run([]spotify.Collection{pl}, Options{Limit: 1}, nil)
+	requireComplete(t, res)
+	assert.Equal(t, 1, res.Counts.Recorded)
+	assert.Empty(t, s.eventsOf(EventTrackDiscarded))
 }
 
 func TestRelinkMatching(t *testing.T) {

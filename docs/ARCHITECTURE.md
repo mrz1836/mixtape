@@ -136,6 +136,8 @@ These come from `mixtape debug trace` runs against Spotify 1.2 on macOS 15
 | Paused position | ~0.16 s behind the last playing one | the paused value is the audio position: pauses are cut there |
 | Start of a song | position reads exactly `0.000` for 1–4 polls while Spotify buffers | samples at exactly 0 are ignored |
 | Start-over glitch | right after `play track`, Spotify plays ~0.2 s, jumps back to 0, then starts | a restart in the first 2 s resets the take; it is not a failed attempt |
+| Resume | `play track` without a context (or with the track itself as context) picks the song up where it was last left, or even resumes the track last played in its album there, after 1–4 polls at `0.000`; `play track … in context <album or playlist>` starts at 0 | a requested song playing mid-song for 1 s is seeked to 0; a take that ends before it believably played 2 s is a false start: no attempt, no event, the song is requested again |
+| Track blips | while it loads a song, Spotify can report another track for 1–11 polls | a change away from a take with no believable position, or to a track that appears mid-song, counts once it holds for 1 s |
 | Track change | the new title and duration can appear one poll before the new URI | half-updated snapshots are ignored |
 | Paused load | `play track` shows the new track paused for one poll before it plays | the take starts recording when it plays |
 | Crossfade | the reported duration drops by the crossfade time ~1.4 s into a song; albums are exempt | detected from the first song (exit 3) |

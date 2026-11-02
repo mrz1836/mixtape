@@ -65,15 +65,31 @@ type fakeSpotify struct {
 	// observation right after a song is played.
 	blipOnPlay bool
 	blipIn     int
-	hold       time.Duration // position frozen at 0 while it re-buffers
-	shuffle    bool
-	repeat     bool
-	volume     int
-	commands   []string
+	blipLen    int           // how many observations the blip lasts (default 1)
+	blipPos    time.Duration // the position reported during the blip
+	blipping   int
+	// resume replays Spotify picking a song up where it was last left: the
+	// first play of a track ID listed here jumps, a few observations in, to
+	// the saved spot (resumeTrack, when set, at resumePos) and plays on.
+	resume   map[string]resumeSpot
+	resumeIn int
+	resumeTo resumeSpot
+	hold     time.Duration // position frozen at 0 while it re-buffers
+	shuffle  bool
+	repeat   bool
+	volume   int
+	commands []string
 
 	now   func() time.Time
 	watch chan spotify.Snapshot
 	wdone <-chan struct{} // the watcher's context is done
+}
+
+// resumeSpot is where Spotify resumes: a track (the played one when "")
+// and a position.
+type resumeSpot struct {
+	track string
+	pos   time.Duration
 }
 
 func newFakeSpotify(now func() time.Time, tracks ...simTrack) *fakeSpotify {
@@ -134,15 +150,32 @@ func (f *fakeSpotify) snapshot() spotify.Snapshot {
 	if f.playing {
 		s.State = spotify.StatePlaying
 	}
+	if f.resumeIn > 0 {
+		f.resumeIn--
+		if f.resumeIn == 0 {
+			if r := f.resumeTo; r.track != "" {
+				f.queue, f.idx = []string{r.track}, 0
+			}
+			f.pos, f.hold = f.resumeTo.pos, 0
+		}
+	}
 	t, ok := f.current()
+	blip := false
 	if f.blipIn > 0 {
 		f.blipIn--
-		if f.blipIn == 0 && f.idx+1 < len(f.queue) {
-			t, ok = f.tracks[f.queue[f.idx+1]], true
+		if f.blipIn == 0 {
+			f.blipping = max(f.blipLen, 1)
 		}
+	}
+	if f.blipping > 0 && f.idx+1 < len(f.queue) {
+		f.blipping--
+		t, ok, blip = f.tracks[f.queue[f.idx+1]], true, true
 	}
 	if ok {
 		s.Position = f.pos.Seconds()
+		if blip && f.blipPos > 0 {
+			s.Position = f.blipPos.Seconds()
+		}
 		if f.staleFor > 0 {
 			f.staleFor--
 			s.Position = f.stalePos.Seconds()
@@ -200,6 +233,10 @@ func (f *fakeSpotify) PlayTrack(_ context.Context, uri, ctxURI string) error {
 		f.blipIn = 3 // the third observation after play shows the next track
 	}
 	id := uri[strings.LastIndex(uri, ":")+1:]
+	if r, ok := f.resume[id]; ok {
+		delete(f.resume, id) // once played, the song's saved spot is its top
+		f.resumeIn, f.resumeTo = 3, r
+	}
 	switch {
 	case strings.HasPrefix(uri, "spotify:playlist:"), strings.HasPrefix(uri, "spotify:album:"):
 		f.queue, f.idx = append([]string(nil), f.contexts[uri]...), 0
@@ -223,6 +260,9 @@ func (f *fakeSpotify) PlayTrack(_ context.Context, uri, ctxURI string) error {
 	}
 	f.pos, f.playing = 0, f.idx < len(f.queue)
 	f.glitched = false
+	if f.resumeIn > 0 {
+		f.hold = time.Hour // as seen live: exactly 0:00 until the resume
+	}
 	return nil
 }
 
