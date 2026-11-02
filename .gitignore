@@ -1,0 +1,81 @@
+########################
+# Go Language          #
+########################
+
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+/mixtape
+# magex builds the binary next to its main package (.mage.yaml output)
+/cmd/mixtape/mixtape
+bin/
+
+# Test files
+*.test
+*.out
+
+# Go tools
+go.list
+
+# Profiling and benchmarks
+profiles/
+*.prof
+bench-old.txt
+bench-new.txt
+
+# Fuzz testing
+internal/fuzz/corpus/
+
+########################
+# Coverage & Testing   #
+########################
+
+coverage.txt
+coverage.out
+coverage-output/
+test-coverage-output/
+
+########################
+# Development Tools    #
+########################
+
+# IDEs and editors
+.idea/
+.project
+
+# Linting
+lint-output.txt
+
+# MAGE-X build cache
+.mage-cache/
+.mage-x/
+dist/
+
+########################
+# Dependencies         #
+########################
+
+node_modules/
+
+# GoFortress local overrides
+.github/.env.base.backup
+.github/env/*.backup
+.github/env/99-local.env
+
+########################
+# Audio                #
+########################
+
+# Recordings live in the user's library (~/Music/Mixtape by default), never in
+# the tree; ignore any stray WAV/M4A written here by hand or by a test run.
+*.wav
+*.m4a
+
+########################
+# Operating System     #
+########################
+
+.DS_Store

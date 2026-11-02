@@ -1,0 +1,67 @@
+# Dependabot configuration (hardened)
+#
+# - Version updates are checked on and opened against master; security updates
+#   always use the default branch and are never delayed.
+# - Cooldown: a new release must be at least 3 days old before a version update
+#   is opened (gomod: 3 days patch, 7 days minor, 14 days major).
+# - First-party modules and trusted publishers are excluded from the cooldown.
+# - Updates are grouped and open pull requests are capped to reduce noise.
+
+version: 2
+updates:
+  # Go modules
+  - package-ecosystem: "gomod"
+    directory: "/"
+    target-branch: "master"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 10
+    groups:
+      gomod-minor-patch:
+        update-types:
+          - "minor"
+          - "patch"
+    cooldown:
+      default-days: 3
+      semver-patch-days: 3
+      semver-minor-days: 7
+      semver-major-days: 14
+      exclude:
+        - "github.com/mrz1836/*"
+
+  # GitHub Actions workflows
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    target-branch: "master"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    groups:
+      github-actions:
+        patterns:
+          - "*"
+    cooldown:
+      default-days: 3
+      exclude:
+        - "actions/*"
+        - "github/*"
+        - "gitleaks/*"
+
+  # Dev container features
+  - package-ecosystem: "devcontainers"
+    directory: "/"
+    target-branch: "master"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    groups:
+      devcontainers:
+        patterns:
+          - "*"
+    cooldown:
+      default-days: 3
+      exclude:
+        - "ghcr.io/devcontainers/features/*"

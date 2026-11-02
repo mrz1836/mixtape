@@ -1,0 +1,102 @@
+# Make sure to check the documentation at http://goreleaser.com
+# ---------------------------
+# General
+# ---------------------------
+version: 2
+
+before:
+  hooks:
+    - |
+      sh -c '
+        if [ "$SKIP_GORELEASER_TESTS" = "true" ]; then
+          echo "Skipping tests (SKIP_GORELEASER_TESTS=true)"
+        else
+          magex test
+        fi
+      '
+changelog:
+  use: github
+  sort: asc
+  abbrev: 0
+  format: '[`{{ slice .SHA 0 7 }}`]({{ .GitURL }}/commit/{{ .SHA }}): {{ .Message }}{{ with .AuthorUsername }} (@{{ . }}){{ end }}'
+  groups:
+    - title: "Features"
+      regexp: '^.*?feat(\([[:word:]]+\))??!?:.+$'
+      order: 100
+    - title: "Bug Fixes"
+      regexp: '^.*?fix(\([[:word:]]+\))??!?:.+$'
+      order: 200
+    - title: "Documentation"
+      regexp: '^.*?docs?(\([[:word:]]+\))??!?:.+$'
+      order: 300
+    - title: "Refactoring"
+      regexp: '^.*?refactor(\([[:word:]]+\))??!?:.+$'
+      order: 400
+    - title: "Other Changes"
+      order: 9999
+  filters:
+    exclude:
+      - "^test:"
+      - "^Merge pull request"
+      - "^Merge branch"
+
+# ---------------------------
+# Builder
+# ---------------------------
+# mixtape is macOS-only and needs cgo: audio capture goes through Core Audio
+# (the process tap in Objective-C, the capture device through malgo). Both
+# architectures build on a Mac; Apple's clang cross-compiles between them.
+# The deployment target matches Go's own minimum; the process tap's
+# macOS 14.2 symbols are weak-linked and gated at run time.
+builds:
+  - id: mixtape
+    main: ./cmd/mixtape
+    binary: mixtape
+    env:
+      - CGO_ENABLED=1
+      - MACOSX_DEPLOYMENT_TARGET=13.0
+      # In the flags too: they are part of Go's build cache key, so no
+      # object compiled for a newer macOS is reused.
+      - CGO_CFLAGS=-mmacosx-version-min=13.0
+      - CGO_LDFLAGS=-mmacosx-version-min=13.0
+    goos:
+      - darwin
+    goarch:
+      - arm64
+      - amd64
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+      - -X main.version={{.Version}}
+      - -X main.commit={{.Commit}}
+      - -X main.buildDate={{.Date}}
+
+# ---------------------------
+# Archives
+# ---------------------------
+archives:
+  - id: mixtape
+    ids:
+      - mixtape
+    formats:
+      - tar.gz
+    name_template: >-
+      {{- .ProjectName }}_{{- .Version }}_{{- .Os }}_{{- .Arch }}
+    files:
+      - LICENSE
+      - README.md
+
+# ---------------------------
+# Checksum
+# ---------------------------
+checksum:
+  name_template: "{{ .ProjectName }}_{{ .Version }}_checksums.txt"
+  algorithm: sha256
+
+# ---------------------------
+# Github Release
+# ---------------------------
+release:
+  prerelease: auto
+  name_template: "Release v{{.Version}}"
