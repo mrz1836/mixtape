@@ -3,6 +3,7 @@ package engine
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -407,6 +408,25 @@ func TestStalePositionAfterPlayIsAFalseStart(t *testing.T) {
 	requireComplete(t, res)
 	assert.Equal(t, 1, res.Counts.Recorded)
 	assert.Empty(t, s.eventsOf(EventTrackDiscarded), "a stale position then 0 is not a failed take")
+}
+
+func TestNextTrackBlipIsIgnored(t *testing.T) {
+	t.Parallel()
+	s := newSim(t, songA, songB)
+	s.spotify.blipOnPlay = true // one observation reports the next album track while Alpha loads
+	pl := s.playlist("pl0000000000000000000h", "Blip", true, songA, songB)
+
+	_, res := s.run([]spotify.Collection{pl}, Options{Limit: 1}, nil)
+	requireComplete(t, res)
+	assert.Equal(t, 1, res.Counts.Recorded)
+	assert.Empty(t, s.eventsOf(EventTrackDiscarded), "a one-poll blip is not a track change")
+	plays := 0
+	for _, c := range s.spotify.Commands() {
+		if strings.HasPrefix(c, "play ") {
+			plays++
+		}
+	}
+	assert.Equal(t, 1, plays, "the song is requested once")
 }
 
 func TestRelinkMatching(t *testing.T) {

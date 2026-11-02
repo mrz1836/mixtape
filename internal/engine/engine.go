@@ -170,6 +170,7 @@ type Engine struct {
 	wg      sync.WaitGroup
 
 	cur       *take
+	pending   *spotify.Snapshot // a track change seen once, awaiting confirmation
 	lastEnded *take
 	finals    []*take
 	last      spotify.Snapshot

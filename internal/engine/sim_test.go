@@ -61,11 +61,15 @@ type fakeSpotify struct {
 	stalePlay bool
 	staleFor  int
 	stalePos  time.Duration
-	hold      time.Duration // position frozen at 0 while it re-buffers
-	shuffle   bool
-	repeat    bool
-	volume    int
-	commands  []string
+	// blipOnPlay replays Spotify reporting the next queued track for one
+	// observation right after a song is played.
+	blipOnPlay bool
+	blipIn     int
+	hold       time.Duration // position frozen at 0 while it re-buffers
+	shuffle    bool
+	repeat     bool
+	volume     int
+	commands   []string
 
 	now   func() time.Time
 	watch chan spotify.Snapshot
@@ -130,7 +134,14 @@ func (f *fakeSpotify) snapshot() spotify.Snapshot {
 	if f.playing {
 		s.State = spotify.StatePlaying
 	}
-	if t, ok := f.current(); ok {
+	t, ok := f.current()
+	if f.blipIn > 0 {
+		f.blipIn--
+		if f.blipIn == 0 && f.idx+1 < len(f.queue) {
+			t, ok = f.tracks[f.queue[f.idx+1]], true
+		}
+	}
+	if ok {
 		s.Position = f.pos.Seconds()
 		if f.staleFor > 0 {
 			f.staleFor--
@@ -184,6 +195,9 @@ func (f *fakeSpotify) PlayTrack(_ context.Context, uri, ctxURI string) error {
 	f.log("play " + uri + " in " + ctxURI)
 	if f.stalePlay {
 		f.stalePos, f.staleFor = f.pos+12*time.Second, 3
+	}
+	if f.blipOnPlay {
+		f.blipIn = 3 // the third observation after play shows the next track
 	}
 	id := uri[strings.LastIndex(uri, ":")+1:]
 	switch {

@@ -64,12 +64,32 @@ func (t *take) eventTrack() *EventTrack {
 	return et
 }
 
-// onSnapshot folds one player observation into the session.
+// onSnapshot folds one player observation into the session. A different
+// track for a single observation is a blip, not a change: while it loads a
+// song Spotify can report the next track of the queue for one poll. A change
+// is accepted when the next observation confirms it, and is still dated to
+// its first observation.
 func (e *Engine) onSnapshot(ctx context.Context, s spotify.Snapshot) {
 	if s.Err != nil {
 		e.onPlayerError(s)
 		return
 	}
+	if t := e.cur; t != nil && s.Track.URI != t.key {
+		if p := e.pending; p == nil || p.Track.URI != s.Track.URI {
+			e.pending = &s
+			return
+		}
+		first := *e.pending
+		e.pending = nil
+		e.observe(ctx, first)
+	} else {
+		e.pending = nil
+	}
+	e.observe(ctx, s)
+}
+
+// observe applies one accepted observation.
+func (e *Engine) observe(ctx context.Context, s spotify.Snapshot) {
 	e.goneSince = time.Time{}
 	if e.transitional(s) {
 		return // half-updated mid-change: the next title under the old URI
