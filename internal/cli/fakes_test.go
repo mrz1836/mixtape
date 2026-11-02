@@ -68,8 +68,13 @@ func (p *fakePlayer) SetVolume(context.Context, int) error            { return p
 
 // fakeCatalog resolves refs from a map.
 type fakeCatalog struct {
-	cols map[spotify.Ref]spotify.Collection
-	err  error
+	cols  map[spotify.Ref]spotify.Collection
+	err   error
+	dates map[string]string // track ID → release date
+}
+
+func (c *fakeCatalog) ReleaseDate(_ context.Context, id string) (string, error) {
+	return c.dates[id], nil
 }
 
 func (c *fakeCatalog) Resolve(_ context.Context, ref spotify.Ref) (spotify.Collection, error) {
@@ -119,19 +124,21 @@ func box(typ string, payload []byte) []byte {
 
 // fakeWorld is the simulated machine behind the harness services.
 type fakeWorld struct {
-	mu        sync.Mutex
-	player    *fakePlayer
-	catalog   *fakeCatalog
-	installed bool
-	running   bool
-	prefs     spotify.Prefs
-	tap       capture.TapStatus
-	devices   []device.Info
-	output    device.Info
-	lockPath  string
-	killed    []int
-	onKill    func(pid int)
-	killErr   error // returned by kill after onKill
+	mu         sync.Mutex
+	player     *fakePlayer
+	catalog    *fakeCatalog
+	installed  bool
+	running    bool
+	prefs      spotify.Prefs
+	tap        capture.TapStatus
+	devices    []device.Info
+	output     device.Info
+	lockPath   string
+	killed     []int
+	onKill     func(pid int)
+	killErr    error // returned by kill after onKill
+	awake      int   // keepAwake holds not yet released
+	awakeCalls int
 	// perms answers permission checks (missing kinds are granted); grantAfter
 	// flips a kind to granted after that many checks, like a user switching
 	// it on in System Settings.
@@ -192,6 +199,17 @@ func (w *fakeWorld) services(h *harness) services {
 		encoder:        syntheticEncoder{},
 		signals:        func() (<-chan os.Signal, func()) { return make(chan os.Signal), func() {} },
 		spawn:          func(string, []string, []string, string) (*os.Process, error) { return nil, os.ErrInvalid },
+		keepAwake: func() func() {
+			w.mu.Lock()
+			w.awake++
+			w.awakeCalls++
+			w.mu.Unlock()
+			return func() {
+				w.mu.Lock()
+				w.awake--
+				w.mu.Unlock()
+			}
+		},
 		kill: func(pid int, _ syscall.Signal) error {
 			w.mu.Lock()
 			w.killed = append(w.killed, pid)

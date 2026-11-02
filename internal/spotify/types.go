@@ -92,6 +92,9 @@ type CatalogTrack struct {
 	// of the server that rendered the page, so it is only a hint.
 	Playable bool
 	Position int // 1-based order in the collection
+	// ReleaseDate is YYYY-MM-DD when the page names it (track pages do;
+	// album and playlist pages do not).
+	ReleaseDate string
 }
 
 // Collection is a resolved track, album or playlist.

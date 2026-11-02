@@ -146,6 +146,33 @@ func TestResolveTrack(t *testing.T) {
 	assert.NotEmpty(t, col.ArtworkURL)
 }
 
+func TestReleaseDateFromTheTrackPage(t *testing.T) {
+	t.Parallel()
+	_, c := newCatalogServer(t, map[string]page{
+		"track/" + testTrackID: {status: http.StatusOK, body: embedHTML(t, map[string]any{
+			"type": "track", "name": "Speak to Me", "duration": 64333,
+			"releaseDate": map[string]any{"isoString": "1973-03-01T00:00:00Z"},
+		})},
+	}, page{status: http.StatusOK})
+
+	col, err := c.Resolve(t.Context(), Ref{KindTrack, testTrackID})
+	require.NoError(t, err)
+	assert.Equal(t, "1973-03-01", col.Tracks[0].ReleaseDate, "a track link carries its date")
+
+	d, err := c.ReleaseDate(t.Context(), testTrackID)
+	require.NoError(t, err)
+	assert.Equal(t, "1973-03-01", d)
+}
+
+func TestISODate(t *testing.T) {
+	t.Parallel()
+	assert.Equal(t, "1973-03-01", isoDate("1973-03-01T00:00:00Z"))
+	assert.Equal(t, "2024-12-31", isoDate("2025-01-01T02:00:00+05:00"), "normalized to UTC")
+	assert.Equal(t, "2001-09-11", isoDate("2001-09-11"))
+	assert.Empty(t, isoDate("soon"))
+	assert.Empty(t, isoDate(""))
+}
+
 func TestResolveTruncatedAndFiltered(t *testing.T) {
 	t.Parallel()
 	items := make([]map[string]any, 0, 100)

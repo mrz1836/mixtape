@@ -85,6 +85,7 @@ func TestTagRoundTrip(t *testing.T) {
 		TrackTotal:  9,
 		DiscNumber:  1,
 		DiscTotal:   1,
+		Date:        "1984-03-27",
 		Freeform:    map[string]string{"SPOTIFY_ID": "abc123", "MIXTAPE_AUDIO_SHA256": "ff00"},
 		Cover:       jpeg(),
 	}

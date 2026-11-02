@@ -60,6 +60,7 @@ type Track struct {
 	DiscNumber  int
 	Popularity  int
 	ArtworkURL  string
+	ReleaseDate string // YYYY-MM-DD
 }
 
 // Entry is one track in a manifest.
@@ -82,6 +83,7 @@ type Entry struct {
 	TrackNumber int        `json:"track_number,omitempty"`
 	DiscNumber  int        `json:"disc_number,omitempty"`
 	Popularity  int        `json:"popularity,omitempty"`
+	ReleaseDate string     `json:"release_date,omitempty"`
 	Partial     bool       `json:"partial,omitempty"`
 	FailReason  string     `json:"fail_reason,omitempty"`
 	PendingWAV  string     `json:"pending_wav,omitempty"`

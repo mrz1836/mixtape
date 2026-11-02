@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/mrz1836/mixtape/internal/fileutil"
 	"github.com/mrz1836/mixtape/internal/mp4tag"
@@ -70,6 +71,9 @@ func afconvert(ctx context.Context, args ...string) error {
 	return nil
 }
 
+// releaseDateTimeout bounds the release-date lookup of one song.
+const releaseDateTimeout = 10 * time.Second
+
 // CommitOptions tune Commit.
 type CommitOptions struct {
 	Artwork    bool  // download and embed the cover art
@@ -126,6 +130,15 @@ func (l *Library) Commit(ctx context.Context, c *Collection, t Track, wavPath st
 	}
 
 	e = c.Entry(id)
+	if e.ReleaseDate == "" && l.opts.ReleaseDate != nil {
+		// Album and playlist pages do not date their songs: ask the song's
+		// own page. Without an answer the file simply has no year.
+		lctx, cancel := context.WithTimeout(ctx, releaseDateTimeout)
+		if d, dErr := l.opts.ReleaseDate(lctx, id); dErr == nil {
+			e.ReleaseDate = d
+		}
+		cancel()
+	}
 	tags := l.tags(c, e, hash, o.Partial)
 	if o.Artwork && e.ArtworkURL != "" {
 		if cover, artErr := l.fetchArtwork(ctx, e.ArtworkURL); artErr != nil {
@@ -281,6 +294,7 @@ func (l *Library) tags(c *Collection, e *Entry, hash string, partial bool) mp4ta
 		Comment:     "https://open.spotify.com/track/" + id,
 		TrackNumber: e.TrackNumber,
 		DiscNumber:  e.DiscNumber,
+		Date:        e.ReleaseDate,
 		Freeform: map[string]string{
 			TagSpotifyID:   id,
 			TagRequestedID: "",

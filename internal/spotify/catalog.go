@@ -99,8 +99,11 @@ func (c *Catalog) Resolve(ctx context.Context, ref Ref) (Collection, error) {
 
 // embedEntity is the part of the embed page's JSON Mixtape reads.
 type embedEntity struct {
-	Type       string `json:"type"`
-	Name       string `json:"name"`
+	Type        string `json:"type"`
+	Name        string `json:"name"`
+	ReleaseDate *struct {
+		ISOString string `json:"isoString"`
+	} `json:"releaseDate"`
 	Title      string `json:"title"`
 	Subtitle   string `json:"subtitle"`
 	Duration   int64  `json:"duration"`
@@ -218,6 +221,9 @@ func collectionFromEntity(ref Ref, e *embedEntity) (Collection, error) {
 			Playable: boolOr(e.IsPlayable, true),
 			Position: 1,
 		}}
+		if e.ReleaseDate != nil {
+			col.Tracks[0].ReleaseDate = isoDate(e.ReleaseDate.ISOString)
+		}
 		col.Complete = true
 		return col, nil
 	}
@@ -246,6 +252,32 @@ func collectionFromEntity(ref Ref, e *embedEntity) (Collection, error) {
 	col.Truncated = ref.Kind == KindPlaylist && len(e.TrackList) >= embedTrackCap
 	col.Complete = !col.Truncated
 	return col, nil
+}
+
+// ReleaseDate looks a track's release date up on its embed page; it returns
+// YYYY-MM-DD, or "" when the page does not name one.
+func (c *Catalog) ReleaseDate(ctx context.Context, trackID string) (string, error) {
+	col, err := c.embed(ctx, Ref{Kind: KindTrack, ID: trackID})
+	if err != nil {
+		return "", err
+	}
+	if len(col.Tracks) == 0 {
+		return "", nil
+	}
+	return col.Tracks[0].ReleaseDate, nil
+}
+
+// isoDate keeps the YYYY-MM-DD of an ISO 8601 timestamp, or "".
+func isoDate(s string) string {
+	if t, err := time.Parse(time.RFC3339, s); err == nil {
+		return t.UTC().Format(time.DateOnly)
+	}
+	if len(s) >= len(time.DateOnly) {
+		if t, err := time.Parse(time.DateOnly, s[:len(time.DateOnly)]); err == nil {
+			return t.Format(time.DateOnly)
+		}
+	}
+	return ""
 }
 
 // oembedTitle resolves ref's name via the oEmbed endpoint.

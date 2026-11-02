@@ -41,6 +41,8 @@ type Tags struct {
 	TrackTotal  int
 	DiscNumber  int
 	DiscTotal   int
+	// Date is the release date (`©day`): YYYY-MM-DD, or a bare year.
+	Date string
 	// Freeform holds `----` atoms under FreeformMean, keyed by name. On
 	// write, a listed name replaces the existing atom (an empty value
 	// removes it); freeform atoms not listed are preserved.
@@ -385,6 +387,7 @@ func (w *builder) ilst(oldIlst *box, tags Tags) ([]byte, error) {
 		w.textAtom("\xa9alb", tags.Album),
 		w.textAtom("\xa9grp", tags.Grouping),
 		w.textAtom("\xa9cmt", tags.Comment),
+		w.textAtom("\xa9day", tags.Date),
 		w.pairAtom("trkn", tags.TrackNumber, tags.TrackTotal),
 		w.pairAtom("disk", tags.DiscNumber, tags.DiscTotal),
 		w.coverAtom(tags.Cover),
@@ -402,7 +405,7 @@ func (w *builder) ilst(oldIlst *box, tags Tags) ([]byte, error) {
 
 func isTagAtom(typ [4]byte) bool {
 	switch string(typ[:]) {
-	case "\xa9nam", "\xa9ART", "aART", "\xa9alb", "\xa9grp", "\xa9cmt", "trkn", "disk", "covr":
+	case "\xa9nam", "\xa9ART", "aART", "\xa9alb", "\xa9grp", "\xa9cmt", "\xa9day", "trkn", "disk", "covr":
 		return true
 	}
 	return false
@@ -484,6 +487,8 @@ func readTagAtom(tags *Tags, b box) error {
 			tags.Grouping = string(val)
 		case "\xa9cmt":
 			tags.Comment = string(val)
+		case "\xa9day":
+			tags.Date = string(val)
 		}
 	}
 	return nil

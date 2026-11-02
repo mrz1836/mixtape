@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -28,6 +29,7 @@ type player interface {
 // catalog resolves links to their track lists.
 type catalog interface {
 	Resolve(ctx context.Context, ref spotify.Ref) (spotify.Collection, error)
+	ReleaseDate(ctx context.Context, trackID string) (string, error)
 }
 
 // captureRequest says how to open a capture source.
@@ -64,6 +66,9 @@ type services struct {
 	permission        func(permission.Kind) permission.State
 	requestPermission func(permission.Kind) permission.State
 	hostApp           func() permission.HostApp
+	// keepAwake stops the Mac from idle-sleeping until release is called
+	// (or the process exits).
+	keepAwake func() (release func())
 }
 
 func newProcessServices() services {
@@ -85,8 +90,9 @@ func newProcessServices() services {
 			signal.Notify(ch, os.Interrupt, syscall.SIGTERM)
 			return ch, func() { signal.Stop(ch) }
 		},
-		spawn: session.Spawn,
-		kill:  syscall.Kill,
+		spawn:     session.Spawn,
+		kill:      syscall.Kill,
+		keepAwake: caffeinate,
 		sleep: func(ctx context.Context, d time.Duration) bool {
 			t := time.NewTimer(d)
 			defer t.Stop()
@@ -118,4 +124,20 @@ func openCapture(r captureRequest) (capture.Source, error) {
 	case capture.MethodAuto:
 	}
 	return nil, fmt.Errorf("%w: %q", capture.ErrUnknownMethod, r.Method)
+}
+
+// caffeinate holds macOS's idle-sleep assertion for this process with the
+// system's own caffeinate tool. Its -w flag ends the assertion when this
+// process exits, even if it is killed. Without the tool, nothing is held.
+func caffeinate() func() {
+	// Not tied to a context: it lives until release, or until this process
+	// exits (-w), whichever comes first.
+	cmd := exec.CommandContext(context.Background(), "caffeinate", "-i", "-w", strconv.Itoa(os.Getpid())) //nolint:gosec // G204: fixed system tool, our own PID
+	if err := cmd.Start(); err != nil {
+		return func() {}
+	}
+	return func() {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+	}
 }

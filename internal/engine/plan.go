@@ -210,7 +210,9 @@ func decide(lib *library.Library, g *Group, id string, twin *Item, redo bool) (A
 
 // trackFrom builds the library metadata known before recording.
 func trackFrom(g *Group, ct spotify.CatalogTrack) library.Track {
-	t := library.Track{ID: ct.ID, Title: ct.Title, Artist: ct.Artist, DurationMS: ct.Duration.Milliseconds()}
+	t := library.Track{
+		ID: ct.ID, Title: ct.Title, Artist: ct.Artist, DurationMS: ct.Duration.Milliseconds(), ReleaseDate: ct.ReleaseDate,
+	}
 	if g.Spec.Kind == library.KindAlbum {
 		t.Album, t.AlbumArtist, t.TrackNumber = g.Spotify.Name, g.Spotify.Owner, ct.Position
 	}

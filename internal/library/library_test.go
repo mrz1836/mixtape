@@ -1,6 +1,7 @@
 package library
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -280,6 +281,28 @@ func TestCommitNameCollisionAndRedo(t *testing.T) {
 	entries, err := os.ReadDir(c.Dir)
 	require.NoError(t, err)
 	assert.Len(t, entries, 4, "two songs, a manifest and a playlist")
+}
+
+func TestCommitLooksUpTheReleaseDate(t *testing.T) {
+	t.Parallel()
+	requireAAC(t)
+	f := newFixture(t, nil)
+	asked := []string{}
+	f.lib.opts.ReleaseDate = func(_ context.Context, id string) (string, error) {
+		asked = append(asked, id)
+		return "1973-03-01", nil
+	}
+	c := f.collection(playlistSpec())
+	e := f.commit(c, trackTime(), 440, CommitOptions{})
+	assert.Equal(t, "1973-03-01", e.ReleaseDate)
+	assert.Equal(t, "1973-03-01", f.tags(c.Path(&e)).Date, "the file is tagged with the year")
+	assert.Equal(t, []string{trackTime().ID}, asked)
+
+	dated := trackMoney()
+	dated.ReleaseDate = "1979-11-30"
+	e = f.commit(c, dated, 550, CommitOptions{})
+	assert.Equal(t, "1979-11-30", e.ReleaseDate, "a known date is kept")
+	assert.Len(t, asked, 1, "and not looked up")
 }
 
 func TestPartialNeverReplacesACompleteRecording(t *testing.T) {

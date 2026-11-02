@@ -525,6 +525,29 @@ func TestStopDuringSetupEndsTheSessionAsStopped(t *testing.T) {
 	assert.Equal(t, session.ResultStopped, st.Result, "the session says it was stopped, not starting")
 }
 
+func TestRecordingKeepsTheMacAwakeUntilItEnds(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	h.world.addPlaylist("List", songs()...)
+	h.deps.services.openCapture = func(captureRequest) (capture.Source, error) { return &loudSource{}, nil }
+	// The setup guard's signals never fire; the session's own handler
+	// gets a stop at once, so the session ends as soon as it runs.
+	calls := 0
+	h.deps.services.signals = func() (<-chan os.Signal, func()) {
+		calls++
+		ch := make(chan os.Signal, 1)
+		if calls > 1 {
+			ch <- syscall.SIGTERM
+		}
+		return ch, func() {}
+	}
+	require.Equal(t, ExitOK, h.run("record", plURL))
+	h.world.mu.Lock()
+	defer h.world.mu.Unlock()
+	assert.Equal(t, 1, h.world.awakeCalls, "a session that plays keeps the Mac awake")
+	assert.Zero(t, h.world.awake, "and lets it sleep again when it ends")
+}
+
 func TestRecordSetupFailureIsRecordedInTheSessionState(t *testing.T) {
 	t.Parallel()
 	h := newHarness(t)

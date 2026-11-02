@@ -242,6 +242,7 @@ func (e *Entry) merge(t Track, overwrite bool) {
 	str(&e.Album, t.Album)
 	str(&e.AlbumArtist, t.AlbumArtist)
 	str(&e.ArtworkURL, t.ArtworkURL)
+	str(&e.ReleaseDate, t.ReleaseDate)
 	num(&e.TrackNumber, t.TrackNumber)
 	num(&e.DiscNumber, t.DiscNumber)
 	num(&e.Popularity, t.Popularity)
@@ -291,6 +292,6 @@ func (e *Entry) track() Track {
 		ID: e.RequestedID, PlayedID: e.PlayedID,
 		Title: e.Title, Artist: e.Artist, Album: e.Album, AlbumArtist: e.AlbumArtist,
 		DurationMS: e.DurationMS, TrackNumber: e.TrackNumber, DiscNumber: e.DiscNumber,
-		Popularity: e.Popularity, ArtworkURL: e.ArtworkURL,
+		Popularity: e.Popularity, ArtworkURL: e.ArtworkURL, ReleaseDate: e.ReleaseDate,
 	}
 }

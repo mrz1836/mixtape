@@ -2,6 +2,7 @@ package library
 
 import (
 	"cmp"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -59,6 +60,9 @@ type Options struct {
 	Now func() time.Time
 	// Warn receives non-fatal problems; nil discards them.
 	Warn func(msg string)
+	// ReleaseDate looks up a track's release date (YYYY-MM-DD) for songs
+	// recorded without one; nil skips the lookup.
+	ReleaseDate func(ctx context.Context, trackID string) (string, error)
 }
 
 // Library is the folder of recordings. It is not safe for concurrent use:

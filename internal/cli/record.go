@@ -203,11 +203,13 @@ func (a *app) resolve(ctx context.Context, refs []spotify.Ref) ([]spotify.Collec
 }
 
 func (a *app) libraryOptions() library.Options {
+	cat := a.deps.services.catalog()
 	return library.Options{
-		Encoder: a.deps.services.encoder,
-		WorkDir: filepath.Join(a.home, "work"),
-		Now:     a.deps.now,
-		Warn:    func(msg string) { a.out.Warn("%s", msg) },
+		Encoder:     a.deps.services.encoder,
+		WorkDir:     filepath.Join(a.home, "work"),
+		Now:         a.deps.now,
+		Warn:        func(msg string) { a.out.Warn("%s", msg) },
+		ReleaseDate: cat.ReleaseDate,
 	}
 }
 
@@ -327,6 +329,12 @@ func (a *app) record(ctx context.Context, cmd *cobra.Command, lib *library.Libra
 	if stopped() {
 		closeSource(src)
 		return rec.abort(context.Canceled, true)
+	}
+	if playback {
+		// A long playlist takes hours: keep the Mac from idle-sleeping
+		// through it. (Closing the lid still sleeps it.)
+		release := svc.keepAwake()
+		defer release()
 	}
 	// The guard stays until the end: the session's own handler starts inside
 	// run, and a signal reaches both, so none falls in between.
