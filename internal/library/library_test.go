@@ -515,6 +515,40 @@ func TestLockKeepsTheWAVWhenTheRepairCannotBeSaved(t *testing.T) {
 	assert.NoFileExists(t, kept)
 }
 
+func TestStatusDoneAndFailed(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		status       Status
+		done, failed bool
+	}{
+		{StatusPending, false, false},
+		{StatusRecorded, true, false},
+		{StatusCopied, true, false},
+		{StatusUnavailable, false, true},
+		{StatusFailed, false, true},
+		{StatusEncodeFailed, false, true},
+		{StatusRemoved, false, false},
+		{"from_a_newer_mixtape", false, false},
+	}
+	for _, tc := range cases {
+		assert.Equal(t, tc.done, tc.status.Done(), "%s: done", tc.status)
+		assert.Equal(t, tc.failed, tc.status.Failed(), "%s: failed", tc.status)
+	}
+}
+
+func TestLocationRelPath(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t, nil)
+	c := f.collection(albumSpec())
+	c.Sync([]Track{trackMoney(), trackTime()}, true)
+	f.commit(c, trackTime(), 440, CommitOptions{})
+
+	locs := f.lib.Find(idTime)
+	require.Len(t, locs, 1)
+	assert.Equal(t, "Pink-Floyd-The-Dark-Side-of-the-Moon/02-Pink-Floyd-Time.m4a", locs[0].RelPath())
+	assert.Equal(t, f.lib.rel(locs[0].Path), locs[0].RelPath(), "the path under the root, as a copy records its source")
+}
+
 func TestUnreadableManifestIsSkipped(t *testing.T) {
 	t.Parallel()
 	f := newFixture(t, nil)

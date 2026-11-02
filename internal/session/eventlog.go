@@ -5,10 +5,13 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"sync"
+
+	"github.com/mrz1836/mixtape/internal/fileutil"
 )
 
 // EventLog appends one compact JSON document per line to a session's
@@ -21,12 +24,9 @@ type EventLog struct {
 
 // OpenEventLog creates (or appends to) the event log at path.
 func OpenEventLog(path string) (*EventLog, error) {
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return nil, err
-	}
-	f, err := os.OpenFile(filepath.Clean(path), os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o600)
+	f, err := fileutil.OpenAppend(path)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("open event log: %w", err)
 	}
 	return &EventLog{f: f, path: path}, nil
 }
@@ -40,7 +40,7 @@ func (l *EventLog) Write(v any) error {
 	enc := json.NewEncoder(&buf)
 	enc.SetEscapeHTML(false)
 	if err := enc.Encode(v); err != nil {
-		return err
+		return fmt.Errorf("encode event: %w", err)
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -70,11 +70,11 @@ func (l *EventLog) Close() error {
 func Follow(path string, from int64, w io.Writer, wait func() bool) (int64, error) {
 	f, err := os.Open(filepath.Clean(path))
 	if err != nil {
-		return from, err
+		return from, fmt.Errorf("follow the event log: %w", err)
 	}
 	defer func() { _ = f.Close() }()
 	if _, err := f.Seek(from, io.SeekStart); err != nil {
-		return from, err
+		return from, fmt.Errorf("follow the event log: %w", err)
 	}
 	r := bufio.NewReader(f)
 	offset := from

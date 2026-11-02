@@ -77,17 +77,9 @@ func parseURI(raw, orig string) (Ref, error) {
 	if len(parts) == 5 && strings.EqualFold(parts[1], "user") {
 		parts = []string{parts[0], parts[3], parts[4]}
 	}
-	if len(parts) < 2 {
-		return Ref{}, fmt.Errorf("%w: %q", ErrBadLink, orig)
-	}
-	kind := strings.ToLower(parts[1])
-	if len(parts) != 3 {
-		if isUnsupportedKind(kind) {
-			return Ref{}, fmt.Errorf("%w: %s", ErrUnsupportedLink, kindName(kind))
-		}
-		return Ref{}, fmt.Errorf("%w: %q", ErrBadLink, orig)
-	}
-	return makeRef(kind, parts[2], orig)
+	// Drop the scheme. raw starts with "spotify:", so parts has at least
+	// two elements and slicing it is safe.
+	return refFromParts(parts[1:], orig)
 }
 
 func parseURL(raw, orig string) (Ref, error) {
@@ -114,17 +106,25 @@ func parseURL(raw, orig string) (Ref, error) {
 	if len(segs) == 4 && strings.EqualFold(segs[0], "user") && strings.EqualFold(segs[2], "playlist") {
 		segs = segs[2:]
 	}
-	if len(segs) == 0 {
+	return refFromParts(segs, orig)
+}
+
+// refFromParts validates what is left of a URI or a URL path once its
+// prefix and legacy forms are stripped: a kind, then an ID. A link with
+// more or fewer parts is unsupported when its kind is a real one Mixtape
+// cannot record, and a bad link otherwise.
+func refFromParts(parts []string, orig string) (Ref, error) {
+	if len(parts) == 0 {
 		return Ref{}, fmt.Errorf("%w: %q", ErrBadLink, orig)
 	}
-	kind := strings.ToLower(segs[0])
-	if len(segs) != 2 {
+	kind := strings.ToLower(parts[0])
+	if len(parts) != 2 {
 		if isUnsupportedKind(kind) {
 			return Ref{}, fmt.Errorf("%w: %s", ErrUnsupportedLink, kindName(kind))
 		}
 		return Ref{}, fmt.Errorf("%w: %q", ErrBadLink, orig)
 	}
-	return makeRef(kind, segs[1], orig)
+	return makeRef(kind, parts[1], orig)
 }
 
 // makeRef validates a kind and ID pair.

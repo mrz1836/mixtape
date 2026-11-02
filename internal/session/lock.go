@@ -32,7 +32,7 @@ type LockInfo struct {
 func DefaultLockPath() (string, error) {
 	dir, err := os.UserCacheDir()
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("find the recorder lock: %w", err)
 	}
 	return filepath.Join(dir, "mixtape", "recorder.lock"), nil
 }
@@ -48,7 +48,7 @@ type Lock struct {
 func Acquire(path string, info LockInfo) (*Lock, error) {
 	f, err := openLockFile(path)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("open the recorder lock: %w", err)
 	}
 	if lockErr := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); lockErr != nil {
 		holder, _ := readLockInfo(f)
@@ -91,7 +91,7 @@ func (l *Lock) Release() error {
 func Inspect(path string) (LockInfo, bool, error) {
 	f, err := openLockFile(path)
 	if err != nil {
-		return LockInfo{}, false, err
+		return LockInfo{}, false, fmt.Errorf("open the recorder lock: %w", err)
 	}
 	defer func() { _ = f.Close() }()
 

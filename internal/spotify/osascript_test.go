@@ -2,6 +2,7 @@ package spotify
 
 import (
 	"context"
+	"errors"
 	"os"
 	"strings"
 	"testing"
@@ -36,8 +37,12 @@ func TestOSAScriptRunError(t *testing.T) {
 	r := &OSAScript{}
 	_, err := r.Run(t.Context(), `error "boom" number -1743`)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "boom")
-	require.ErrorIs(t, Classify(err, true), ErrNotAuthorized, "the error number survives into the message")
+	se, ok := errors.AsType[*ScriptError](err)
+	require.True(t, ok, "a failed script is a ScriptError: %v", err)
+	assert.Equal(t, -1743, se.Code)
+	assert.True(t, strings.HasPrefix(err.Error(), "osascript: exit status 1: "), err.Error())
+	assert.True(t, strings.HasSuffix(err.Error(), "boom (-1743)"), "the message keeps osascript's text: %v", err)
+	require.ErrorIs(t, Classify(err, true), ErrNotAuthorized)
 }
 
 func TestOSAScriptRunTimeout(t *testing.T) {
@@ -73,6 +78,56 @@ func TestOSAScriptStart(t *testing.T) {
 	}
 	assert.Equal(t, []string{"line 1", "line 2", "line 3"}, texts)
 	require.ErrorIs(t, last.Err, errNoOutput)
+}
+
+func TestOSAScriptStartScriptError(t *testing.T) {
+	t.Parallel()
+	requireOSAScript(t)
+	r := &OSAScript{}
+	ch, err := r.Start(t.Context(), "on run argv\nlog \"working\"\nerror \"boom\" number -1743\nend run")
+	require.NoError(t, err)
+	var last Line
+	for l := range ch {
+		last = l
+	}
+	se, ok := errors.AsType[*ScriptError](last.Err)
+	require.True(t, ok, "the exit of a failed script is a ScriptError: %v", last.Err)
+	assert.Equal(t, -1743, se.Code)
+	assert.Contains(t, se.Msg, "boom")
+	require.ErrorIs(t, Classify(last.Err, true), ErrNotAuthorized)
+}
+
+func TestExitError(t *testing.T) {
+	t.Parallel()
+	exit := textError("exit status 1")
+
+	err := exitError(exit, "32:38: execution error: boom (-1743)")
+	se, ok := errors.AsType[*ScriptError](err)
+	require.True(t, ok)
+	assert.Equal(t, &ScriptError{Code: -1743, Msg: "osascript: exit status 1: 32:38: execution error: boom (-1743)"}, se)
+
+	err = exitError(exit, "2026-11-02 osascript[1:2] Connection Invalid error for service")
+	_, ok = errors.AsType[*ScriptError](err)
+	assert.False(t, ok, "a last line without a number may be log noise")
+	require.ErrorIs(t, err, exit)
+	assert.Equal(t, "osascript: exit status 1: 2026-11-02 osascript[1:2] Connection Invalid error for service", err.Error())
+}
+
+func TestErrorCode(t *testing.T) {
+	t.Parallel()
+	for s, want := range map[string]int{
+		"execution error: boom (-1743)":        -1743,
+		"kLSServerCommunicationErr (-10822)\n": -10822,
+		"positive (42)":                        42,
+	} {
+		got, ok := errorCode(s)
+		assert.True(t, ok, s)
+		assert.Equal(t, want, got, s)
+	}
+	for _, s := range []string{"", "exit status 1", "(-1743) then more", "(99999999999999999999)"} {
+		_, ok := errorCode(s)
+		assert.False(t, ok, s)
+	}
 }
 
 func TestOSAScriptStartCancel(t *testing.T) {

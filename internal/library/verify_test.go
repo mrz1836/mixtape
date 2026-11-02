@@ -11,6 +11,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/mrz1836/mixtape/internal/fileutil"
 	"github.com/mrz1836/mixtape/internal/mp4tag"
 	"github.com/mrz1836/mixtape/internal/testutil"
 )
@@ -80,7 +81,7 @@ func TestVerifyTagAndAudioProblems(t *testing.T) {
 	timePath := c.Path(c.Entry(idTime))
 	moneyPath := c.Path(c.Entry(idMoney))
 
-	require.NoError(t, mp4tag.Write(timePath, mp4tag.Tags{Freeform: map[string]string{TagSpotifyID: "someoneElse"}}))
+	retag(t, timePath, mp4tag.Tags{Freeform: map[string]string{TagSpotifyID: "someoneElse"}})
 	swapAudio(t, moneyPath)
 
 	r, err := f.lib.Verify(t.Context(), true, false)
@@ -223,6 +224,43 @@ func TestVerifyReportsSongsMovedOutOfTheirFolder(t *testing.T) {
 	assert.Equal(t, StatusRecorded, c.Entry(idTime).Status)
 }
 
+// TestVerifyPicksTheSameMovedFileEveryRun: when several unreferenced files
+// hold a missing song's audio, the song moved to the first of them by
+// path, on every run, and the others are orphans.
+func TestVerifyPicksTheSameMovedFileEveryRun(t *testing.T) {
+	t.Parallel()
+	f, c := verifyFixture(t)
+	timePath := c.Path(c.Entry(idTime))
+	data, err := os.ReadFile(timePath)
+	require.NoError(t, err)
+	for _, name := range []string{"c-copy.m4a", "a-copy.m4a", "b-copy.m4a"} {
+		require.NoError(t, os.WriteFile(filepath.Join(c.Dir, name), data, 0o600))
+	}
+	require.NoError(t, os.Remove(timePath))
+
+	orphan := func(name string) Problem {
+		return Problem{Collection: c.Folder(), File: name, Kind: ProblemOrphan, Detail: "no manifest entry mentions this file"}
+	}
+	want := []Problem{
+		{
+			Collection: c.Folder(), File: "Pink-Floyd-Time.m4a", TrackID: idTime, Kind: ProblemMoved,
+			Detail: "found at " + filepath.Join(c.Folder(), "a-copy.m4a"),
+		},
+		orphan("b-copy.m4a"),
+		orphan("c-copy.m4a"),
+	}
+	for range 20 {
+		r, verifyErr := f.lib.Verify(t.Context(), false, false)
+		require.NoError(t, verifyErr)
+		require.Equal(t, want, r.Problems)
+	}
+
+	r, err := f.lib.Verify(t.Context(), true, false)
+	require.NoError(t, err)
+	assert.Equal(t, want[:1], r.Fixed)
+	assert.Equal(t, "a-copy.m4a", c.Entry(idTime).File)
+}
+
 func TestVerifyUnreadableSongIsRecordedAgain(t *testing.T) {
 	t.Parallel()
 	f, c := verifyFixture(t)
@@ -295,7 +333,7 @@ func TestVerifyScansOnlyCollectionAudio(t *testing.T) {
 	require.NoError(t, os.Mkdir(trash, 0o750))
 	require.NoError(t, os.Rename(c.Path(c.Entry(idTime)), filepath.Join(trash, "Time.m4a")))
 	writeSong(t, c.Dir, "EXTRA.M4A", "an orphan, whatever its case", nil)
-	writeSong(t, c.Dir, ".tagging-1.m4a", "a crashed retag", nil)
+	writeSong(t, c.Dir, fileutil.TempPrefix+"1.m4a", "a crashed write", nil)
 	writeSong(t, f.root, "loose.m4a", "outside every collection", nil)
 	other := filepath.Join(f.root, "Not a collection")
 	require.NoError(t, os.Mkdir(other, 0o750))

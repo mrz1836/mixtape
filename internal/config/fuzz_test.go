@@ -62,7 +62,7 @@ func FuzzLoad(f *testing.F) {
 		require.NoError(t, rawErr, "Load accepted what decodeRaw refuses")
 		unknown := 0
 		for k := range raw {
-			if !isKnown(k) {
+			if _, known := lookup(k); !known {
 				unknown++
 			}
 		}
@@ -74,8 +74,10 @@ func FuzzLoad(f *testing.F) {
 			return
 		}
 		again := filepath.Join(dir, "again.json")
-		for k, v := range fileValues(file) {
-			require.NoError(t, Set(again, k, v, testHome), "Set refuses %s=%q that Resolve accepted", k, v)
+		for _, st := range table() {
+			if v, ok := fieldText(st.inFile(&file)); ok {
+				require.NoError(t, Set(again, st.Name, v, testHome), "Set refuses %s=%q that Resolve accepted", st.Name, v)
+			}
 		}
 		reloaded, warnings, err := Load(again)
 		require.NoError(t, err)

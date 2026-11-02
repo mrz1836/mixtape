@@ -3,6 +3,7 @@ package session
 import (
 	"bytes"
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -171,7 +172,7 @@ func TestRestoreCompareAndSet(t *testing.T) {
 	// Shuffle and volume still hold what we set; the user turned repeat
 	// off again themselves, so it is left alone.
 	p := &fakeRestorer{snap: spotify.Snapshot{Shuffle: false, Repeat: false, Volume: 100}}
-	restored, err := Restore(t.Context(), p, st)
+	restored, err := restore(t.Context(), p, st, 0)
 	require.NoError(t, err)
 	assert.Equal(t, []string{"shuffle", "volume"}, restored)
 	assert.Equal(t, []string{"shuffle=on", "volume", "volume"}, p.calls, "the volume is nudged once")
@@ -181,6 +182,53 @@ func TestRestoreCompareAndSet(t *testing.T) {
 	assert.False(t, st.NeedsRestore())
 	assert.False(t, (*SpotifyState)(nil).NeedsRestore())
 }
+
+func TestRestoreReportsWhatFailed(t *testing.T) {
+	t.Parallel()
+	st := SpotifyState{
+		Original: PlayerSettings{Shuffle: testutil.Ptr(true), Volume: testutil.Ptr(40)},
+		Set:      PlayerSettings{Shuffle: testutil.Ptr(false), Volume: testutil.Ptr(100)},
+	}
+	p := &failingRestorer{fakeRestorer: fakeRestorer{snap: spotify.Snapshot{Volume: 100}}}
+	restored, err := restore(t.Context(), p, st, 0)
+	require.ErrorIs(t, err, errSetFailed)
+	assert.Contains(t, err.Error(), "restore shuffle: ")
+	assert.Equal(t, []string{"volume"}, restored, "one failure does not stop the others")
+}
+
+func TestRestoreWaitsForTheVolumeOnlyWhileTheContextLives(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	st := SpotifyState{Original: PlayerSettings{Volume: testutil.Ptr(47)}, Set: PlayerSettings{Volume: testutil.Ptr(100)}}
+	p := &fakeRestorer{snap: spotify.Snapshot{Volume: 100}}
+	start := time.Now()
+	restored, err := restore(ctx, p, st, time.Hour)
+	require.NoError(t, err, "the volume was set; only the read-back was cut short")
+	assert.Equal(t, []string{"volume"}, restored)
+	assert.Less(t, time.Since(start), time.Minute, "a canceled restore does not wait out the settle")
+	assert.Equal(t, []string{"volume"}, p.calls, "no nudging without time to check")
+}
+
+func TestToRestore(t *testing.T) {
+	t.Parallel()
+	v, ok := toRestore(testutil.Ptr(40), testutil.Ptr(100), 100)
+	assert.True(t, ok)
+	assert.Equal(t, 40, v)
+	_, ok = toRestore(testutil.Ptr(40), testutil.Ptr(100), 70)
+	assert.False(t, ok, "the listener changed it since: theirs wins")
+	_, ok = toRestore(testutil.Ptr(true), testutil.Ptr(true), true)
+	assert.False(t, ok, "nothing was changed")
+	_, ok = toRestore(nil, testutil.Ptr(true), true)
+	assert.False(t, ok, "the original is unknown")
+}
+
+var errSetFailed = errors.New("spotify did not answer")
+
+// failingRestorer fails to change shuffle.
+type failingRestorer struct{ fakeRestorer }
+
+func (*failingRestorer) SetShuffle(context.Context, bool) error { return errSetFailed }
 
 func TestRestorePollError(t *testing.T) {
 	t.Parallel()

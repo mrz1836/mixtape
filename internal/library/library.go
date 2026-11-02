@@ -290,6 +290,11 @@ type Location struct {
 	Path       string
 }
 
+// RelPath returns the song's path relative to the library root,
+// "<collection folder>/<file>", the form plans and events report (Path is
+// the absolute one).
+func (loc Location) RelPath() string { return loc.Collection.Folder() + "/" + loc.Entry.File }
+
 // Find returns every complete song whose requested or played ID is id and
 // whose file exists, across all collections.
 func (l *Library) Find(id string) []Location {
@@ -342,11 +347,7 @@ func (l *Library) Save(c *Collection) error {
 	if m.Tracks == nil {
 		m.Tracks = []Entry{}
 	}
-	data, err := json.MarshalIndent(m, "", "  ")
-	if err != nil {
-		return fmt.Errorf("encode manifest: %w", err)
-	}
-	if err := fileutil.WriteAtomic(filepath.Join(c.Dir, ManifestName), append(data, '\n'), manifestPerm); err != nil {
+	if err := fileutil.WriteJSON(filepath.Join(c.Dir, ManifestName), m, manifestPerm); err != nil {
 		return fmt.Errorf("save manifest: %w", err)
 	}
 	if err := fileutil.WriteAtomic(filepath.Join(c.Dir, c.Folder()+m3u8Ext), c.playlist(), manifestPerm); err != nil {

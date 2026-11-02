@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"io"
 	"math"
 	"os"
 	"os/exec"
@@ -37,7 +38,7 @@ func TestWriteHeaderFields(t *testing.T) {
 	t.Parallel()
 	data := sine(0.1)
 	var buf bytes.Buffer
-	require.NoError(t, Write(&buf, data, testRate, testChans))
+	require.NoError(t, writeWAV(&buf, data, testRate, testChans))
 
 	b := buf.Bytes()
 	require.Len(t, b, HeaderSize+len(data))
@@ -84,7 +85,7 @@ func (failWriter) Write([]byte) (int, error) { return 0, errWrite }
 
 func TestWritePropagatesErrors(t *testing.T) {
 	t.Parallel()
-	require.ErrorIs(t, Write(failWriter{}, sine(0.01), testRate, testChans), errWrite)
+	require.ErrorIs(t, writeWAV(failWriter{}, sine(0.01), testRate, testChans), errWrite)
 }
 
 // TestAfconvertAccepts checks the header against the real consumer.
@@ -97,7 +98,7 @@ func TestAfconvertAccepts(t *testing.T) {
 	in := filepath.Join(dir, "in.wav")
 	f, err := os.Create(in)
 	require.NoError(t, err)
-	require.NoError(t, Write(f, sine(0.25), testRate, testChans))
+	require.NoError(t, writeWAV(f, sine(0.25), testRate, testChans))
 	require.NoError(t, f.Close())
 
 	// Reading the header is the point, so the output is plain PCM: unlike
@@ -117,4 +118,14 @@ func TestMaxDuration(t *testing.T) {
 	assert.Greater(t, d, 6*time.Hour)
 	assert.Less(t, d, 6*time.Hour+15*time.Minute)
 	assert.Zero(t, MaxDuration(0, 2))
+}
+
+// writeWAV writes a complete WAV file holding data, as the engine does
+// with its header and the spooled audio.
+func writeWAV(w io.Writer, data []byte, rate, channels int) error {
+	if err := WriteHeader(w, int64(len(data)), rate, channels); err != nil {
+		return err
+	}
+	_, err := w.Write(data)
+	return err
 }

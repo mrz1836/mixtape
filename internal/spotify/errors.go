@@ -4,8 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"regexp"
-	"strconv"
 	"strings"
 )
 
@@ -19,14 +17,27 @@ const (
 	codeLaunchServices2 = -10822 // kLSServerCommunicationErr (sandboxed caller)
 )
 
-// errCodeRe finds the trailing "(-1743)" osascript appends to an error.
-var errCodeRe = regexp.MustCompile(`\((-?\d+)\)\s*$`)
+// ScriptError is a failed AppleScript call: osascript exiting with an
+// error, or an error the snapshot script caught and reported itself.
+// Classify reads Code, so nothing downstream has to parse the message.
+type ScriptError struct {
+	// Code is the AppleScript or Apple Event error number (-1743 when
+	// Automation is denied), or 0 when the failure gave none.
+	Code int
+	// Msg is the whole error text, ending with the number when there is
+	// one, as osascript prints it.
+	Msg string
+}
+
+// Error returns Msg.
+func (e *ScriptError) Error() string { return e.Msg }
 
 // Classify maps an osascript failure to one of the package's sentinels,
 // keeping the original text as detail. running says whether the Spotify
 // process exists; it separates "not running" from "Apple Events blocked"
 // (a sandbox) for the errors that look alike. Errors that already carry a
-// sentinel pass through unchanged.
+// sentinel pass through unchanged. Only a *ScriptError carries an error
+// number: any other error is ErrScript, whatever its text says.
 func Classify(err error, running bool) error {
 	if err == nil {
 		return nil
@@ -43,11 +54,11 @@ func Classify(err error, running bool) error {
 	if errors.Is(err, context.DeadlineExceeded) {
 		return fmt.Errorf("%w: %s", ErrPromptPending, detail)
 	}
-	code, ok := errorCode(detail)
+	se, ok := errors.AsType[*ScriptError](err)
 	if !ok {
 		return fmt.Errorf("%w: %s", ErrScript, detail)
 	}
-	return classifyCode(code, detail, running)
+	return classifyCode(se.Code, detail, running)
 }
 
 // classifyCode maps an Apple Event error number to a sentinel.
@@ -65,24 +76,11 @@ func classifyCode(code int, detail string, running bool) error {
 	return fmt.Errorf("%w: %s", ErrScript, detail)
 }
 
-// errorCode extracts the trailing error number from osascript output.
-func errorCode(s string) (int, bool) {
-	m := errCodeRe.FindStringSubmatch(s)
-	if m == nil {
-		return 0, false
-	}
-	n, err := strconv.Atoi(m[1])
-	if err != nil {
-		return 0, false
-	}
-	return n, true
-}
-
 // needsProcessCheck reports whether classifying err depends on whether
 // Spotify is running, so the process list is consulted only then.
 func needsProcessCheck(err error) bool {
-	code, ok := errorCode(strings.TrimSpace(err.Error()))
-	return ok && ambiguousCode(code)
+	se, ok := errors.AsType[*ScriptError](err)
+	return ok && ambiguousCode(se.Code)
 }
 
 // ambiguousCode reports error numbers that mean "not running" or "blocked"

@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"path/filepath"
 	"strings"
-	"time"
 	"unicode"
 	"unicode/utf8"
 )
@@ -72,12 +71,6 @@ func capBytes(s string, n int) string {
 		s = s[:len(s)-1]
 	}
 	return s
-}
-
-// MMSS formats a duration as m:ss (e.g. "3:12", "15:04").
-func MMSS(d time.Duration) string {
-	total := int(d.Seconds())
-	return fmt.Sprintf("%d:%02d", total/60, total%60)
 }
 
 // trackFileName is the file name for a song: "Artist-Title.m4a", or

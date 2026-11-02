@@ -150,12 +150,12 @@ func rules() []rule {
 		{errBadOutput, ExitUsage, ""},
 
 		// Not ready.
-		{errCrossfade, ExitNotReady, "turn off Spotify → Settings → Playback → Crossfade songs, or pass --allow-crossfade"},
-		{engine.ErrCrossfade, ExitNotReady, "turn off Spotify → Settings → Playback → Crossfade songs, then run again"},
-		{spotify.ErrNotInstalled, ExitNotReady, "install Spotify from https://www.spotify.com/download"},
-		{spotify.ErrNotRunning, ExitNotReady, "open Spotify (open -a Spotify) and run the command again"},
+		{errCrossfade, ExitNotReady, `in Spotify → Settings → Playback turn off "Crossfade songs" and "Automix", or pass --allow-crossfade`},
+		{engine.ErrCrossfade, ExitNotReady, fixCrossfade + ", then run again"},
+		{spotify.ErrNotInstalled, ExitNotReady, fixInstallSpotify},
+		{spotify.ErrNotRunning, ExitNotReady, fixOpenSpotify + " and run the command again"},
 		{spotify.ErrPromptPending, ExitNotReady, "approve the macOS Automation prompt for Spotify, then run again"},
-		{errNoAfconvert, ExitNotReady, "afconvert ships with macOS; check /usr/bin/afconvert"},
+		{errNoAfconvert, ExitNotReady, fixAfconvert},
 		{capture.ErrTapUnsupported, ExitNotReady, "use --capture device with BlackHole (see 'mixtape setup')"},
 		{device.ErrNoDevice, ExitNotReady, "install BlackHole (brew install blackhole-2ch) and run 'mixtape setup'"},
 		{tap.ErrNoProcess, ExitNotReady, "start playing something in Spotify, then run again"},

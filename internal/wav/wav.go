@@ -66,12 +66,3 @@ func WriteHeader(w io.Writer, dataSize int64, rate, channels int) error {
 	_, err := w.Write(h[:])
 	return err
 }
-
-// Write writes a complete WAV file holding data.
-func Write(w io.Writer, data []byte, rate, channels int) error {
-	if err := WriteHeader(w, int64(len(data)), rate, channels); err != nil {
-		return err
-	}
-	_, err := w.Write(data)
-	return err
-}

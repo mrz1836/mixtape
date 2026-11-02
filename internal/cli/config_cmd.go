@@ -3,7 +3,6 @@ package cli
 import (
 	"fmt"
 	"strings"
-	"text/tabwriter"
 
 	"github.com/spf13/cobra"
 
@@ -67,23 +66,24 @@ flag, env, file or default.`,
 				return err
 			}
 			doc := configShowDoc{Path: config.Path(a.home)}
-			var b strings.Builder
-			tw := tabwriter.NewWriter(&b, 0, 0, 2, ' ', 0)
-			_, _ = fmt.Fprintf(tw, "%s\t%s\t%s\n", a.out.paint(colorBold, "KEY"),
-				a.out.paint(colorBold, "VALUE"), a.out.paint(colorBold, "SOURCE"))
 			for _, k := range config.Keys() {
-				row := configSettingDoc{
+				doc.Settings = append(doc.Settings, configSettingDoc{
 					Key: k.Name, Value: s.Value(k.Name), Source: string(s.Sources[k.Name]),
 					Env: k.Env, Default: k.Default, Help: k.Help,
-				}
-				doc.Settings = append(doc.Settings, row)
-				_, _ = fmt.Fprintf(tw, "%s\t%s\t%s\n", row.Key, row.Value, row.Source)
+				})
 			}
-			_ = tw.Flush()
-			text := b.String() + a.out.paint(colorDim, "file: "+doc.Path)
-			return a.out.Result(text, doc)
+			return a.out.Result(a.configText(doc), doc)
 		},
 	}
+}
+
+// configText renders `config show` for people.
+func (a *app) configText(doc configShowDoc) string {
+	rows := make([][]string, 0, len(doc.Settings))
+	for _, row := range doc.Settings {
+		rows = append(rows, []string{row.Key, row.Value, row.Source})
+	}
+	return a.out.table([]string{"KEY", "VALUE", "SOURCE"}, rows) + "\n" + a.out.paint(colorDim, "file: "+doc.Path)
 }
 
 func newConfigSetCmd(a *app) *cobra.Command {

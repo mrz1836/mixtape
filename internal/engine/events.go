@@ -92,3 +92,12 @@ type PlanItem struct {
 	From       string `json:"from,omitempty"`
 	Hint       string `json:"hint,omitempty"`
 }
+
+// itemTrack describes a planned song for events.
+func itemTrack(it *Item) *EventTrack {
+	return &EventTrack{
+		ID: it.Track.ID, PlayedID: it.Track.PlayedID, Title: it.Track.Title, Artist: it.Track.Artist,
+		Collection: it.Group.Spec.Name, Position: it.position(), DurationMS: it.Track.DurationMS,
+		Attempt: it.attempts,
+	}
+}

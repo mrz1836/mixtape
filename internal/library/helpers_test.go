@@ -159,6 +159,16 @@ func swapAudio(t *testing.T, path string) {
 	require.NoError(t, os.WriteFile(path, data, 0o600))
 }
 
+// retag replaces the tags of the song at path with tags; its audio stays.
+func retag(t *testing.T, path string, tags mp4tag.Tags) {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	require.NoError(t, err)
+	data, err = mp4tag.Tag(data, tags)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(path, data, 0o600))
+}
+
 // truncate cuts the end off the song at path: its tags (moov comes first)
 // stay readable, its audio does not.
 func truncate(t *testing.T, path string) {

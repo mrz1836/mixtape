@@ -5,6 +5,7 @@
 package fileutil
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -92,4 +93,23 @@ func writeAtomic(path string, perm os.FileMode, fill func(io.Writer) error) erro
 		_ = dirFile.Close()
 	}
 	return nil
+}
+
+// WriteJSON writes v to path atomically (see WriteAtomic) as indented JSON
+// ending in a newline. The folder must exist.
+func WriteJSON(path string, v any, perm os.FileMode) error {
+	data, err := json.MarshalIndent(v, "", "  ")
+	if err != nil {
+		return fmt.Errorf("encode %s: %w", filepath.Base(path), err)
+	}
+	return WriteAtomic(path, append(data, '\n'), perm)
+}
+
+// OpenAppend opens path for appending, creating the file (mode 0600) and
+// its folder (mode 0700) as needed: a log only its owner may read.
+func OpenAppend(path string) (*os.File, error) {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return nil, err
+	}
+	return os.OpenFile(filepath.Clean(path), os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o600)
 }

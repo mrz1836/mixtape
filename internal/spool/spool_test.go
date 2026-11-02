@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -197,14 +198,14 @@ func TestFrameAtInterpolates(t *testing.T) {
 	for _, sec := range []float64{0, 0.25, 1, 2.5, 4.9} {
 		at := start.Add(time.Duration(sec * float64(time.Second)))
 		assert.InDelta(t, sec*1000, float64(s.FrameAt(at)), 5, "FrameAt(%.2fs)", sec)
-		assert.InDelta(t, 0, s.TimeAt(s.FrameAt(at)).Sub(at).Seconds(), 0.005, "TimeAt inverts FrameAt at %.2fs", sec)
+		assert.InDelta(t, 0, timeAt(s, s.FrameAt(at)).Sub(at).Seconds(), 0.005, "timeAt inverts FrameAt at %.2fs", sec)
 	}
 
 	// Beyond the anchors both directions extrapolate at the nominal rate.
 	assert.InDelta(t, -1000, float64(s.FrameAt(start.Add(-time.Second))), 5)
 	last := start.Add(49 * 100 * time.Millisecond)
 	assert.InDelta(t, 4900+2000, float64(s.FrameAt(last.Add(2*time.Second))), 5)
-	assert.InDelta(t, 0, s.TimeAt(-1000).Sub(start.Add(-time.Second)).Seconds(), 0.005)
+	assert.InDelta(t, 0, timeAt(s, -1000).Sub(start.Add(-time.Second)).Seconds(), 0.005)
 }
 
 func TestFrameAtThinsAndIgnoresBackwardTime(t *testing.T) {
@@ -231,7 +232,7 @@ func TestFrameAtWithoutAnchors(t *testing.T) {
 	t.Parallel()
 	s := newSpool(t, t.TempDir(), smallFormat())
 	assert.Zero(t, s.FrameAt(time.Now()))
-	assert.True(t, s.TimeAt(10).IsZero())
+	assert.True(t, timeAt(s, 10).IsZero())
 
 	at := time.Now()
 	require.NoError(t, s.Append(capture.Block{PCM: frames(smallFormat(), 0, 100), Frames: 100, At: at}))
@@ -373,4 +374,26 @@ func TestCloseDeletesChunksPruneCouldNotDelete(t *testing.T) {
 
 	require.NoError(t, s.Close())
 	assert.Empty(t, chunkFiles(t, dir))
+}
+
+// timeAt maps a frame position back to its capture time, the inverse of
+// FrameAt, so tests can check that mapping both ways.
+func timeAt(s *Spool, frame int64) time.Time {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	a := s.anchors
+	switch {
+	case len(a) == 0:
+		return time.Time{}
+	case len(a) == 1 || frame <= a[0].frame:
+		return a[0].at.Add(s.format.Duration(frame - a[0].frame))
+	}
+	last := a[len(a)-1]
+	if frame >= last.frame {
+		return last.at.Add(s.format.Duration(frame - last.frame))
+	}
+	i := sort.Search(len(a), func(i int) bool { return a[i].frame > frame })
+	lo, hi := a[i-1], a[i]
+	frac := float64(frame-lo.frame) / float64(hi.frame-lo.frame)
+	return lo.at.Add(time.Duration(frac * float64(hi.at.Sub(lo.at))))
 }

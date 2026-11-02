@@ -10,6 +10,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/mrz1836/mixtape/internal/fileutil"
 	"github.com/mrz1836/mixtape/internal/mp4tag"
 )
 
@@ -181,8 +182,8 @@ func TestReconcileLeavesOtherFilesAlone(t *testing.T) {
 	require.NoError(t, f.lib.Save(c))
 
 	for name, audio := range map[string]string{
-		"Rick.aac":         "not an .m4a name",
-		".tagging-123.m4a": "a retag that crashed",
+		"Rick.aac":                      "not an .m4a name",
+		fileutil.TempPrefix + "123.m4a": "a write that crashed",
 	} {
 		writeSong(t, c.Dir, name, audio, map[string]string{TagSpotifyID: idRick})
 	}
@@ -207,7 +208,7 @@ func TestReconcileLeavesOtherFilesAlone(t *testing.T) {
 	require.NoError(t, err)
 	defer unlock()
 	assert.Equal(t, before.UpdatedAt, readManifest(t, c.Dir).UpdatedAt, "nothing to repair, nothing written")
-	assert.NoFileExists(t, filepath.Join(c.Dir, ".tagging-123.m4a"), "the writer removes a crashed retag")
+	assert.NoFileExists(t, filepath.Join(c.Dir, fileutil.TempPrefix+"123.m4a"), "the writer removes a crashed write")
 	assert.FileExists(t, filepath.Join(c.Dir, "untagged.m4a"))
 }
 

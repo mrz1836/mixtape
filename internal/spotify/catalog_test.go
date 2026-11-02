@@ -332,7 +332,16 @@ func TestNewCatalogDefaults(t *testing.T) {
 	assert.Equal(t, catalogTimeout, c.Client.Timeout)
 
 	var zero Catalog
-	assert.Equal(t, defaultEmbedBase, zero.embedBase())
+	d := zero.withDefaults()
+	assert.Equal(t, defaultEmbedBase, d.EmbedBase)
+	assert.Equal(t, defaultOEmbedBase, d.OEmbedBase)
+	assert.Equal(t, defaultUserAgent, d.UserAgent)
+	require.NotNil(t, d.Client)
+	assert.Equal(t, catalogTimeout, d.Client.Timeout)
+	assert.Equal(t, Catalog{}, zero, "the defaults fill a copy, not the Catalog")
+
+	set := Catalog{EmbedBase: "http://e", OEmbedBase: "http://o", UserAgent: "ua", Client: &http.Client{}}
+	assert.Equal(t, set, set.withDefaults(), "fields that are set are kept")
 }
 
 func TestResolveNamesTheCatalogFailureOnce(t *testing.T) {

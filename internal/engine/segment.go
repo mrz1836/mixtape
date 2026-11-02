@@ -272,18 +272,9 @@ func splitRuns(tl Timeline, clock Clock, f, dur float64, tn Tuning) []run {
 			prevAt = o.At
 			continue
 		}
-		if o.Position == 0 {
+		if rejected(o, cur, accepted, tl.Before, tn) {
 			prevAt = o.At
-			continue // Spotify reports exactly 0 while it buffers the start
-		}
-		if !accepted && !tl.Before.IsZero() &&
-			o.Position > o.At.Sub(tl.Before).Seconds()+tn.StaleSlack.Seconds() {
-			prevAt = o.At
-			continue // the previous track's position, reported under the new ID
-		}
-		if cur != nil && o.Position == cur.samples[len(cur.samples)-1].pos {
-			prevAt = o.At
-			continue // a held value carries no new timing information
+			continue
 		}
 		accepted = true
 		s := sample{
@@ -303,6 +294,21 @@ func splitRuns(tl Timeline, clock Clock, f, dur float64, tn Tuning) []run {
 	}
 	closeRun()
 	return runs
+}
+
+// rejected reports a playing observation that carries no timing for the
+// song. accepted tells whether one was taken already; cur is the run being
+// built, if any.
+func rejected(o Obs, cur *run, accepted bool, before time.Time, tn Tuning) bool {
+	switch {
+	case o.Position == 0:
+		return true // Spotify reports exactly 0 while it buffers the start
+	case !accepted && !reachable(before, o.At, o.Position, tn):
+		return true // the previous track's position, reported under the new ID
+	case cur != nil && o.Position == cur.samples[len(cur.samples)-1].pos:
+		return true // a held value carries no new timing information
+	}
+	return false
 }
 
 // recentAnchor is the median anchor of a run's last few samples, the

@@ -81,7 +81,6 @@ func (p *replayPlayer) Watch(context.Context, time.Duration) <-chan spotify.Snap
 }
 
 func (p *replayPlayer) PlayTrack(context.Context, string, string) error { return p.log("play") }
-func (p *replayPlayer) Play(context.Context) error                      { return p.log("play") }
 func (p *replayPlayer) Pause(context.Context) error                     { return p.log("pause") }
 func (p *replayPlayer) Next(context.Context) error                      { return p.log("next") }
 func (p *replayPlayer) PlayPause(context.Context) error                 { return p.log("playpause") }

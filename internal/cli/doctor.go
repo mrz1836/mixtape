@@ -63,8 +63,7 @@ Exits 0 when ready and 3 when a check fails. Warnings do not block.`,
 				return err
 			}
 			if !doc.Ready {
-				return newError(ExitNotReady, errNotReady, "fix the failed checks above, or run 'mixtape setup'",
-					"not ready: %d check(s) failed", failed(doc.Checks))
+				return notReady(failed(doc.Checks), "fix the failed checks above, or run 'mixtape setup'")
 			}
 			return nil
 		},
@@ -73,73 +72,67 @@ Exits 0 when ready and 3 when a check fails. Warnings do not block.`,
 
 // diagnose runs every readiness check.
 func (a *app) diagnose(ctx context.Context) doctorDoc {
-	svc := a.deps.services
-	var checks []check
-	add := func(c check) { checks = append(checks, c) }
-
-	add(a.checkMacOS())
+	checks := []check{a.checkMacOS()}
 	settings, cfgCheck := a.checkConfig()
-	add(cfgCheck)
-
-	appPath, installed := svc.spotifyApp(a.deps.userHome)
-	if installed {
-		add(check{ID: "spotify_installed", Name: "Spotify app", Status: checkOK, Detail: appPath})
-	} else {
-		add(check{
-			ID: "spotify_installed", Name: "Spotify app", Status: checkFail, Detail: "not installed",
-			Fix: "install Spotify from https://www.spotify.com/download",
-		})
-	}
-	snap := spotify.Snapshot{Err: spotify.ErrNotRunning}
-	proc, procErr := a.spotifyStatus()
-	switch proc {
-	case spotifyRunning:
-		add(check{ID: "spotify_running", Name: "Spotify running", Status: checkOK, Detail: "running"})
-	case spotifyStopped:
-		add(check{
-			ID: "spotify_running", Name: "Spotify running", Status: checkFail, Detail: "not running",
-			Fix: "open Spotify (open -a Spotify)",
-		})
-	case spotifyUnknown:
-		// Polling never launches Spotify, so it still tells whether it runs.
-		add(check{
-			ID: "spotify_running", Name: "Spotify running", Status: checkWarn,
-			Detail: "could not check Spotify: " + procErr.Error(),
-		})
-	}
-	if proc == spotifyStopped {
-		add(check{
-			ID: "automation", Name: "Automation permission", Status: checkSkip,
-			Detail: "checked once Spotify is running",
-		})
-	} else if c, ok := a.automationState(); ok {
-		// Ask macOS first: polling Spotify while Automation is undecided
-		// would put a prompt on screen, and doctor never prompts.
-		add(c)
-	} else {
-		pctx, cancel := context.WithTimeout(ctx, 8*time.Second)
-		snap = svc.player().Poll(pctx)
-		cancel()
-		add(automationCheck(snap))
-	}
-	add(a.checkCrossfade())
-	add(volumeCheck(snap))
+	checks = append(checks, cfgCheck)
+	spotifyChecks, snap := a.checkSpotify(ctx)
+	checks = append(checks, spotifyChecks...)
+	checks = append(checks, a.checkCrossfade(), volumeCheck(snap))
 
 	method, capChecks := a.checkCapture(settings)
 	checks = append(checks, capChecks...)
 
-	if _, err := svc.lookPath("afconvert"); err == nil || svc.encoder != nil {
-		add(check{ID: "afconvert", Name: "afconvert", Status: checkOK, Detail: "found"})
+	if a.afconvertFound() {
+		checks = append(checks, check{ID: checkIDAfconvert, Name: "afconvert", Status: checkOK, Detail: "found"})
 	} else {
-		add(check{
-			ID: "afconvert", Name: "afconvert", Status: checkFail, Detail: "not found",
-			Fix: "afconvert ships with macOS; check /usr/bin/afconvert",
+		checks = append(checks, check{
+			ID: checkIDAfconvert, Name: "afconvert", Status: checkFail, Detail: "not found", Fix: fixAfconvert,
 		})
 	}
-	add(checkLibrary(settings.Library))
-	add(a.checkSession())
-
+	checks = append(checks, checkLibrary(settings.Library), a.checkSession())
 	return doctorDoc{Ready: failed(checks) == 0, Capture: string(method), Checks: checks}
+}
+
+// checkSpotify reports the Spotify app (installed, running) and whether
+// mixtape may control it, with the snapshot taken to find out (an error
+// snapshot when Spotify was not asked).
+func (a *app) checkSpotify(ctx context.Context) ([]check, spotify.Snapshot) {
+	svc := a.deps.services
+	var checks []check
+	if appPath, installed := svc.spotifyApp(a.deps.userHome); installed {
+		checks = append(checks, check{ID: checkIDSpotifyApp, Name: "Spotify app", Status: checkOK, Detail: appPath})
+	} else {
+		checks = append(checks, check{
+			ID: checkIDSpotifyApp, Name: "Spotify app", Status: checkFail, Detail: "not installed", Fix: fixInstallSpotify,
+		})
+	}
+	snap := spotify.Snapshot{Err: spotify.ErrNotRunning}
+	running := check{ID: checkIDSpotifyRunning, Name: "Spotify running", Status: checkOK, Detail: "running"}
+	proc, procErr := a.spotifyStatus()
+	switch proc {
+	case spotifyStopped:
+		running.Status, running.Detail, running.Fix = checkFail, "not running", fixOpenSpotify
+	case spotifyUnknown:
+		// Polling never launches Spotify, so it still tells whether it runs.
+		running.Status, running.Detail = checkWarn, "could not check Spotify: "+procErr.Error()
+	case spotifyRunning:
+	}
+	checks = append(checks, running)
+	if proc == spotifyStopped {
+		return append(checks, check{
+			ID: checkIDAutomation, Name: "Automation permission", Status: checkSkip,
+			Detail: "checked once Spotify is running",
+		}), snap
+	}
+	// Ask macOS first: polling Spotify while Automation is undecided would
+	// put a prompt on screen, and doctor never prompts.
+	if c, decided := a.automationState(); decided {
+		return append(checks, c), snap
+	}
+	pctx, cancel := context.WithTimeout(ctx, 8*time.Second)
+	snap = svc.player().Poll(pctx)
+	cancel()
+	return append(checks, automationCheck(snap)), snap
 }
 
 // failed counts the checks that failed.
@@ -156,45 +149,43 @@ func failed(checks []check) int {
 func (a *app) checkMacOS() check {
 	v, err := osProductVersion()
 	if err != nil || v == "" {
-		return check{ID: "macos", Name: "macOS", Status: checkWarn, Detail: "version unknown"}
+		return check{ID: checkIDMacOS, Name: "macOS", Status: checkWarn, Detail: "version unknown"}
 	}
-	return check{ID: "macos", Name: "macOS", Status: checkOK, Detail: "macOS " + v}
+	return check{ID: checkIDMacOS, Name: "macOS", Status: checkOK, Detail: "macOS " + v}
 }
 
+// checkConfig reports the config file and returns the settings the other
+// checks use: the defaults, where the file or a value is unusable.
 func (a *app) checkConfig() (config.Settings, check) {
-	c := check{ID: "config", Name: "Config file", Status: checkOK, Detail: config.Path(a.home)}
-	file, warnings, err := config.Load(config.Path(a.home))
-	if err != nil {
+	c := check{ID: checkIDConfig, Name: "Config file", Status: checkOK, Detail: config.Path(a.home)}
+	s, warnings, err := a.loadSettings(config.Overrides{})
+	switch {
+	case errors.Is(err, config.ErrInvalidValue):
+		c.Status, c.Detail, c.Fix = checkFail, err.Error(), "fix the value with 'mixtape config set'"
+	case err != nil:
 		c.Status, c.Detail, c.Fix = checkFail, err.Error(), "fix the JSON, or delete the file to start over"
-		file = config.File{}
-	} else if len(warnings) > 0 {
+	case len(warnings) > 0:
 		c.Status, c.Detail = checkWarn, strings.Join(warnings, "; ")
 	}
-	o := config.Overrides{}
-	if a.flags.librarySet {
-		o.Library = &a.flags.library
-	}
-	s, err := config.Resolve(file, a.deps.getenv, o, a.deps.userHome)
-	if err != nil {
-		c.Status, c.Detail, c.Fix = checkFail, err.Error(), "fix the value with 'mixtape config set'"
-		s, _ = config.Resolve(config.File{}, func(string) string { return "" }, config.Overrides{}, a.deps.userHome)
+	if s.Sources == nil { // nothing resolved: carry on with the defaults
+		s, _ = config.Resolve(config.File{}, nil, config.Overrides{}, a.deps.userHome)
 	}
 	return s, c
 }
 
 // automationState reports the Automation permission when macOS gives a
-// definite answer that rules out polling (undecided or denied); ok is false
-// when Spotify should be polled to find out.
-func (a *app) automationState() (check, bool) {
+// definite answer that rules out polling (undecided or denied); decided is
+// false when Spotify should be polled to find out.
+func (a *app) automationState() (c check, decided bool) {
 	app := a.deps.services.hostApp()
-	c := check{ID: "automation", Name: "Automation permission", Fix: permission.Instructions(permission.Automation, app)}
+	c = check{ID: checkIDAutomation, Name: "Automation permission", Fix: permission.Instructions(permission.Automation, app)}
 	switch a.deps.services.permission(permission.Automation) {
 	case permission.Denied:
-		c.Status, c.Detail = checkFail, app.String()+" may not control Spotify"
+		c.Status, c.Detail = checkFail, app.String()+" may not "+permissionVerb(permission.Automation)
 		return c, true
 	case permission.Undecided:
 		c.Status = checkWarn
-		c.Detail = "macOS has not been asked yet whether " + app.String() + " may control Spotify"
+		c.Detail = "macOS has not been asked yet whether " + app.String() + " may " + permissionVerb(permission.Automation)
 		c.Fix = "run 'mixtape setup': it shows the prompt"
 		return c, true
 	case permission.Granted, permission.Unknown:
@@ -206,10 +197,10 @@ func (a *app) automationState() (check, bool) {
 func (a *app) permissionCheck(k permission.Kind) check {
 	app := a.deps.services.hostApp()
 	c := check{ID: string(k), Name: "Audio recording", Status: checkOK}
-	what := "record system audio (process tap)"
 	if k == permission.Microphone {
-		c.Name, what = "Microphone access", "open the capture device"
+		c.Name = "Microphone access"
 	}
+	what := permissionVerb(k)
 	switch a.deps.services.permission(k) {
 	case permission.Granted:
 		c.Detail = app.String() + " may " + what
@@ -233,7 +224,7 @@ func (a *app) permissionCheck(k permission.Kind) check {
 }
 
 func automationCheck(snap spotify.Snapshot) check {
-	c := check{ID: "automation", Name: "Automation permission", Status: checkOK, Detail: "mixtape can control Spotify"}
+	c := check{ID: checkIDAutomation, Name: "Automation permission", Status: checkOK, Detail: "mixtape can control Spotify"}
 	switch {
 	case snap.Err == nil:
 	case errors.Is(snap.Err, spotify.ErrNotAuthorized):
@@ -251,7 +242,7 @@ func automationCheck(snap spotify.Snapshot) check {
 }
 
 func (a *app) checkCrossfade() check {
-	c := check{ID: "crossfade", Name: "Crossfade off", Status: checkOK, Detail: "off"}
+	c := check{ID: checkIDCrossfade, Name: "Crossfade off", Status: checkOK, Detail: "off"}
 	prefs, err := a.deps.services.prefs(a.deps.userHome)
 	switch {
 	case err != nil:
@@ -262,19 +253,16 @@ func (a *app) checkCrossfade() check {
 		c.Status = checkWarn
 		c.Detail = "this Spotify version keeps crossfade where mixtape cannot read it; make sure it is off " +
 			"(recording stops if songs keep ending early)"
-		c.Fix = "Spotify → Settings → Playback → \"Crossfade songs\" off"
-	case prefs.Crossfade:
-		c.Status, c.Detail = checkFail, fmt.Sprintf("crossfade is on (%.1fs): songs overlap and cannot be cut", prefs.CrossfadeSeconds)
-		c.Fix = "Spotify → Settings → Playback → turn off \"Crossfade songs\""
-	case prefs.Automix:
-		c.Status, c.Detail = checkFail, "automix is on: songs blend into each other"
-		c.Fix = "Spotify → Settings → Playback → turn off \"Automix\""
+		c.Fix = fixCrossfade
+	case blending(prefs) != "":
+		c.Status, c.Detail = checkFail, blending(prefs)+": songs blend into each other and cannot be cut"
+		c.Fix = blendingFix(prefs)
 	}
 	return c
 }
 
 func volumeCheck(snap spotify.Snapshot) check {
-	c := check{ID: "volume", Name: "Spotify volume", Status: checkSkip, Detail: "checked once Spotify is reachable"}
+	c := check{ID: checkIDVolume, Name: "Spotify volume", Status: checkSkip, Detail: "checked once Spotify is reachable"}
 	if snap.Err != nil {
 		return c
 	}
@@ -282,7 +270,7 @@ func volumeCheck(snap spotify.Snapshot) check {
 	if snap.Volume < 100 {
 		c.Status = checkWarn
 		c.Detail = fmt.Sprintf("%d%%: recordings are made at Spotify's volume", snap.Volume)
-		c.Fix = "set Spotify's volume slider to the maximum (the Mac's own volume does not matter)"
+		c.Fix = fixVolume
 	}
 	return c
 }
@@ -293,15 +281,14 @@ func (a *app) checkCapture(s config.Settings) (capture.Method, []check) {
 	svc := a.deps.services
 	var checks []check
 	tapSt := svc.tapStatus()
-	tapCheck := check{ID: "tap", Name: "Process tap", Status: checkOK, Detail: "available (records Spotify only, nothing to install)"}
+	tapCheck := check{ID: checkIDTap, Name: "Process tap", Status: checkOK, Detail: "available (records Spotify only, nothing to install)"}
 	if !tapSt.Supported {
 		tapCheck.Status, tapCheck.Detail = checkWarn, "unavailable: "+tapSt.Reason
 	}
 
-	requested, _ := capture.ParseMethod(s.Capture)
-	method, err := capture.Select(requested, tapSt)
+	method, err := capture.Select(s.Capture, tapSt)
 	methodCheck := check{
-		ID: "capture", Name: "Capture method", Status: checkOK,
+		ID: checkIDCapture, Name: "Capture method", Status: checkOK,
 		Detail: fmt.Sprintf("%s (setting: %s)", method, s.Capture),
 	}
 	if err != nil {
@@ -310,23 +297,23 @@ func (a *app) checkCapture(s config.Settings) (capture.Method, []check) {
 	}
 	checks = append(checks, methodCheck, tapCheck)
 	if method == capture.MethodTap {
-		return method, append(checks, a.permissionCheck(permission.SystemAudio))
+		return method, append(checks, a.permissionCheck(capturePermission(method)))
 	}
 
 	devs, derr := svc.devices()
-	dev := check{ID: "device", Name: "Capture device", Status: checkOK}
+	dev := check{ID: checkIDDevice, Name: "Capture device", Status: checkOK}
 	found := findDevice(devs, s.Device)
 	switch {
 	case derr != nil:
 		dev.Status, dev.Detail = checkFail, derr.Error()
 	case found == nil:
 		dev.Status, dev.Detail = checkFail, fmt.Sprintf("no capture device matching %q", s.Device)
-		dev.Fix = "brew install blackhole-2ch, then 'mixtape setup'"
+		dev.Fix = fixInstallDevice
 	default:
 		dev.Detail = found.Name
 	}
 	checks = append(checks, dev)
-	route := check{ID: "routing", Name: "Output routing", Status: checkOK}
+	route := check{ID: checkIDRouting, Name: "Output routing", Status: checkOK}
 	out, oerr := svc.defaultOutput()
 	switch {
 	case oerr != nil:
@@ -336,10 +323,10 @@ func (a *app) checkCapture(s config.Settings) (capture.Method, []check) {
 		route.Detail = "system output is " + out.Name
 	default:
 		route.Status, route.Detail = checkFail, "system output is "+out.Name+", so the capture device hears nothing"
-		route.Fix = "create a Multi-Output Device (speakers + BlackHole) in Audio MIDI Setup and select it as the output"
+		route.Fix = fixRouting
 	}
 	if method == capture.MethodDevice {
-		checks = append(checks, a.permissionCheck(permission.Microphone))
+		checks = append(checks, a.permissionCheck(capturePermission(method)))
 	}
 	return method, append(checks, route)
 }
@@ -356,7 +343,7 @@ func findDevice(devs []device.Info, match string) *device.Info {
 // checkLibrary checks that the library folder is writable without
 // creating it: a missing folder is fine when its parent is writable.
 func checkLibrary(root string) check {
-	c := check{ID: "library", Name: "Library folder", Status: checkOK, Detail: root}
+	c := check{ID: checkIDLibrary, Name: "Library folder", Status: checkOK, Detail: root}
 	dir := root
 	for {
 		if info, err := os.Stat(dir); err == nil {
@@ -386,7 +373,7 @@ func checkLibrary(root string) check {
 }
 
 func (a *app) checkSession() check {
-	c := check{ID: "session", Name: "Recording session", Status: checkOK, Detail: "none running"}
+	c := check{ID: checkIDSession, Name: "Recording session", Status: checkOK, Detail: "none running"}
 	st, running, err := a.current()
 	switch {
 	case err != nil && !errors.Is(err, session.ErrNoSession):

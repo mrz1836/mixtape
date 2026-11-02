@@ -41,9 +41,6 @@ const (
 	Unknown   State = "unknown"   // the state could not be read
 )
 
-// SpotifyBundleID is the Automation target.
-const SpotifyBundleID = "com.spotify.client"
-
 // ErrNotGranted reports a permission the host app does not have.
 var ErrNotGranted = errors.New("macOS permission not granted")
 

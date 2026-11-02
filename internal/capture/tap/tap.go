@@ -30,17 +30,13 @@ import (
 	"unsafe"
 
 	"github.com/mrz1836/mixtape/internal/capture"
+	"github.com/mrz1836/mixtape/internal/spotify"
 )
 
 const (
-	// DefaultBundlePrefix matches Spotify's app and its helper processes.
-	DefaultBundlePrefix = "com.spotify.client"
-
 	ringSeconds    = 4.0
-	drainInterval  = 10 * time.Millisecond
 	waitInterval   = 250 * time.Millisecond
 	retryInterval  = time.Second
-	eventBuffer    = 16
 	maxProcesses   = 64
 	maxBundleBytes = 512
 	channels       = 2
@@ -51,10 +47,6 @@ var (
 	ErrNoProcess = errors.New("spotify has no audio process to tap (is it running?)")
 	// ErrCreateTap reports a Core Audio failure while building the tap.
 	ErrCreateTap = errors.New("could not create the process tap")
-	// ErrStarted reports a second Start on the same Source.
-	ErrStarted = errors.New("capture already started")
-	// ErrClosed reports use of a closed Source.
-	ErrClosed = errors.New("capture source closed")
 )
 
 // Available reports whether this Mac can run process taps.
@@ -80,12 +72,16 @@ type Process struct {
 }
 
 // SpotifyProcesses lists the audio process objects of Spotify.
-func SpotifyProcesses() ([]Process, error) { return processes(DefaultBundlePrefix) }
-
-func processes(prefix string) ([]Process, error) {
+func SpotifyProcesses() ([]Process, error) {
 	if !Available().Supported {
 		return nil, capture.ErrTapUnsupported
 	}
+	return processes(spotify.BundleID)
+}
+
+// processes lists the audio process objects whose bundle ID starts with
+// prefix. The caller has checked that taps are available.
+func processes(prefix string) ([]Process, error) {
 	cprefix := C.CString(prefix)
 	defer C.free(unsafe.Pointer(cprefix))
 	var (
@@ -110,7 +106,8 @@ func processes(prefix string) ([]Process, error) {
 type Options struct {
 	// Mute silences Spotify on the speakers while it is being recorded.
 	Mute bool
-	// BundlePrefix selects the processes to tap; empty means Spotify.
+	// BundlePrefix selects the processes to tap; empty means Spotify
+	// (spotify.BundleID, which its helper processes extend).
 	BundlePrefix string
 	// Wait is how long Open waits for the processes to appear.
 	Wait time.Duration
@@ -120,61 +117,72 @@ type Options struct {
 type Source struct {
 	opts Options
 
-	mu      sync.Mutex
-	tap     unsafe.Pointer // retained MTTap, owned by the drain once started
-	procs   []uint32
-	format  capture.Format
-	started bool
-	closed  bool
-	cancel  context.CancelFunc
-	done    chan struct{}
+	life   capture.Lifecycle
+	events *capture.Emitter
 
-	events   chan capture.Event
-	evMu     sync.Mutex
-	evClosed bool
+	mu     sync.Mutex
+	tap    unsafe.Pointer // retained MTTap, owned by the drain once started
+	procs  []uint32
+	format capture.Format
 }
 
 var _ capture.Source = (*Source)(nil)
 
 // Open builds the tap on Spotify's audio processes, waiting up to o.Wait
-// for them to appear. Audio flows to the sink once Start is called.
-func Open(o Options) (*Source, error) {
+// for them to appear (or ctx to end). Audio flows to the sink once Start
+// is called.
+func Open(ctx context.Context, o Options) (*Source, error) {
 	if st := Available(); !st.Supported {
 		return nil, fmt.Errorf("%w: %s", capture.ErrTapUnsupported, st.Reason)
 	}
 	if o.BundlePrefix == "" {
-		o.BundlePrefix = DefaultBundlePrefix
+		o.BundlePrefix = spotify.BundleID
 	}
-	procs, err := waitForProcesses(o.BundlePrefix, o.Wait)
+	procs, err := waitForProcesses(ctx, o.BundlePrefix, o.Wait)
 	if err != nil {
 		return nil, err
 	}
-	s := &Source{opts: o, events: make(chan capture.Event, eventBuffer)}
+	s := &Source{opts: o, events: capture.NewEmitter()}
 	if err := s.build(procs); err != nil {
 		return nil, err
 	}
 	return s, nil
 }
 
-func waitForProcesses(prefix string, wait time.Duration) ([]uint32, error) {
+// processIDs lists the sorted object IDs of the processes to tap; none is
+// ErrNoProcess.
+func processIDs(prefix string) ([]uint32, error) {
+	procs, err := processes(prefix)
+	if err != nil {
+		return nil, err
+	}
+	if len(procs) == 0 {
+		return nil, ErrNoProcess
+	}
+	ids := make([]uint32, 0, len(procs))
+	for _, p := range procs {
+		ids = append(ids, p.ObjectID)
+	}
+	slices.Sort(ids)
+	return ids, nil
+}
+
+// waitForProcesses lists the processes to tap, asking again every
+// waitInterval for up to wait while there are none.
+func waitForProcesses(ctx context.Context, prefix string, wait time.Duration) ([]uint32, error) {
 	deadline := time.Now().Add(wait)
 	for {
-		procs, err := processes(prefix)
-		if err != nil {
-			return nil, err
+		ids, err := processIDs(prefix)
+		if !errors.Is(err, ErrNoProcess) || !time.Now().Before(deadline) {
+			return ids, err
 		}
-		if len(procs) > 0 {
-			ids := make([]uint32, 0, len(procs))
-			for _, p := range procs {
-				ids = append(ids, p.ObjectID)
-			}
-			slices.Sort(ids)
-			return ids, nil
+		t := time.NewTimer(waitInterval)
+		select {
+		case <-ctx.Done():
+			t.Stop()
+			return nil, ctx.Err()
+		case <-t.C:
 		}
-		if !time.Now().Before(deadline) {
-			return nil, ErrNoProcess
-		}
-		time.Sleep(waitInterval)
 	}
 }
 
@@ -229,32 +237,19 @@ func (s *Source) Format() capture.Format {
 }
 
 // Events reports rebuilds, format changes and overflows.
-func (s *Source) Events() <-chan capture.Event { return s.events }
+func (s *Source) Events() <-chan capture.Event { return s.events.Events() }
 
 // Start delivers blocks to sink from a drain goroutine.
 func (s *Source) Start(ctx context.Context, sink func(capture.Block)) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	switch {
-	case s.closed:
-		return ErrClosed
-	case s.started:
-		return ErrStarted
-	}
-	s.started = true
-	dctx, cancel := context.WithCancel(ctx)
-	s.cancel, s.done = cancel, make(chan struct{})
-	go s.drain(dctx, sink)
-	return nil
+	return s.life.Start(ctx, nil, func(dctx context.Context) { s.drain(dctx, sink) })
 }
 
 // drain runs until ctx ends: it reads the ring, stamps blocks, answers
 // Core Audio's change notifications by rebuilding the tap, and reports
 // overflows.
 func (s *Source) drain(ctx context.Context, sink func(capture.Block)) {
-	defer close(s.done)
 	clock := sampleClock()
-	tick := time.NewTicker(drainInterval)
+	tick := time.NewTicker(capture.DrainInterval)
 	defer tick.Stop()
 	var buf []byte
 	var nextRetry time.Time
@@ -305,7 +300,7 @@ func (s *Source) read(t unsafe.Pointer, f capture.Format, clock clockPair, buf [
 		sink(capture.Block{PCM: buf[:int(n)*f.BytesPerFrame()], Frames: int(n), At: at})
 	}
 	if n := uint64(C.mt_ring_take_overflows(ring)); n > 0 {
-		s.emit(capture.EventOverflow, fmt.Sprintf("%d tap IO cycles dropped: the reader fell behind", n))
+		s.events.Emit(capture.EventOverflow, fmt.Sprintf("%d tap IO cycles dropped: the reader fell behind", n))
 	}
 	return buf
 }
@@ -319,7 +314,7 @@ func (s *Source) handleEvents(t unsafe.Pointer) {
 	case bits&C.MT_EVENT_RATE != 0:
 		s.rebuild(capture.EventFormatChanged, "the output sample rate changed")
 	case bits&C.MT_EVENT_PROCESSES != 0:
-		procs, err := waitForProcesses(s.opts.BundlePrefix, 0)
+		procs, err := processIDs(s.opts.BundlePrefix)
 		s.mu.Lock()
 		same := err == nil && slices.Equal(procs, s.procs)
 		s.mu.Unlock()
@@ -340,13 +335,13 @@ func (s *Source) rebuild(kind capture.EventKind, detail string) {
 	if old != nil {
 		C.mt_tap_close(old)
 	}
-	procs, err := waitForProcesses(s.opts.BundlePrefix, 0)
+	procs, err := processIDs(s.opts.BundlePrefix)
 	if err == nil {
 		err = s.build(procs)
 	}
 	if err != nil {
 		if old != nil {
-			s.emit(kind, detail+"; capture paused: "+err.Error())
+			s.events.Emit(kind, detail+"; capture paused: "+err.Error())
 		}
 		return
 	}
@@ -360,36 +355,13 @@ func (s *Source) rebuild(kind capture.EventKind, detail string) {
 	case kind == capture.EventFormatChanged:
 		kind = capture.EventDeviceChanged
 	}
-	s.emit(kind, detail)
-}
-
-// emit sends an event without blocking; it is a no-op after Close.
-func (s *Source) emit(kind capture.EventKind, detail string) {
-	s.evMu.Lock()
-	defer s.evMu.Unlock()
-	if s.evClosed {
-		return
-	}
-	select {
-	case s.events <- capture.Event{Kind: kind, Detail: detail, At: time.Now()}:
-	default:
-	}
+	s.events.Emit(kind, detail)
 }
 
 // Close stops capture and destroys the tap. It is idempotent.
 func (s *Source) Close() error {
-	s.mu.Lock()
-	if s.closed {
-		s.mu.Unlock()
+	if !s.life.Close(nil) {
 		return nil
-	}
-	s.closed = true
-	cancel, done := s.cancel, s.done
-	s.mu.Unlock()
-
-	if cancel != nil {
-		cancel()
-		<-done
 	}
 	s.mu.Lock()
 	if s.tap != nil {
@@ -397,11 +369,7 @@ func (s *Source) Close() error {
 		s.tap = nil
 	}
 	s.mu.Unlock()
-
-	s.evMu.Lock()
-	s.evClosed = true
-	close(s.events)
-	s.evMu.Unlock()
+	s.events.Close()
 	return nil
 }
 

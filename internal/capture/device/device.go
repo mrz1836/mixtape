@@ -17,7 +17,6 @@ import (
 	"fmt"
 	"math"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -33,19 +32,11 @@ const (
 	ringSeconds = 4
 	// ringStamps is the number of callback timestamps buffered.
 	ringStamps = 4096
-	// drainInterval is how often the drain goroutine empties the ring.
-	drainInterval = 10 * time.Millisecond
-	// eventBuffer is the capacity of the Events channel.
-	eventBuffer = 16
 )
 
 var (
 	// ErrNoDevice reports that no capture device matched the requested name.
 	ErrNoDevice = errors.New("no capture device matching")
-	// ErrStarted reports a second Start on the same Source.
-	ErrStarted = errors.New("capture already started")
-	// ErrClosed reports use of a closed Source.
-	ErrClosed = errors.New("capture source closed")
 	// errNoDefault reports that Core Audio has no default output device.
 	errNoDefault = errors.New("no default output device")
 	// errFormat reports a device whose negotiated format is unusable.
@@ -133,16 +124,9 @@ type Source struct {
 	dev  *malgo.Device
 	ring *ring
 
-	mu      sync.Mutex
-	started bool
-	closed  bool
-	cancel  context.CancelFunc
-	done    chan struct{}
-
-	events   chan capture.Event
-	evMu     sync.Mutex
-	evClosed bool
-	closing  atomic.Bool
+	life    capture.Lifecycle
+	events  *capture.Emitter
+	closing atomic.Bool // set before the device is stopped on purpose
 }
 
 var _ capture.Source = (*Source)(nil)
@@ -188,7 +172,7 @@ func open(mctx *malgo.AllocatedContext, match string) (*Source, error) {
 		return nil, fmt.Errorf("%w %q (available capture devices: %s)", ErrNoDevice, match, available)
 	}
 
-	s := &Source{name: found.Name(), mctx: mctx, events: make(chan capture.Event, eventBuffer)}
+	s := &Source{name: found.Name(), mctx: mctx, events: capture.NewEmitter()}
 
 	cfg := malgo.DefaultDeviceConfig(malgo.Capture)
 	cfg.SampleRate = 0 // the device's native rate: no resampling
@@ -225,26 +209,17 @@ func (s *Source) Method() capture.Method { return capture.MethodDevice }
 func (s *Source) Format() capture.Format { return s.format }
 
 // Events reports overflows and an unexpected stop.
-func (s *Source) Events() <-chan capture.Event { return s.events }
+func (s *Source) Events() <-chan capture.Event { return s.events.Events() }
 
 // Start begins capture and delivers blocks to sink from a drain goroutine.
 func (s *Source) Start(ctx context.Context, sink func(capture.Block)) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	switch {
-	case s.closed:
-		return ErrClosed
-	case s.started:
-		return ErrStarted
+	begin := func() error {
+		if err := s.dev.Start(); err != nil {
+			return fmt.Errorf("start capture on %q: %w", s.name, err)
+		}
+		return nil
 	}
-	if err := s.dev.Start(); err != nil {
-		return fmt.Errorf("start capture on %q: %w", s.name, err)
-	}
-	s.started = true
-	dctx, cancel := context.WithCancel(ctx)
-	s.cancel, s.done = cancel, make(chan struct{})
-	go s.drain(dctx, sink)
-	return nil
+	return s.life.Start(ctx, begin, func(dctx context.Context) { s.drain(dctx, sink) })
 }
 
 // onData runs on the real-time audio thread: it only copies into the ring.
@@ -256,16 +231,15 @@ func (s *Source) onData(_, input []byte, frames uint32) {
 // onStop runs when the device stops on its own (unplugged, reconfigured).
 func (s *Source) onStop() {
 	if !s.closing.Load() {
-		s.emit(capture.EventStopped, "the capture device stopped")
+		s.events.Emit(capture.EventStopped, "the capture device stopped")
 	}
 }
 
 // drain empties the ring every drainInterval and hands blocks to sink.
 func (s *Source) drain(ctx context.Context, sink func(capture.Block)) {
-	defer close(s.done)
 	bpf := s.format.BytesPerFrame()
 	buf := make([]byte, len(s.ring.buf))
-	tick := time.NewTicker(drainInterval)
+	tick := time.NewTicker(capture.DrainInterval)
 	defer tick.Stop()
 	for {
 		for {
@@ -280,7 +254,7 @@ func (s *Source) drain(ctx context.Context, sink func(capture.Block)) {
 			sink(capture.Block{PCM: buf[:n], Frames: n / bpf, At: at})
 		}
 		if dropped := s.ring.takeOverflows(); dropped > 0 {
-			s.emit(capture.EventOverflow, fmt.Sprintf("%d audio callbacks dropped: the reader fell behind", dropped))
+			s.events.Emit(capture.EventOverflow, fmt.Sprintf("%d audio callbacks dropped: the reader fell behind", dropped))
 		}
 		select {
 		case <-ctx.Done():
@@ -290,40 +264,18 @@ func (s *Source) drain(ctx context.Context, sink func(capture.Block)) {
 	}
 }
 
-// emit sends an event without blocking; it is a no-op after Close.
-func (s *Source) emit(kind capture.EventKind, detail string) {
-	s.evMu.Lock()
-	defer s.evMu.Unlock()
-	if s.evClosed {
-		return
-	}
-	select {
-	case s.events <- capture.Event{Kind: kind, Detail: detail, At: time.Now()}:
-	default:
-	}
-}
-
 // Close stops capture and frees the device and the audio context. It is
 // idempotent.
 func (s *Source) Close() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.closed {
-		return nil
+	halt := func() {
+		s.closing.Store(true)
+		s.dev.Uninit() // stops the device; no callback runs after it returns
 	}
-	s.closed = true
-	s.closing.Store(true)
-	s.dev.Uninit() // stops the device; no callback runs after it returns
-	if s.cancel != nil {
-		s.cancel()
-		<-s.done
+	if !s.life.Close(halt) {
+		return nil
 	}
 	err := s.mctx.Uninit()
 	s.mctx.Free()
-
-	s.evMu.Lock()
-	s.evClosed = true
-	close(s.events)
-	s.evMu.Unlock()
+	s.events.Close()
 	return err
 }

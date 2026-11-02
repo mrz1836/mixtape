@@ -134,6 +134,7 @@ type app struct {
 	flags globalFlags
 	out   *Output
 	home  string
+	cat   catalog // made on first use (see app.catalog)
 }
 
 // run builds the tree, executes args, reports any error, and returns the
@@ -306,16 +307,32 @@ func (a *app) noColorEnv() bool {
 // carrying the command's own flag overrides (the global --library is
 // applied here). Config warnings are printed once.
 func (a *app) settings(o config.Overrides) (config.Settings, error) {
-	file, warnings, err := config.Load(config.Path(a.home))
-	if err != nil {
-		return config.Settings{}, err
-	}
+	s, warnings, err := a.loadSettings(o)
 	for _, w := range warnings {
 		a.out.Warn("%s", w)
 	}
+	if err != nil {
+		return config.Settings{}, err
+	}
+	return s, nil
+}
+
+// loadSettings is settings without printing: it returns the config file's
+// warnings. When the file cannot be read, the error is that failure, and
+// the settings still resolve the environment and the flags over the
+// defaults (empty when those fail too), so a check can go on with them.
+func (a *app) loadSettings(o config.Overrides) (config.Settings, []string, error) {
 	if a.flags.librarySet {
 		lib := a.flags.library
 		o.Library = &lib
 	}
-	return config.Resolve(file, a.deps.getenv, o, a.deps.userHome)
+	file, warnings, loadErr := config.Load(config.Path(a.home))
+	s, err := config.Resolve(file, a.deps.getenv, o, a.deps.userHome)
+	if loadErr != nil {
+		if err != nil {
+			s = config.Settings{}
+		}
+		return s, warnings, loadErr
+	}
+	return s, warnings, err
 }

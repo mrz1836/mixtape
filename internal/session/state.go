@@ -106,14 +106,13 @@ func LogPath(home, id string) string { return filepath.Join(SessionsDir(home), i
 // WriteState atomically replaces session.json.
 func WriteState(home string, s State) error {
 	s.Schema = StateSchema
-	data, err := json.MarshalIndent(s, "", "  ")
-	if err != nil {
-		return err
-	}
 	if err := os.MkdirAll(home, 0o700); err != nil {
-		return err
+		return fmt.Errorf("write session state: %w", err)
 	}
-	return fileutil.WriteAtomic(StatePath(home), append(data, '\n'), 0o600)
+	if err := fileutil.WriteJSON(StatePath(home), s, 0o600); err != nil {
+		return fmt.Errorf("write session state: %w", err)
+	}
+	return nil
 }
 
 // ReadState reads session.json; a missing file is ErrNoSession.
@@ -123,7 +122,7 @@ func ReadState(home string) (State, error) {
 		return State{}, ErrNoSession
 	}
 	if err != nil {
-		return State{}, err
+		return State{}, fmt.Errorf("read session state: %w", err)
 	}
 	var s State
 	if err := json.Unmarshal(data, &s); err != nil {

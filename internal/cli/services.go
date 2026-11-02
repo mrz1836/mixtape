@@ -21,9 +21,11 @@ import (
 )
 
 // player is the Spotify control surface commands use: the engine's needs
-// plus restoring settings after a crash.
+// (which include what restoring settings after a crash takes), plus
+// resuming playback for setup's test capture.
 type player interface {
 	engine.Player
+	Play(ctx context.Context) error
 }
 
 // catalog resolves links to their track lists.
@@ -45,7 +47,7 @@ type captureRequest struct {
 type services struct {
 	player         func() player
 	catalog        func() catalog
-	openCapture    func(captureRequest) (capture.Source, error)
+	openCapture    func(context.Context, captureRequest) (capture.Source, error)
 	tapStatus      func() capture.TapStatus
 	devices        func() ([]device.Info, error)
 	defaultOutput  func() (device.Info, error)
@@ -119,10 +121,10 @@ func newProcessServices() services {
 }
 
 // openCapture opens the real backend for a selected method.
-func openCapture(r captureRequest) (capture.Source, error) {
+func openCapture(ctx context.Context, r captureRequest) (capture.Source, error) {
 	switch r.Method {
 	case capture.MethodTap:
-		return tap.Open(tap.Options{Mute: r.Mute, Wait: 10 * time.Second})
+		return tap.Open(ctx, tap.Options{Mute: r.Mute, Wait: 10 * time.Second})
 	case capture.MethodDevice:
 		return device.Open(r.Device)
 	case capture.MethodAuto:

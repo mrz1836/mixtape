@@ -479,7 +479,7 @@ func TestSetupInteractiveVerifiesAndSavesTheTap(t *testing.T) {
 	h := newHarness(t)
 	h.interactive()
 	h.deps.stdin = strings.NewReader("y\n\n~/Tapes\n")
-	h.deps.services.openCapture = func(r captureRequest) (capture.Source, error) {
+	h.deps.services.openCapture = func(_ context.Context, r captureRequest) (capture.Source, error) {
 		assert.Equal(t, capture.MethodTap, r.Method)
 		return &loudSource{}, nil
 	}
@@ -502,7 +502,7 @@ func TestSetupFallsBackToBlackHoleWhenTheTapIsSilent(t *testing.T) {
 	h.interactive()
 	h.world.output = device.Info{Name: "Multi-Output Device", Output: true, DefaultOutput: true}
 	h.world.player.snap.State = spotify.StatePlaying // Spotify plays; the tap still hears nothing
-	h.deps.services.openCapture = func(r captureRequest) (capture.Source, error) {
+	h.deps.services.openCapture = func(_ context.Context, r captureRequest) (capture.Source, error) {
 		if r.Method == capture.MethodTap {
 			return &nopSource{}, nil // a tap without permission hears nothing
 		}

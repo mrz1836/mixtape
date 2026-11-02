@@ -3,6 +3,7 @@ package cli
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"path/filepath"
 	"strings"
@@ -84,7 +85,7 @@ func (h *harness) interactive() {
 
 // loudCapture makes every capture source deliver audible audio.
 func (h *harness) loudCapture() {
-	h.deps.services.openCapture = func(captureRequest) (capture.Source, error) { return &loudSource{}, nil }
+	h.deps.services.openCapture = func(context.Context, captureRequest) (capture.Source, error) { return &loudSource{}, nil }
 }
 
 // json decodes stdout as one JSON document.

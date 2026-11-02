@@ -9,6 +9,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/mrz1836/mixtape/internal/capture"
 	"github.com/mrz1836/mixtape/internal/testutil"
 )
 
@@ -24,7 +25,7 @@ func TestResolveDefaults(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.Equal(t, "/Users/test/Music/Mixtape", s.Library)
-	assert.Equal(t, CaptureAuto, s.Capture)
+	assert.Equal(t, capture.MethodAuto, s.Capture)
 	assert.Equal(t, DefaultDevice, s.Device)
 	assert.False(t, s.Artwork)
 	assert.Equal(t, 10*time.Minute, s.IdleTimeout)
@@ -49,7 +50,7 @@ func TestResolvePrecedence(t *testing.T) {
 
 	assert.Equal(t, "/Volumes/Ext/Music", s.Library)
 	assert.Equal(t, SourceFlag, s.Sources[KeyLibrary])
-	assert.Equal(t, CaptureTap, s.Capture, "env beats file, and values are case-folded")
+	assert.Equal(t, capture.MethodTap, s.Capture, "env beats file, and values are case-folded")
 	assert.Equal(t, SourceEnv, s.Sources[KeyCapture])
 	assert.Equal(t, "Loopback", s.Device)
 	assert.True(t, s.Artwork)
@@ -195,7 +196,7 @@ func TestSettingsValue(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "false", s.Value(KeyArtwork))
 	assert.Equal(t, "10m0s", s.Value(KeyIdleTimeout))
-	assert.Equal(t, CaptureAuto, s.Value(KeyCapture))
+	assert.Equal(t, "auto", s.Value(KeyCapture))
 	assert.Empty(t, s.Value("nope"))
 }
 
@@ -213,4 +214,43 @@ func TestPaths(t *testing.T) {
 	t.Parallel()
 	assert.Equal(t, "/Users/test/.mixtape", DefaultHome(testHome))
 	assert.Equal(t, "/h/config.json", Path("/h"))
+}
+
+func TestLoadIgnoresKeysThatDifferInCase(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "config.json")
+	require.NoError(t, os.WriteFile(path, []byte(`{"LIBRARY": "/elsewhere", "Device": "Loopback"}`), 0o600))
+	f, warnings, err := Load(path)
+	require.NoError(t, err)
+	assert.Equal(t, File{}, f, "a key the warning calls ignored is ignored")
+	assert.Len(t, warnings, 2)
+}
+
+func TestLoadNamesTheKeyOfAWrongType(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "config.json")
+	require.NoError(t, os.WriteFile(path, []byte(`{"artwork": "yes"}`), 0o600))
+	_, _, err := Load(path)
+	require.ErrorIs(t, err, ErrDecode)
+	assert.Contains(t, err.Error(), "artwork")
+}
+
+func TestEverySettingIsDescribedOnce(t *testing.T) {
+	t.Parallel()
+	names := map[string]bool{}
+	envs := map[string]bool{}
+	for _, st := range table() {
+		assert.False(t, names[st.Name], st.Name)
+		assert.False(t, envs[st.Env], st.Env)
+		names[st.Name], envs[st.Env] = true, true
+		assert.NotEmpty(t, st.Help, st.Name)
+		var defaults Settings
+		require.NoError(t, st.apply(&defaults, st.Default, testHome), "the documented default of %s parses", st.Name)
+		var f File
+		var o Overrides
+		_, inFile := fieldText(st.inFile(&f))
+		_, inFlag := fieldText(st.inFlag(&o))
+		assert.False(t, inFile || inFlag, "a zero File and Overrides set nothing")
+	}
+	assert.Len(t, Keys(), len(names))
 }

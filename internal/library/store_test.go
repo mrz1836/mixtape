@@ -3,6 +3,7 @@ package library
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -96,3 +97,35 @@ func TestCommitWithAFConvert(t *testing.T) {
 	assert.Equal(t, 1, r.OK)
 	assert.Empty(t, r.Problems)
 }
+
+func TestRetryIntoAnUnwritableFolderKeepsTheRecording(t *testing.T) {
+	t.Parallel()
+	if os.Geteuid() == 0 {
+		t.Skip("root writes into read-only folders")
+	}
+	enc := &testutil.Encoder{}
+	enc.Fail(errEncoderDown)
+	f := newFixture(t, enc)
+	c := f.collection(playlistSpec())
+	e, err := f.lib.Commit(t.Context(), c, trackTime(), testutil.SineWAV(t, 440), CommitOptions{})
+	require.ErrorIs(t, err, ErrEncode)
+	kept := e.PendingWAV
+	require.FileExists(t, kept)
+
+	// The encoder works again, but the drive refuses the file.
+	enc.Fail(nil)
+	require.NoError(t, os.Chmod(c.Dir, 0o500))
+	t.Cleanup(func() { _ = os.Chmod(c.Dir, 0o700) })
+	_, err = f.lib.RetryEncode(t.Context(), c, idTime, CommitOptions{})
+	require.ErrorIs(t, err, ErrStore)
+	assert.FileExists(t, kept, "the only copy of the recording stays for the next retry")
+	assert.Equal(t, kept, c.Entry(idTime).PendingWAV)
+
+	require.NoError(t, os.Chmod(c.Dir, 0o700))
+	done, err := f.lib.RetryEncode(t.Context(), c, idTime, CommitOptions{})
+	require.NoError(t, err)
+	assert.Equal(t, StatusRecorded, done.Status)
+	assert.NoFileExists(t, kept, "a stored recording leaves nothing behind")
+}
+
+var errEncoderDown = errors.New("encoder unavailable")

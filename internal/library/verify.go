@@ -5,11 +5,13 @@ import (
 	"context"
 	"fmt"
 	"io/fs"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
 
+	"github.com/mrz1836/mixtape/internal/fileutil"
 	"github.com/mrz1836/mixtape/internal/mp4tag"
 )
 
@@ -69,120 +71,205 @@ func (l *Library) Verify(ctx context.Context, fix, force bool) (Report, error) {
 		}
 		return r, nil
 	}
-
 	files, err := l.scanAudio(ctx)
 	if err != nil {
 		return r, err
 	}
-	referenced := map[string]bool{}
+
+	v := l.index(files)
 	for _, c := range l.cols {
-		for i := range c.Manifest.Tracks {
-			if p := c.Path(&c.Manifest.Tracks[i]); p != "" {
-				referenced[p] = true
-			}
-		}
+		v.checkCollection(c)
 	}
-	unreferencedByHash := map[string][]string{}
-	for path, f := range files {
-		if !referenced[path] && f.hash != "" {
-			unreferencedByHash[f.hash] = append(unreferencedByHash[f.hash], path)
-		}
-	}
-
-	type pending struct {
-		p     Problem
-		apply func()
-	}
-	var found []pending
-	claimed := map[string]bool{} // unreferenced files explained as moved
-	done, missing := 0, 0
-	for _, c := range l.cols {
-		for i := range c.Manifest.Tracks {
-			e := &c.Manifest.Tracks[i]
-			p := Problem{Collection: c.Folder(), File: e.File, TrackID: e.RequestedID}
-			if !e.Status.Done() {
-				// Changed audio stays pending (see the hash check below), as
-				// reconcile leaves it: a second --fix must not take it back.
-				if f, ok := files[c.Path(e)]; ok && f.readErr == nil && e.Status != StatusRemoved && taggedFor(f.tags, e) && f.intact() {
-					p.Kind, p.Detail = ProblemStatusMismatch, fmt.Sprintf("file exists but status is %s", e.Status)
-					hash := f.hash
-					found = append(found, pending{p, func() { e.Status, e.AudioSHA256, e.FailReason = StatusRecorded, hash, "" }})
-				}
-				continue
-			}
-			done++
-			r.Files++
-			f, ok := files[c.Path(e)]
-			if !ok {
-				if moved := unreferencedByHash[e.AudioSHA256]; e.AudioSHA256 != "" && len(moved) > 0 {
-					to := moved[0]
-					claimed[to] = true
-					p.Kind, p.Detail = ProblemMoved, "found at "+l.rel(to)
-					if filepath.Dir(to) == c.Dir {
-						name := filepath.Base(to)
-						found = append(found, pending{p, func() { e.File = name }})
-					} else {
-						p.Detail += " (outside its folder; move it back to fix)"
-						found = append(found, pending{p, nil})
-					}
-					continue
-				}
-				missing++ // a song found elsewhere proves the drive is mounted: only lost ones count
-				p.Kind, p.Detail = ProblemMissing, "file not found; the next run records it again"
-				found = append(found, pending{p, func() {
-					e.Status, e.File, e.AudioSHA256, e.Partial = StatusPending, "", "", false
-					e.FailReason = "file missing (verify)"
-				}})
-				continue
-			}
-			switch {
-			case f.readErr != nil:
-				p.Kind, p.Detail = ProblemUnreadable, f.readErr.Error()
-				found = append(found, pending{p, func() { e.Status, e.FailReason = StatusPending, "unreadable file (verify)" }})
-			case !taggedFor(f.tags, e):
-				p.Kind = ProblemTagMismatch
-				p.Detail = fmt.Sprintf("file is tagged %s=%q", TagSpotifyID, f.tags.Freeform[TagSpotifyID])
-				found = append(found, pending{p, nil})
-			case f.hash != e.AudioSHA256:
-				p.Kind = ProblemHashMismatch
-				hash := f.hash
-				if e.AudioSHA256 == "" || f.tags.Freeform[TagAudioSHA256] == f.hash {
-					p.Detail = "manifest hash is stale"
-					found = append(found, pending{p, func() { e.AudioSHA256 = hash }})
-				} else {
-					p.Detail = "audio changed since it was recorded; the next run records it again"
-					found = append(found, pending{p, func() { e.Status, e.FailReason = StatusPending, "audio changed (verify)" }})
-				}
-			default:
-				r.OK++
-			}
-		}
-	}
-
-	for path := range files {
-		if referenced[path] || claimed[path] {
-			continue
-		}
-		for _, c := range l.cols {
-			if filepath.Dir(path) == c.Dir {
-				found = append(found, pending{Problem{
-					Collection: c.Folder(), File: filepath.Base(path), Kind: ProblemOrphan,
-					Detail: "no manifest entry mentions this file",
-				}, nil})
-			}
-		}
-	}
-
-	for _, f := range found {
+	v.findOrphans()
+	r.Files, r.OK = v.checked, v.ok
+	for _, f := range v.found {
 		r.Problems = append(r.Problems, f.p)
 	}
 	sortProblems(r.Problems)
 	if !fix {
 		return r, nil
 	}
-	if !force && done > 0 && missing*2 > done {
-		return r, fmt.Errorf("%w (%d of %d songs missing; pass --force if they are really gone)", ErrUnsafeFix, missing, done)
+	if err = v.safeToFix(force); err != nil {
+		return r, err
 	}
+	err = l.applyFixes(v.found, &r)
+	return r, err
+}
+
+// verifier is the state of one Verify pass over the scanned files.
+type verifier struct {
+	l     *Library
+	files map[string]audioFile // every .m4a under the root, by path
+	paths []string             // the keys of files, sorted
+	// referenced holds the paths manifest entries name; unreferenced
+	// lists the other files by audio hash, in path order.
+	referenced   map[string]bool
+	unreferenced map[string][]string
+	claimed      map[string]bool // unreferenced files explained as moved
+	found        []finding
+	// checked counts the done songs checked, ok the ones without a
+	// problem and missing the ones whose file is nowhere to be found.
+	checked, ok, missing int
+}
+
+// finding is a problem and the change that fixes it; apply is nil for a
+// problem that is only reported.
+type finding struct {
+	p     Problem
+	apply func()
+}
+
+// index sorts out the scanned files: which ones manifest entries name, and
+// the others by audio hash, so a song whose file is not where its entry
+// says can be found by its hash. Paths are taken in sorted order so that,
+// when several unreferenced files share a hash, every run picks the same
+// one.
+func (l *Library) index(files map[string]audioFile) *verifier {
+	v := &verifier{
+		l: l, files: files, paths: slices.Sorted(maps.Keys(files)),
+		referenced: map[string]bool{}, unreferenced: map[string][]string{}, claimed: map[string]bool{},
+	}
+	for _, c := range l.cols {
+		for i := range c.Manifest.Tracks {
+			if p := c.Path(&c.Manifest.Tracks[i]); p != "" {
+				v.referenced[p] = true
+			}
+		}
+	}
+	for _, path := range v.paths {
+		if f := files[path]; !v.referenced[path] && f.hash != "" {
+			v.unreferenced[f.hash] = append(v.unreferenced[f.hash], path)
+		}
+	}
+	return v
+}
+
+func (v *verifier) add(p Problem, apply func()) { v.found = append(v.found, finding{p, apply}) }
+
+// checkCollection checks every entry of c against the files.
+func (v *verifier) checkCollection(c *Collection) {
+	for i := range c.Manifest.Tracks {
+		e := &c.Manifest.Tracks[i]
+		p := Problem{Collection: c.Folder(), File: e.File, TrackID: e.RequestedID}
+		if e.Status.Done() {
+			v.checkDone(c, e, p)
+		} else {
+			v.checkNotDone(c, e, p)
+		}
+	}
+}
+
+// checkNotDone finds a song the manifest does not count as done although
+// its intact file is in place. Changed audio stays pending (see
+// hashMismatch), as reconcile leaves it: a second --fix must not take it
+// back.
+func (v *verifier) checkNotDone(c *Collection, e *Entry, p Problem) {
+	f, ok := v.files[c.Path(e)]
+	if !ok || f.readErr != nil || e.Status == StatusRemoved || !taggedFor(f.tags, e) || !f.intact() {
+		return
+	}
+	p.Kind, p.Detail = ProblemStatusMismatch, fmt.Sprintf("file exists but status is %s", e.Status)
+	hash := f.hash
+	v.add(p, func() { e.Status, e.AudioSHA256, e.FailReason = StatusRecorded, hash, "" })
+}
+
+// checkDone checks a done song's file: there, readable, tagged for it, and
+// holding the audio the manifest recorded.
+func (v *verifier) checkDone(c *Collection, e *Entry, p Problem) {
+	v.checked++
+	f, ok := v.files[c.Path(e)]
+	switch {
+	case !ok:
+		v.notInPlace(c, e, p)
+	case f.readErr != nil:
+		p.Kind, p.Detail = ProblemUnreadable, f.readErr.Error()
+		v.add(p, func() { e.Status, e.FailReason = StatusPending, "unreadable file (verify)" })
+	case !taggedFor(f.tags, e):
+		p.Kind = ProblemTagMismatch
+		p.Detail = fmt.Sprintf("file is tagged %s=%q", TagSpotifyID, f.tags.Freeform[TagSpotifyID])
+		v.add(p, nil)
+	case f.hash != e.AudioSHA256:
+		v.hashMismatch(e, f, p)
+	default:
+		v.ok++
+	}
+}
+
+// notInPlace handles a done song whose file is not where its entry says:
+// moved, when an unreferenced file holds its audio, or else missing. A
+// file found outside the song's own folder is only reported; moving it
+// back is left to the owner.
+func (v *verifier) notInPlace(c *Collection, e *Entry, p Problem) {
+	if moved := v.unreferenced[e.AudioSHA256]; e.AudioSHA256 != "" && len(moved) > 0 {
+		to := moved[0]
+		v.claimed[to] = true
+		p.Kind, p.Detail = ProblemMoved, "found at "+v.l.rel(to)
+		if filepath.Dir(to) != c.Dir {
+			p.Detail += " (outside its folder; move it back to fix)"
+			v.add(p, nil)
+			return
+		}
+		name := filepath.Base(to)
+		v.add(p, func() { e.File = name })
+		return
+	}
+	v.missing++ // a song found elsewhere proves the drive is mounted: only lost ones count
+	p.Kind, p.Detail = ProblemMissing, "file not found; the next run records it again"
+	v.add(p, func() {
+		e.Status, e.File, e.AudioSHA256, e.Partial = StatusPending, "", "", false
+		e.FailReason = "file missing (verify)"
+	})
+}
+
+// hashMismatch handles a file whose audio hash is not the manifest's.
+// When the manifest has no hash, or the file's own hash tag agrees with
+// its audio, the manifest is what is stale (a redo whose manifest write
+// was lost) and is refreshed. Otherwise the audio changed after it was
+// recorded, and the song goes back to pending.
+func (v *verifier) hashMismatch(e *Entry, f audioFile, p Problem) {
+	p.Kind = ProblemHashMismatch
+	hash := f.hash
+	if e.AudioSHA256 == "" || f.tags.Freeform[TagAudioSHA256] == f.hash {
+		p.Detail = "manifest hash is stale"
+		v.add(p, func() { e.AudioSHA256 = hash })
+		return
+	}
+	p.Detail = "audio changed since it was recorded; the next run records it again"
+	v.add(p, func() { e.Status, e.FailReason = StatusPending, "audio changed (verify)" })
+}
+
+// findOrphans reports the files in a collection folder that no entry names
+// and no song claimed as moved. Files outside every collection folder are
+// not the library's, and are not reported.
+func (v *verifier) findOrphans() {
+	for _, path := range v.paths {
+		if v.referenced[path] || v.claimed[path] {
+			continue
+		}
+		for _, c := range v.l.cols {
+			if filepath.Dir(path) == c.Dir {
+				v.add(Problem{
+					Collection: c.Folder(), File: filepath.Base(path), Kind: ProblemOrphan,
+					Detail: "no manifest entry mentions this file",
+				}, nil)
+			}
+		}
+	}
+}
+
+// safeToFix is the safety gate of --fix: unless forced, it refuses to send
+// more than half of the done songs back to pending, which looks like an
+// unmounted drive, not lost files.
+func (v *verifier) safeToFix(force bool) error {
+	if force || v.checked == 0 || v.missing*2 <= v.checked {
+		return nil
+	}
+	return fmt.Errorf("%w (%d of %d songs missing; pass --force if they are really gone)", ErrUnsafeFix, v.missing, v.checked)
+}
+
+// applyFixes applies every fix found, records it in r, and saves every
+// collection, which also regenerates its playlist.
+func (l *Library) applyFixes(found []finding, r *Report) error {
 	for _, f := range found {
 		if f.apply != nil {
 			f.apply()
@@ -192,10 +279,10 @@ func (l *Library) Verify(ctx context.Context, fix, force bool) (Report, error) {
 	sortProblems(r.Fixed)
 	for _, c := range l.cols {
 		if err := l.Save(c); err != nil {
-			return r, err
+			return err
 		}
 	}
-	return r, nil
+	return nil
 }
 
 // intact reports whether a readable file's audio matches its own hash tag
@@ -222,7 +309,7 @@ func (l *Library) scanAudio(ctx context.Context) (map[string]audioFile, error) {
 			}
 			return nil
 		}
-		if !strings.EqualFold(filepath.Ext(name), m4aExt) || isTempName(name) {
+		if !strings.EqualFold(filepath.Ext(name), m4aExt) || fileutil.IsTemp(name) {
 			return nil
 		}
 		var f audioFile

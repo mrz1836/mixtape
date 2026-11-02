@@ -1,20 +1,13 @@
 package engine
 
 import (
-	"bufio"
 	"context"
 	"errors"
 	"fmt"
-	"math"
-	"os"
-	"path/filepath"
 	"slices"
-	"strings"
 	"time"
 
-	"github.com/mrz1836/mixtape/internal/library"
 	"github.com/mrz1836/mixtape/internal/spotify"
-	"github.com/mrz1836/mixtape/internal/wav"
 )
 
 // take is one stretch of Spotify playing one track: from the first
@@ -201,7 +194,16 @@ func (e *Engine) reached(t *take) float64 {
 
 // plausible reports whether a song that began with t could be at pos by at.
 func (e *Engine) plausible(t *take, at time.Time, pos float64) bool {
-	return t.before.IsZero() || pos <= at.Sub(t.before).Seconds()+e.tn.StaleSlack.Seconds()
+	return reachable(t.before, at, pos, e.tn)
+}
+
+// reachable reports whether a track first seen after the observation at
+// before could have played to pos by at: no further than the time since,
+// plus StaleSlack. Anything beyond is the previous track's position,
+// reported under the new one. With no earlier observation, any position
+// is.
+func reachable(before, at time.Time, pos float64, tn Tuning) bool {
+	return before.IsZero() || pos <= at.Sub(before).Seconds()+tn.StaleSlack.Seconds()
 }
 
 // checkResumed restarts a requested song that Spotify resumed from the
@@ -211,8 +213,7 @@ func (e *Engine) plausible(t *take, at time.Time, pos float64) bool {
 // is started over from the top in a fresh take.
 func (e *Engine) checkResumed(ctx context.Context, t *take, s spotify.Snapshot) {
 	mid := e.plan.Mode != ModeLive && t.item != nil && t.item.state == itemPending && !t.ad && !e.stopping &&
-		s.State == spotify.StatePlaying && s.Position > e.tn.StartSlack.Seconds()+2*e.opts.Poll.Seconds() &&
-		!e.plausible(t, s.At, s.Position) && !e.started(t)
+		s.State == spotify.StatePlaying && e.midSong(s.Position) && !e.plausible(t, s.At, s.Position) && !e.started(t)
 	switch {
 	case !mid:
 		t.midSince = time.Time{}
@@ -221,9 +222,21 @@ func (e *Engine) checkResumed(ctx context.Context, t *take, s spotify.Snapshot) 
 	case s.At.Sub(t.midSince) >= blipWindow:
 		it := t.item
 		e.abandon()
-		e.command(ctx, "restart", func(c context.Context) error { return e.cfg.Player.SetPosition(c, 0) })
-		e.waiting = &request{item: it, at: s.At}
+		e.restartFromTop(ctx, it, s.At)
 	}
+}
+
+// midSong reports a position past the start of a song: beyond StartSlack
+// and the two polls it can take to see a song begin.
+func (e *Engine) midSong(pos float64) bool {
+	return pos > e.tn.StartSlack.Seconds()+2*e.opts.Poll.Seconds()
+}
+
+// restartFromTop asks Spotify to start the current song over and waits for
+// it to begin as item it. The current take has already been let go.
+func (e *Engine) restartFromTop(ctx context.Context, it *Item, at time.Time) {
+	e.command(ctx, "restart", func(c context.Context) error { return e.cfg.Player.SetPosition(c, 0) })
+	e.waiting = &request{item: it, at: at}
 }
 
 // abandon drops the current take without settling it: a false start that
@@ -254,12 +267,13 @@ func (e *Engine) transitional(s spotify.Snapshot) bool {
 	return t != nil && s.Track.URI == t.key && s.Track.Name != "" && t.track.Name != "" && s.Track.Name != t.track.Name
 }
 
-// crossfadeShrink bounds how much shorter Spotify may report a song a
-// moment after it starts before that is read as crossfade: with crossfade
-// on, the duration drops by the crossfade time (up to 12 s).
+// Spotify's crossfade lasts up to 12 s: a song that shrinks by
+// crossfadeShrinkMin to crossfadeMax right after it starts, or that keeps
+// changing up to crossfadeMax before its end, is being blended into the
+// next.
 const (
 	crossfadeShrinkMin = time.Second
-	crossfadeShrinkMax = 13 * time.Second
+	crossfadeMax       = 13 * time.Second
 )
 
 // refineDuration follows Spotify's updates to the current song's duration.
@@ -273,7 +287,7 @@ func (e *Engine) refineDuration(s spotify.Snapshot) {
 		return
 	}
 	shrink := t.track.Duration - d
-	if shrink >= crossfadeShrinkMin && shrink <= crossfadeShrinkMax && !e.opts.AllowCrossfade && !t.ad {
+	if shrink >= crossfadeShrinkMin && shrink <= crossfadeMax && !e.opts.AllowCrossfade && !t.ad {
 		e.fail(fmt.Errorf("%w (Spotify shortened %q by %.1fs to blend it into the next song)",
 			ErrCrossfade, t.track.Name, shrink.Seconds()))
 		return
@@ -298,14 +312,14 @@ func (e *Engine) parked(s spotify.Snapshot) bool {
 // onPlayerError handles a failed observation.
 func (e *Engine) onPlayerError(s spotify.Snapshot) {
 	switch {
-	case isAny(s.Err, spotify.ErrNotAuthorized),
+	case errors.Is(s.Err, spotify.ErrNotAuthorized),
 		// Blocked Apple Events are fatal only before Spotify ever answered.
 		// Mid-session the same error is Spotify quitting or relaunching (its
 		// process is still listed but no longer answers): it gets the grace
 		// period of a Spotify that is gone.
-		isAny(s.Err, spotify.ErrAppleEventsBlocked) && e.last.At.IsZero():
+		errors.Is(s.Err, spotify.ErrAppleEventsBlocked) && e.last.At.IsZero():
 		e.fail(s.Err)
-	case isAny(s.Err, spotify.ErrPromptPending):
+	case errors.Is(s.Err, spotify.ErrPromptPending):
 		e.warn("macOS is asking whether mixtape may control Spotify: approve the prompt")
 	default:
 		if e.goneSince.IsZero() {
@@ -341,15 +355,14 @@ func (e *Engine) beginRecording(ctx context.Context, t *take, it *Item, s spotif
 	if s.State != spotify.StatePlaying {
 		return // loaded but not playing yet: promoted when it starts
 	}
-	if s.Position > e.tn.StartSlack.Seconds()+2*e.opts.Poll.Seconds() {
-		if !t.before.IsZero() && s.Position > s.At.Sub(t.before).Seconds()+e.tn.StaleSlack.Seconds() {
+	if e.midSong(s.Position) {
+		if !e.plausible(t, s.At, s.Position) {
 			return // the previous track's position under the new URI: wait for a real one
 		}
 		// Joined mid-song: restart it from the top in a fresh take, and give
 		// Spotify time to do it before steering anything else.
 		e.releaseCur()
-		e.command(ctx, "restart", func(c context.Context) error { return e.cfg.Player.SetPosition(c, 0) })
-		e.waiting = &request{item: it, at: s.At}
+		e.restartFromTop(ctx, it, s.At)
 		return
 	}
 	e.adopt(t, it, s.At)
@@ -412,377 +425,4 @@ func (e *Engine) endTake(at time.Time, byUs bool) {
 		e.finals = append(e.finals, t)
 		e.finalizeReady(false)
 	}
-}
-
-// finalizeReady settles every ended take whose audio is fully spooled
-// (or has waited long enough). force settles them all now.
-func (e *Engine) finalizeReady(force bool) {
-	if len(e.finals) == 0 {
-		return
-	}
-	// Detach the list first: settling can end the session, which closes
-	// the current take and re-enters here with it.
-	pending := e.finals
-	e.finals = nil
-	now := e.now()
-	for _, t := range pending {
-		seg := e.segment(t)
-		if t.waitedAt.IsZero() {
-			t.waitedAt = now
-		}
-		if !force && seg.End() > e.spoolFrames() && now.Sub(t.waitedAt) < audioWait {
-			e.finals = append(e.finals, t)
-			continue
-		}
-		e.settle(t, seg)
-	}
-}
-
-// forceFinalize settles every pending take immediately.
-func (e *Engine) forceFinalize() {
-	if e.cur != nil {
-		e.endTake(e.now(), true)
-	}
-	e.finalizeReady(true)
-}
-
-// segment runs the segmenter over a take.
-func (e *Engine) segment(t *take) Segment {
-	tl := Timeline{
-		Duration: t.track.Duration, Before: t.before, Obs: t.obs,
-		EndAt: t.endAt, EndedByUs: t.endedByUs,
-	}
-	e.spoolMu.Lock()
-	defer e.spoolMu.Unlock()
-	if e.spool == nil {
-		return Segment{Reason: ReasonNoAudio}
-	}
-	return Segmentize(tl, e.spool, e.spool.Format().Rate, e.spool.Oldest(), e.tn)
-}
-
-// settle decides a finished take: save it, keep it as a partial, or
-// discard it (and retry or fail the song).
-func (e *Engine) settle(t *take, seg Segment) {
-	it := t.item
-	if e.falseStart(t, seg) {
-		if e.opts.Verbose {
-			e.emitBoundary(t, seg)
-		}
-		return
-	}
-	e.announce(t) // whatever becomes of the take follows its start
-	it.attempts++
-	reason := t.invalid
-	if reason == "" {
-		reason = seg.Reason
-	}
-	complete := seg.Complete && t.invalid == ""
-	if e.opts.Verbose {
-		e.emitBoundary(t, seg)
-	}
-	if e.crossfaded(t, seg) {
-		return
-	}
-
-	switch {
-	case complete || (e.opts.KeepPartial && seg.Frames() > 0 && !t.userSkipped):
-		path, err := e.render(t, seg)
-		if err != nil {
-			it.state = itemPending
-			e.failItem(it, "render: "+err.Error())
-			e.setback(setbackOther, "render: "+err.Error())
-			return
-		}
-		e.submitCommit(it, t, path, !complete, seg.Covered)
-		if !complete {
-			it.state = itemPending // a complete take will replace the partial
-			e.discardOrRetry(t, reason, true)
-		}
-	default:
-		it.state = itemPending
-		e.discardOrRetry(t, reason, false)
-	}
-}
-
-// maxFalseStarts bounds how often a song may start falsely before its
-// takes count as attempts.
-const maxFalseStarts = 3
-
-// falseStart recognizes a take of a song that never really began: Spotify
-// moved on (to the track it resumed, say) before the song believably played
-// earlyRestart seconds. That is no attempt and nothing to report; the song
-// is simply requested again. A take the session's end cut short is
-// discarded as usual.
-func (e *Engine) falseStart(t *take, seg Segment) bool {
-	it := t.item
-	if seg.Complete || t.userSkipped || t.invalid != "" || e.stopping || e.plan.Mode == ModeLive ||
-		e.started(t) || it.falseStarts >= maxFalseStarts {
-		return false
-	}
-	it.falseStarts++
-	it.state = itemPending
-	return true
-}
-
-// crossfadeWindow bounds how early a crossfaded song changes (Spotify's
-// crossfade goes up to 12 s).
-const crossfadeWindow = 13.0
-
-// crossfaded recognizes Spotify's crossfade: consecutive songs that change
-// on their own the same few seconds before their end. It ends the session
-// rather than discard every song.
-func (e *Engine) crossfaded(t *take, seg Segment) bool {
-	gap := t.track.Duration.Seconds() - t.lastPos()
-	if seg.Complete || seg.Reason != ReasonEndedEarly || t.endedByUs || t.userSkipped ||
-		gap < e.tn.EndSlack.Seconds() || gap > crossfadeWindow {
-		e.earlyEnds = e.earlyEnds[:0]
-		return false
-	}
-	e.earlyEnds = append(e.earlyEnds, gap)
-	n := len(e.earlyEnds)
-	if n < 2 || math.Abs(e.earlyEnds[n-1]-e.earlyEnds[n-2]) > e.tn.EndSlack.Seconds() {
-		return false
-	}
-	t.item.state = itemPending
-	e.counts.Discarded++
-	e.emit(Event{Type: EventTrackDiscarded, Track: t.eventTrack(), Reason: ReasonEndedEarly})
-	e.fail(fmt.Errorf("%w (they change %.1fs before the end)", ErrCrossfade, gap))
-	return true
-}
-
-// discardOrRetry handles an incomplete take: the song is retried once
-// unless the user skipped it; kept reports a saved partial.
-func (e *Engine) discardOrRetry(t *take, reason string, kept bool) {
-	it := t.item
-	if !kept {
-		e.counts.Discarded++
-		e.emit(Event{Type: EventTrackDiscarded, Track: t.eventTrack(), Reason: reason})
-	}
-	if !t.userSkipped && !t.endedByUs {
-		kind := setbackOther
-		if t.silent {
-			kind = setbackSilent
-		}
-		e.setback(kind, reason)
-	}
-	switch {
-	case t.userSkipped:
-		it.state = itemDone
-		e.counts.Skipped++
-		e.emit(Event{Type: EventTrackSkipped, Track: t.eventTrack(), Reason: "skipped by you"})
-	case e.plan.Mode == ModeLive:
-		it.state = itemDone // live mode records what plays; nothing to retry
-	case it.attempts >= maxTakes:
-		e.failItem(it, reason)
-	}
-}
-
-// failItem gives up on a song for this session.
-func (e *Engine) failItem(it *Item, reason string) {
-	if it.state == itemDone || it.state == itemFailed {
-		return
-	}
-	it.state, it.reason = itemFailed, reason
-	e.counts.Failed++
-	e.submit(job{kind: jobMark, item: it, status: library.StatusFailed, reason: reason})
-	e.emit(Event{Type: EventTrackFailed, Track: itemTrack(it), Reason: reason})
-}
-
-// render writes a segment's frames to a WAV in the work directory.
-func (e *Engine) render(t *take, seg Segment) (string, error) {
-	// The engine lock is held only to pick the spool and its bounds: render
-	// runs on the engine goroutine, as do pruning and reopening, so the
-	// spool stays put while it is read, and capture keeps appending (the
-	// spool guards itself) instead of waiting for the whole WAV write.
-	e.spoolMu.Lock()
-	sp := e.spool
-	if sp == nil {
-		e.spoolMu.Unlock()
-		return "", errNoSpool
-	}
-	oldest, newest := sp.Oldest(), sp.Frames()
-	e.spoolMu.Unlock()
-	ranges := make([]Range, 0, len(seg.Ranges))
-	var total int64
-	for _, r := range seg.Ranges {
-		r.From, r.To = max(r.From, oldest), min(r.To, newest)
-		if r.Len() > 0 {
-			ranges = append(ranges, r)
-			total += r.Len()
-		}
-	}
-	if total == 0 {
-		return "", errNoSpool
-	}
-	if err := os.MkdirAll(e.cfg.WorkDir, 0o700); err != nil {
-		return "", err
-	}
-	name := fmt.Sprintf("%s-%d.wav", safeName(t.item.Track.ID), t.startedAt.UnixNano())
-	path := filepath.Join(e.cfg.WorkDir, name)
-	f, err := os.Create(filepath.Clean(path))
-	if err != nil {
-		return "", err
-	}
-	format := sp.Format()
-	w := bufio.NewWriterSize(f, 1<<20)
-	err = wav.WriteHeader(w, total*int64(format.BytesPerFrame()), format.Rate, format.Channels)
-	for _, r := range ranges {
-		if err != nil {
-			break
-		}
-		var n int64
-		n, err = sp.ReadRange(r.From, r.To, w)
-		if err == nil && n != r.Len() {
-			err = fmt.Errorf("%w: %d of %d frames", errShortRead, n, r.Len())
-		}
-	}
-	if err == nil {
-		err = w.Flush()
-	}
-	if cerr := f.Close(); err == nil {
-		err = cerr
-	}
-	if err != nil {
-		_ = os.Remove(path)
-		return "", err
-	}
-	return path, nil
-}
-
-// emitBoundary reports the measured timing of a song (--verbose).
-func (e *Engine) emitBoundary(t *take, seg Segment) {
-	var rate int
-	var observed int64 // the frame at the first observation of the track
-	e.spoolMu.Lock()
-	if e.spool != nil {
-		rate = e.spool.Format().Rate
-		observed = e.spool.FrameAt(t.startedAt)
-	}
-	e.spoolMu.Unlock()
-	if rate == 0 {
-		return
-	}
-	drift := seg.Drift.Seconds()
-	ev := Event{Type: EventBoundary, Track: t.eventTrack(), Runs: seg.Runs, DriftSeconds: &drift, Reason: seg.Reason}
-	if len(seg.Ranges) > 0 {
-		// Seconds between the capture's first observation of the track and
-		// the estimated start of its audio: latency plus poll delay.
-		first := float64(seg.Anchor-observed) / float64(rate)
-		ev.OffsetSeconds = &first
-	}
-	e.emit(ev)
-}
-
-// itemTrack describes a planned song for events.
-func itemTrack(it *Item) *EventTrack {
-	return &EventTrack{
-		ID: it.Track.ID, PlayedID: it.Track.PlayedID, Title: it.Track.Title, Artist: it.Track.Artist,
-		Collection: it.Group.Spec.Name, Position: it.position(), DurationMS: it.Track.DurationMS,
-		Attempt: it.attempts,
-	}
-}
-
-// libraryTrack merges what the plan knew with what Spotify reported while
-// the song played.
-func libraryTrack(it *Item, base library.Track, played spotify.Track) library.Track {
-	t := base
-	if played.ID != "" && played.ID != t.ID {
-		t.PlayedID = played.ID
-	}
-	set := func(dst *string, v string) {
-		if v != "" {
-			*dst = v
-		}
-	}
-	set(&t.Title, played.Name)
-	set(&t.Artist, played.Artist)
-	set(&t.Album, played.Album)
-	set(&t.AlbumArtist, played.AlbumArtist)
-	set(&t.ArtworkURL, played.ArtworkURL)
-	if played.Duration > 0 {
-		t.DurationMS = played.Duration.Milliseconds()
-	}
-	if t.TrackNumber == 0 || it.Group.Spec.Kind != library.KindAlbum {
-		t.TrackNumber = played.TrackNumber
-	}
-	t.DiscNumber, t.Popularity = played.DiscNumber, played.Popularity
-	return t
-}
-
-func safeName(s string) string {
-	return strings.Map(func(r rune) rune {
-		if r >= '0' && r <= '9' || r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' {
-			return r
-		}
-		return '_'
-	}, s)
-}
-
-// isAny reports whether err matches any of the targets.
-func isAny(err error, targets ...error) bool {
-	for _, t := range targets {
-		if errors.Is(err, t) {
-			return true
-		}
-	}
-	return false
-}
-
-// setbackKind classifies a song that could not be recorded.
-type setbackKind int
-
-const (
-	setbackOther      setbackKind = iota // cut short, drifted, failed to save
-	setbackSilent                        // played, but no sound reached mixtape
-	setbackNotStarted                    // Spotify did not start it
-)
-
-// setback counts a song (or one attempt at it) that could not be recorded
-// for a reason outside mixtape's and the listener's control. After
-// MaxFailures in a row the session ends with an error naming the likely
-// cause, instead of trying every song the same way: signed out, offline,
-// playing on another device, or muted. A recorded song resets the count.
-func (e *Engine) setback(kind setbackKind, reason string) {
-	if e.opts.MaxFailures <= 0 || e.plan.Mode == ModeLive || e.stopping {
-		return
-	}
-	e.streak = append(e.streak, kind)
-	e.lastSetback = reason
-	if len(e.streak) >= e.opts.MaxFailures {
-		e.fail(e.streakError())
-	}
-}
-
-// streakError names what the setbacks in a row have in common.
-func (e *Engine) streakError() error {
-	n := len(e.streak)
-	all := func(k setbackKind) bool {
-		for _, s := range e.streak {
-			if s != k {
-				return false
-			}
-		}
-		return true
-	}
-	switch {
-	case all(setbackSilent):
-		return fmt.Errorf("%w (%d in a row)", ErrNoSound, n)
-	case all(setbackNotStarted):
-		return fmt.Errorf("%w (%d in a row)", ErrNotStarting, n)
-	}
-	return fmt.Errorf("%w (%d in a row; the last: %s)", ErrFailing, n, e.lastSetback)
-}
-
-// tooLong explains why a song of duration d cannot be recorded (its WAV
-// would pass the format's 4 GiB limit), or returns "".
-func (e *Engine) tooLong(d time.Duration) string {
-	if e.cfg.Source == nil || d <= 0 {
-		return ""
-	}
-	f := e.cfg.Source.Format()
-	if limit := wav.MaxDuration(f.Rate, f.Channels); limit > 0 && d > limit {
-		return fmt.Sprintf("too long to record: %s, and a recording can hold at most %s at %d Hz",
-			d.Round(time.Minute), limit.Round(time.Minute), f.Rate)
-	}
-	return ""
 }

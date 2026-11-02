@@ -38,7 +38,7 @@ func TestIntegrationSpotifyProcesses(t *testing.T) {
 func TestIntegrationTapRecords(t *testing.T) {
 	t.Parallel()
 	testutil.RequireLive(t)
-	src, err := Open(Options{Wait: 5 * time.Second})
+	src, err := Open(t.Context(), Options{Wait: 5 * time.Second})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = src.Close() })
 	f := src.Format()

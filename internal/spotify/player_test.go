@@ -3,6 +3,7 @@ package spotify
 import (
 	"context"
 	"fmt"
+	"math"
 	"strings"
 	"sync"
 	"testing"
@@ -70,14 +71,20 @@ func newTestPlayer(r Runner, running bool) *Player {
 	return p
 }
 
-// snapLine builds a snapshot line the way the AppleScript handler does.
+// scriptLine builds a line the way the AppleScript handler does: a
+// marker, then its fields, all separated by fieldSep.
+func scriptLine(marker string, fields ...string) string {
+	return strings.Join(append([]string{marker}, fields...), fieldSep)
+}
+
+// snapLine builds the snapshot line of a typical track, with the fields
+// tests vary given.
 func snapLine(state, uri, name, artist, pos string) string {
-	f := []string{
+	return scriptLine(markSnapshot,
 		state, "80", "false", "true",
 		uri, name, artist, "Whenever You Need Somebody", "Rick Astley",
 		"213573", "1", "1", "77", "https://i.scdn.co/image/abc", pos,
-	}
-	return markSnapshot + fieldSep + strings.Join(f, fieldSep)
+	)
 }
 
 func TestPollParsesSnapshot(t *testing.T) {
@@ -111,8 +118,7 @@ func TestPollParsesSnapshot(t *testing.T) {
 
 func TestPollLocaleAndEmptyTrack(t *testing.T) {
 	t.Parallel()
-	f := []string{"paused", "100", "true", "false", "", "", "", "", "", "0", "0", "0", "0", "", "3,5"}
-	line := markSnapshot + fieldSep + strings.Join(f, fieldSep)
+	line := scriptLine(markSnapshot, "paused", "100", "true", "false", "", "", "", "", "", "0", "0", "0", "0", "", "3,5")
 	p := newTestPlayer(&fakeRunner{run: func(string) (string, error) { return line, nil }}, true)
 
 	s := p.Poll(t.Context())
@@ -125,11 +131,8 @@ func TestPollLocaleAndEmptyTrack(t *testing.T) {
 
 func TestPollMissingTextFieldsAreEmpty(t *testing.T) {
 	t.Parallel()
-	f := []string{
-		"playing", "80", "false", "false", "spotify:track:" + testTrackID, "Song", "missing value",
-		"missing value", "missing value", "1000", "1", "1", "0", "", "1.5",
-	}
-	line := markSnapshot + fieldSep + strings.Join(f, fieldSep)
+	line := scriptLine(markSnapshot, "playing", "80", "false", "false", "spotify:track:"+testTrackID, "Song",
+		"missing value", "missing value", "missing value", "1000", "1", "1", "0", "", "1.5")
 	p := newTestPlayer(&fakeRunner{run: func(string) (string, error) { return line, nil }}, true)
 	s := p.Poll(t.Context())
 	require.NoError(t, s.Err)
@@ -168,6 +171,22 @@ func TestPollAds(t *testing.T) {
 	}
 }
 
+// osascriptError is the error OSAScript.Run returns when the script fails
+// with code and msg.
+func osascriptError(code int, msg string) *ScriptError {
+	return &ScriptError{Code: code, Msg: fmt.Sprintf("osascript: exit status 1: 0:42: execution error: %s (%d)", msg, code)}
+}
+
+func TestPollErrorKeepsTheScriptsText(t *testing.T) {
+	t.Parallel()
+	r := &fakeRunner{run: func(string) (string, error) {
+		return scriptLine(markError, "-1743", "Not authorized to send Apple events to Spotify."), nil
+	}}
+	s := newTestPlayer(r, false).Poll(t.Context())
+	require.ErrorIs(t, s.Err, ErrNotAuthorized)
+	assert.Equal(t, ErrNotAuthorized.Error()+": Not authorized to send Apple events to Spotify. (-1743)", s.Err.Error())
+}
+
 func TestPollErrors(t *testing.T) {
 	t.Parallel()
 	tests := map[string]struct {
@@ -177,17 +196,17 @@ func TestPollErrors(t *testing.T) {
 		want    error
 	}{
 		"not running marker":   {out: markNotRunning, want: ErrNotRunning},
-		"not authorized":       {out: "E" + fieldSep + "-1743" + fieldSep + "Not authorized.", want: ErrNotAuthorized},
-		"proc gone, stopped":   {out: "E" + fieldSep + "-600" + fieldSep + "isn't running", want: ErrNotRunning},
-		"proc gone, running":   {out: "E" + fieldSep + "-600" + fieldSep + "isn't running", running: true, want: ErrAppleEventsBlocked},
-		"other script error":   {out: "E" + fieldSep + "-1728" + fieldSep + "Can't get name.", want: ErrScript},
-		"error without code":   {out: "E" + fieldSep + "x" + fieldSep + "odd", want: ErrScript},
+		"not authorized":       {out: scriptLine(markError, "-1743", "Not authorized."), want: ErrNotAuthorized},
+		"proc gone, stopped":   {out: scriptLine(markError, "-600", "isn't running"), want: ErrNotRunning},
+		"proc gone, running":   {out: scriptLine(markError, "-600", "isn't running"), running: true, want: ErrAppleEventsBlocked},
+		"other script error":   {out: scriptLine(markError, "-1728", "Can't get name."), want: ErrScript},
+		"error without code":   {out: scriptLine(markError, "x", "odd"), want: ErrScript},
 		"garbage":              {out: "hello", want: errBadSnapshot},
-		"short":                {out: markSnapshot + fieldSep + "playing", want: errBadSnapshot},
-		"runner denied":        {err: textError("execution error: Not authorized to send Apple events to Spotify. (-1743)"), want: ErrNotAuthorized},
+		"short":                {out: scriptLine(markSnapshot, "playing"), want: errBadSnapshot},
+		"runner denied":        {err: osascriptError(-1743, "Not authorized to send Apple events to Spotify."), want: ErrNotAuthorized},
 		"runner timeout":       {err: fmt.Errorf("osascript: %w", context.DeadlineExceeded), want: ErrPromptPending},
-		"runner sandboxed":     {err: textError("execution error: An error of type -10810 has occurred. (-10810)"), running: true, want: ErrAppleEventsBlocked},
-		"runner not running":   {err: textError("execution error: Spotify got an error: Application isn't running. (-600)"), want: ErrNotRunning},
+		"runner sandboxed":     {err: osascriptError(-10810, "An error of type -10810 has occurred."), running: true, want: ErrAppleEventsBlocked},
+		"runner not running":   {err: osascriptError(-600, "Spotify got an error: Application isn't running."), want: ErrNotRunning},
 		"runner plain failure": {err: textError("exit status 1"), want: ErrScript},
 	}
 	for name, tc := range tests {
@@ -253,7 +272,7 @@ func TestCommandResults(t *testing.T) {
 	require.ErrorIs(t, newTestPlayer(notRunning, false).Next(t.Context()), ErrNotRunning)
 
 	denied := &fakeRunner{run: func(string) (string, error) {
-		return "", textError("execution error: Not authorized to send Apple events to Spotify. (-1743)")
+		return "", osascriptError(-1743, "Not authorized to send Apple events to Spotify.")
 	}}
 	require.ErrorIs(t, newTestPlayer(denied, true).Pause(t.Context()), ErrNotAuthorized)
 
@@ -285,7 +304,7 @@ func TestSetPositionRejects(t *testing.T) {
 	t.Parallel()
 	r := &fakeRunner{}
 	p := newTestPlayer(r, true)
-	for _, v := range []float64{-1, nan(), inf()} {
+	for _, v := range []float64{-1, math.NaN(), math.Inf(1)} {
 		require.ErrorIs(t, p.SetPosition(t.Context(), v), errBadValue)
 	}
 	assert.Empty(t, r.lastScript())
@@ -360,6 +379,39 @@ func TestWatchStreamsAndRestarts(t *testing.T) {
 	defer r.mu.Unlock()
 	assert.Equal(t, []string{"100"}, r.args[0], "interval passed in milliseconds")
 	assert.Contains(t, r.scripts[0], "repeat")
+}
+
+func TestWatchClassifiesTheScriptsExit(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	r := &fakeRunner{starts: []func(context.Context) (<-chan Line, error){
+		lines(nil, osascriptError(-600, "Spotify got an error: Application isn't running.")),
+	}}
+	s := <-newTestPlayer(r, true).Watch(ctx, time.Millisecond)
+	require.ErrorIs(t, s.Err, ErrAppleEventsBlocked, "-600 while Spotify runs means Apple Events are blocked")
+}
+
+func TestConsumeStopsWhenCanceled(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	p := newTestPlayer(&fakeRunner{}, true)
+	snap := snapLine("playing", "spotify:track:"+testTrackID, "A", "X", "1.0")
+
+	exited := make(chan Line, 1)
+	exited <- Line{Err: textError("signal: killed")}
+	close(exited)
+	out := make(chan Snapshot, 1)
+	p.consume(ctx, exited, out)
+	assert.Empty(t, out, "the exit of a canceled watch is not reported")
+
+	pending := make(chan Line, 2)
+	pending <- Line{Text: snap}
+	pending <- Line{Text: snap}
+	close(pending)
+	p.consume(ctx, pending, make(chan Snapshot))
+	assert.Len(t, pending, 1, "it stops at the first snapshot nobody can receive")
 }
 
 func TestWatchClosesOnCancel(t *testing.T) {

@@ -49,8 +49,8 @@ var (
 )
 
 // Spool is an append-only, chunked PCM store with a time index. One
-// goroutine may Append while another reads (FrameAt, TimeAt, ReadRange,
-// Prune); ReadRange and Prune must not run concurrently with each other.
+// goroutine may Append while another reads (FrameAt, ReadRange, Prune);
+// ReadRange and Prune must not run concurrently with each other.
 type Spool struct {
 	mu          sync.Mutex
 	dir         string
@@ -230,27 +230,6 @@ func (s *Spool) FrameAt(t time.Time) int64 {
 	lo, hi := a[i-1], a[i]
 	frac := float64(t.Sub(lo.at)) / float64(hi.at.Sub(lo.at))
 	return lo.frame + int64(frac*float64(hi.frame-lo.frame))
-}
-
-// TimeAt maps a frame position to its capture time; the inverse of FrameAt.
-func (s *Spool) TimeAt(frame int64) time.Time {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	a := s.anchors
-	switch {
-	case len(a) == 0:
-		return time.Time{}
-	case len(a) == 1 || frame <= a[0].frame:
-		return a[0].at.Add(s.format.Duration(frame - a[0].frame))
-	}
-	last := a[len(a)-1]
-	if frame >= last.frame {
-		return last.at.Add(s.format.Duration(frame - last.frame))
-	}
-	i := sort.Search(len(a), func(i int) bool { return a[i].frame > frame })
-	lo, hi := a[i-1], a[i]
-	frac := float64(frame-lo.frame) / float64(hi.frame-lo.frame)
-	return lo.at.Add(time.Duration(frac * float64(hi.at.Sub(lo.at))))
 }
 
 // ReadRange writes the PCM of frames [from, to) to w, clipped to the

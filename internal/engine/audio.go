@@ -48,7 +48,7 @@ func (e *Engine) stopCapture() {
 // sink receives captured blocks on the capture goroutine: it spools them
 // and tracks when audio was last above the silence floor.
 func (e *Engine) sink(b capture.Block) {
-	if peak(b.PCM[:min(len(b.PCM), b.Frames*4)]) > silenceFloor {
+	if peak(b.PCM[:min(len(b.PCM), b.Frames*e.cfg.Source.Format().BytesPerFrame())]) > silenceFloor {
 		e.loudAt.Store(int64(b.At.Sub(e.capStart)))
 	}
 	e.spoolMu.Lock()
@@ -184,7 +184,7 @@ func (e *Engine) checkSilence(now time.Time) {
 	}
 	t.silent = true
 	if t.invalid == "" {
-		t.invalid = "no audio was captured for 10 s while the song played"
+		t.invalid = fmt.Sprintf("no audio was captured for %s while the song played", silenceWindow)
 	}
 }
 
@@ -282,6 +282,9 @@ func (e *Engine) restoreSpotify(ctx context.Context) {
 	}
 	e.spotifyState.Restored = true
 	if e.cfg.SaveSpotify != nil {
+		// Best effort: if this write is lost, the next session finds the
+		// settings still pending, sees Spotify no longer holds the values
+		// set, and leaves them alone.
 		_ = e.cfg.SaveSpotify(e.spotifyState)
 	}
 }
@@ -296,21 +299,22 @@ func mergePending(st session.SpotifyState, pending *session.SpotifyState, snap s
 	if pending == nil || pending.Restored {
 		return st
 	}
-	carry := func(orig, set **bool, pOrig, pSet *bool, now bool) {
-		if pOrig != nil && pSet != nil && now == *pSet {
-			*orig = pOrig
-			if *set == nil {
-				*set = pSet
-			}
-		}
-	}
-	carry(&st.Original.Shuffle, &st.Set.Shuffle, pending.Original.Shuffle, pending.Set.Shuffle, snap.Shuffle)
-	carry(&st.Original.Repeat, &st.Set.Repeat, pending.Original.Repeat, pending.Set.Repeat, snap.Repeat)
-	if po, ps := pending.Original.Volume, pending.Set.Volume; po != nil && ps != nil && snap.Volume == *ps {
-		st.Original.Volume = po
-		if st.Set.Volume == nil {
-			st.Set.Volume = ps
-		}
-	}
+	carryPending(&st.Original.Shuffle, &st.Set.Shuffle, pending.Original.Shuffle, pending.Set.Shuffle, snap.Shuffle)
+	carryPending(&st.Original.Repeat, &st.Set.Repeat, pending.Original.Repeat, pending.Set.Repeat, snap.Repeat)
+	carryPending(&st.Original.Volume, &st.Set.Volume, pending.Original.Volume, pending.Set.Volume, snap.Volume)
 	return st
+}
+
+// carryPending takes over one setting an interrupted session changed
+// (from pOrig to pSet) while Spotify still holds pSet (now): this session
+// will put pOrig back, and keeps pSet as what is set unless it sets
+// something itself.
+func carryPending[T comparable](orig, set **T, pOrig, pSet *T, now T) {
+	if pOrig == nil || pSet == nil || now != *pSet {
+		return
+	}
+	*orig = pOrig
+	if *set == nil {
+		*set = pSet
+	}
 }

@@ -17,6 +17,11 @@ import (
 	"time"
 )
 
+// BundleID identifies the Spotify desktop app to macOS: the target of the
+// Automation permission, and the prefix of the bundle IDs of the helper
+// processes that play its audio.
+const BundleID = "com.spotify.client"
+
 // Kind is the type of Spotify item a link points at.
 type Kind string
 

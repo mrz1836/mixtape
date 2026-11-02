@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bytes"
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
@@ -11,7 +12,6 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/mrz1836/mixtape/internal/capture"
-	"github.com/mrz1836/mixtape/internal/config"
 	"github.com/mrz1836/mixtape/internal/engine"
 	"github.com/mrz1836/mixtape/internal/library"
 	"github.com/mrz1836/mixtape/internal/session"
@@ -24,7 +24,7 @@ func TestRecordClosesTheCaptureWhenTheSessionFailsBeforeCapturing(t *testing.T) 
 	h := newHarness(t)
 	h.world.addPlaylist("List", songs()...)
 	src := &nopSource{events: make(chan capture.Event)}
-	h.deps.services.openCapture = func(captureRequest) (capture.Source, error) { return src, nil }
+	h.deps.services.openCapture = func(context.Context, captureRequest) (capture.Source, error) { return src, nil }
 	// Spotify answers the readiness poll, then quits before the engine
 	// sets it up: the session ends before capture ever starts.
 	h.world.player.polls = []spotify.Snapshot{
@@ -45,13 +45,13 @@ func TestRecorderThatCannotStartTheEngineRecordsTheFailure(t *testing.T) {
 	a := &app{deps: h.deps, out: plainOutput(t, false), home: t.TempDir()}
 	lib, err := library.Open(t.TempDir(), library.Options{Encoder: &testutil.Encoder{}, WorkDir: t.TempDir()})
 	require.NoError(t, err)
-	plan := engine.BuildPlan(lib, nil, engine.PlanOptions{})
-	rec, err := a.newRecorder("s1", plan, config.Settings{}, nil, nil, nil)
+	run := &recordRun{flags: &recordFlags{}, lib: lib, plan: engine.BuildPlan(lib, nil, engine.PlanOptions{})}
+	rec, err := a.newRecorder("s1", run, nil)
 	require.NoError(t, err)
 	defer rec.close()
 
 	// No player: engine.New refuses the config.
-	failure := rec.run(t.Context(), lib, plan, nil, nil, config.Settings{}, &recordFlags{})
+	failure := rec.run(t.Context(), run)
 	require.Error(t, failure)
 	st, err := session.ReadState(a.home)
 	require.NoError(t, err)
@@ -104,7 +104,7 @@ func TestRecordLeavesNoCaptureOpenWhenStoppedDuringSetup(t *testing.T) {
 	h := newHarness(t)
 	h.world.addPlaylist("List", songs()...)
 	src := &nopSource{events: make(chan capture.Event)}
-	h.deps.services.openCapture = func(captureRequest) (capture.Source, error) { return src, nil }
+	h.deps.services.openCapture = func(context.Context, captureRequest) (capture.Source, error) { return src, nil }
 	h.deps.services.signals = stopAtOnce
 
 	require.Equal(t, ExitOK, h.run("record", plURL))

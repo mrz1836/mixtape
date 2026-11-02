@@ -551,24 +551,6 @@ func TestReadFileMoovSizeGuard(t *testing.T) {
 	}
 }
 
-// Write rewrites the file through a temp file; the result must keep the
-// original permissions and carry the tags.
-func TestWritePreservesModeAndTags(t *testing.T) {
-	t.Parallel()
-	path := filepath.Join(t.TempDir(), "song.m4a")
-	require.NoError(t, os.WriteFile(path, testutil.M4A(testutil.M4AOptions{}), 0o640))
-	require.NoError(t, Write(path, Tags{Title: "Kept"}))
-
-	info, err := os.Stat(path)
-	require.NoError(t, err)
-	assert.Equal(t, os.FileMode(0o640), info.Mode().Perm())
-	tags, err := ReadFile(path)
-	require.NoError(t, err)
-	assert.Equal(t, "Kept", tags.Title)
-
-	require.Error(t, Write(filepath.Join(t.TempDir(), "missing.m4a"), Tags{}))
-}
-
 // The tests below run on a real afconvert file and skip where the AAC
 // encoder is unavailable (Linux CI, sandboxes). They check what synthetic
 // files cannot: that real encoder output survives tagging.

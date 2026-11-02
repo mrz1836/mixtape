@@ -309,14 +309,6 @@ func (f *fakeSpotify) PlayTrack(_ context.Context, uri, ctxURI string) error {
 	return nil
 }
 
-func (f *fakeSpotify) Play(context.Context) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.log("play")
-	f.playing = true
-	return nil
-}
-
 func (f *fakeSpotify) Pause(context.Context) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()

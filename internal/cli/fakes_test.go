@@ -173,9 +173,11 @@ func newFakeWorld(t *testing.T) *fakeWorld {
 // services wires the fake world into the CLI.
 func (w *fakeWorld) services(h *harness) services {
 	return services{
-		player:         func() player { return w.player },
-		catalog:        func() catalog { return w.catalog },
-		openCapture:    func(captureRequest) (capture.Source, error) { return &nopSource{events: make(chan capture.Event)}, nil },
+		player:  func() player { return w.player },
+		catalog: func() catalog { return w.catalog },
+		openCapture: func(context.Context, captureRequest) (capture.Source, error) {
+			return &nopSource{events: make(chan capture.Event)}, nil
+		},
 		tapStatus:      func() capture.TapStatus { return w.tap },
 		devices:        func() ([]device.Info, error) { return w.devices, w.devicesErr },
 		defaultOutput:  func() (device.Info, error) { return w.output, nil },

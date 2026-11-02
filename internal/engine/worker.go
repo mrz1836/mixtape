@@ -36,7 +36,6 @@ type job struct {
 	// engine may still update the item (a relinked ID) while the worker
 	// runs, so the worker reads only this copy.
 	track   library.Track
-	take    *take
 	played  spotify.Track
 	wav     string
 	partial bool
@@ -148,15 +147,11 @@ func (e *Engine) runJob(ctx context.Context, j job) result {
 			Artwork: e.opts.Artwork, KeepWAV: e.opts.KeepWAV, Partial: j.partial,
 			RecordedMS: j.covered.Milliseconds(),
 		})
-		if r.err == nil {
-			r.loc = &library.Location{Collection: c, Entry: r.entry, Path: c.Path(&r.entry)}
-		}
+		r.loc = located(c, r.entry, r.err)
 	case jobCopy:
 		c.Ensure(j.track)
 		r.entry, r.err = lib.Copy(ctx, c, j.track, *j.from)
-		if r.err == nil {
-			r.loc = &library.Location{Collection: c, Entry: r.entry, Path: c.Path(&r.entry)}
-		}
+		r.loc = located(c, r.entry, r.err)
 	case jobEncode:
 		r.entry, r.err = lib.RetryEncode(ctx, c, j.track.ID, library.CommitOptions{
 			Artwork: e.opts.Artwork, KeepWAV: e.opts.KeepWAV,
@@ -178,6 +173,14 @@ func (e *Engine) runJob(ctx context.Context, j job) result {
 		}
 	}
 	return r
+}
+
+// located is where a stored entry now lives, or nil when storing failed.
+func located(c *library.Collection, en library.Entry, err error) *library.Location {
+	if err != nil {
+		return nil
+	}
+	return &library.Location{Collection: c, Entry: en, Path: c.Path(&en)}
 }
 
 // onResult applies a finished job on the engine goroutine.
@@ -210,7 +213,7 @@ func (e *Engine) onResult(ctx context.Context, r result) {
 		e.counts.Copied++
 		ev := e.entryEvent(it, r.entry)
 		if r.from != nil {
-			ev.CopiedFrom = r.from.Collection.Folder() + "/" + r.from.Entry.File
+			ev.CopiedFrom = r.from.RelPath()
 		}
 		e.emit(Event{Type: EventTrackCopied, Track: ev})
 		e.copyTwins(it, r.loc)
@@ -220,28 +223,22 @@ func (e *Engine) onResult(ctx context.Context, r result) {
 // onSaved handles a committed (or re-encoded) recording.
 func (e *Engine) onSaved(r result) {
 	it := r.item
-	if r.err != nil {
-		if errors.Is(r.err, library.ErrKeptComplete) {
-			// The partial take was not kept: the complete file stays.
-			e.counts.Discarded++
-			e.emit(Event{Type: EventTrackDiscarded, Track: itemTrack(it), Reason: r.err.Error()})
-			return
-		}
-		if errors.Is(r.err, library.ErrStore) {
-			e.storeFailed(it, r.err)
-			return
-		}
-		if errors.Is(r.err, library.ErrEncode) {
-			// The library kept the WAV and marked the song encode_failed;
-			// the next run encodes it again without recording.
-			it.state, it.reason = itemFailed, r.err.Error()
-			e.counts.Failed++
-			e.emit(Event{Type: EventTrackFailed, Track: itemTrack(it), Reason: r.err.Error()})
-			return
-		}
-		if it.state == itemBusy {
-			it.state = itemPending
-		}
+	switch {
+	case errors.Is(r.err, library.ErrKeptComplete):
+		// The partial take was not kept: the complete file stays.
+		e.counts.Discarded++
+		e.emit(Event{Type: EventTrackDiscarded, Track: itemTrack(it), Reason: r.err.Error()})
+		return
+	case errors.Is(r.err, library.ErrStore):
+		e.storeFailed(it, r.err)
+		return
+	case errors.Is(r.err, library.ErrEncode):
+		// The library kept the WAV and marked the song encode_failed; the
+		// next run encodes it again without recording.
+		e.markFailed(it, r.err.Error())
+		return
+	case r.err != nil:
+		it.unbusy()
 		e.failItem(it, "save: "+r.err.Error())
 		return
 	}
@@ -265,9 +262,7 @@ func (e *Engine) onSaved(r result) {
 // unplugged drive, a full disk): every further song would be lost the same
 // way. The song stays pending for the next run.
 func (e *Engine) storeFailed(it *Item, err error) {
-	if it.state == itemBusy {
-		it.state = itemPending
-	}
+	it.unbusy()
 	e.fail(fmt.Errorf("%s: %w", it.Track.Title, err))
 }
 
@@ -303,9 +298,7 @@ func (e *Engine) instantWork() {
 	for _, it := range e.plan.Items {
 		switch it.Action {
 		case ActionSkip:
-			it.state = itemDone
-			e.counts.Skipped++
-			e.emit(Event{Type: EventTrackSkipped, Track: itemTrack(it), Reason: "already in the library"})
+			e.skip(it, itemTrack(it), reasonInLibrary)
 		case ActionCopy:
 			if it.From != nil {
 				e.submit(job{kind: jobCopy, item: it, from: it.From})
@@ -319,5 +312,32 @@ func (e *Engine) instantWork() {
 
 // submitCommit hands a rendered take to the worker.
 func (e *Engine) submitCommit(it *Item, t *take, wavPath string, partial bool, covered time.Duration) {
-	e.submit(job{kind: jobCommit, item: it, take: t, played: t.track, wav: wavPath, partial: partial, covered: covered})
+	e.submit(job{kind: jobCommit, item: it, played: t.track, wav: wavPath, partial: partial, covered: covered})
+}
+
+// libraryTrack merges what the plan knew with what Spotify reported while
+// the song played.
+func libraryTrack(it *Item, base library.Track, played spotify.Track) library.Track {
+	t := base
+	if played.ID != "" && played.ID != t.ID {
+		t.PlayedID = played.ID
+	}
+	set := func(dst *string, v string) {
+		if v != "" {
+			*dst = v
+		}
+	}
+	set(&t.Title, played.Name)
+	set(&t.Artist, played.Artist)
+	set(&t.Album, played.Album)
+	set(&t.AlbumArtist, played.AlbumArtist)
+	set(&t.ArtworkURL, played.ArtworkURL)
+	if played.Duration > 0 {
+		t.DurationMS = played.Duration.Milliseconds()
+	}
+	if t.TrackNumber == 0 || it.Group.Spec.Kind != library.KindAlbum {
+		t.TrackNumber = played.TrackNumber
+	}
+	t.DiscNumber, t.Popularity = played.DiscNumber, played.Popularity
+	return t
 }

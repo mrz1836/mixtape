@@ -131,25 +131,27 @@ func checkEmbedCollection(t *testing.T, ref Ref, col Collection) {
 // so it must never panic, and a line is either an error or a snapshot,
 // never half of each.
 func FuzzParseSnapshot(f *testing.F) {
-	join := func(fields ...string) string { return strings.Join(fields, fieldSep) }
 	for _, line := range []string{
 		snapLine("playing", "spotify:track:"+testTrackID, "Never Gonna Give You Up", "Rick Astley", "12.345"),
 		snapLine("stopped", "", "", "", "missing value"),
 		snapLine("playing", "spotify:ad:000000012c91b4e1000000203d88d1ef", "Spotify", "", "1"),
 		snapLine("playing", "", "Advertisement", "", "1"),
-		join(markSnapshot, "paused", "100", "true", "false", "", "", "", "", "", "0", "0", "0", "0", "", "3,5"),
-		join(markSnapshot, "playing", "80", "false", "false", "spotify:track:"+testTrackID, "Song", "missing value",
+		scriptLine(markSnapshot, "paused", "100", "true", "false", "", "", "", "", "", "0", "0", "0", "0", "", "3,5"),
+		scriptLine(markSnapshot, "playing", "80", "false", "false", "spotify:track:"+testTrackID, "Song", "missing value",
 			"missing value", "missing value", "1000", "1", "1", "0", "", "1.5"),
 		// A duration past time.Duration's range once wrapped to a negative one.
-		join(markSnapshot, "playing", "80", "false", "false", "spotify:track:"+testTrackID, "Song", "", "", "",
+		scriptLine(markSnapshot, "playing", "80", "false", "false", "spotify:track:"+testTrackID, "Song", "", "", "",
 			"1e13", "1e12", "-1e12", "1", "", "1e308"),
 		markNotRunning,
-		join(markError, "-1743", "Not authorized."),
-		join(markError, "-600", "isn't running"),
-		join(markError, "-1728", "Can't get name."),
-		join(markError, "x", "odd"),
+		scriptLine(markError, "-1743", "Not authorized."),
+		scriptLine(markError, "-600", "isn't running"),
+		scriptLine(markError, "-1728", "Can't get name."),
+		scriptLine(markError, "x", "odd"),
+		scriptLine(markError, "0", "no number"),
+		scriptLine(markError, "-1743", ""),
+		scriptLine(markError, "-1712"),
 		"hello",
-		join(markSnapshot, "playing"),
+		scriptLine(markSnapshot, "playing"),
 		"",
 	} {
 		f.Add(line)

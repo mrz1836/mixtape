@@ -122,12 +122,13 @@ func TestHundredsOfCopiesAtTheStartDoNotHang(t *testing.T) {
 	_, res := s.run(singles(songA), Options{}, nil)
 	requireComplete(t, res)
 
-	// Alpha is in 135 playlists: 135 copies are queued before the session
-	// loop runs, far more than the worker's result buffer holds.
+	// Alpha is in more playlists than the worker's result buffer holds:
+	// every copy is queued before the session loop takes a result.
+	const lists = resultBuffer + 16
 	s.reopen()
 	s.resetEvents()
-	cols := make([]spotify.Collection, 0, 135)
-	for i := range 135 {
+	cols := make([]spotify.Collection, 0, lists)
+	for i := range lists {
 		cols = append(cols, s.playlist(fmt.Sprintf("pl%020d", i), fmt.Sprintf("List %d", i), true, songA))
 	}
 	done := make(chan Result, 1)
@@ -141,7 +142,7 @@ func TestHundredsOfCopiesAtTheStartDoNotHang(t *testing.T) {
 		t.Fatal("the session hung queueing copies")
 	}
 	requireComplete(t, res)
-	assert.Equal(t, 135, res.Counts.Copied)
+	assert.Equal(t, lists, res.Counts.Copied)
 }
 
 func TestOutputRateChangeReportedAsDeviceChangeKeepsRecording(t *testing.T) {

@@ -55,9 +55,11 @@ func writtenIlst(t *testing.T, file []byte) Tags {
 	require.NotNil(t, ilst, "Tag always writes an ilst")
 
 	var got Tags
-	require.NoError(t, walkChildren(ilst.payload(), func(b box) error {
+	for b, err := range childrenOf(ilst.payload()) {
+		require.NoError(t, err)
 		if a, ok := findTagAtom(b.typ); ok {
-			return readTagAtom(&got, a, b)
+			require.NoError(t, readTagAtom(&got, a, b))
+			continue
 		}
 		if ff, ok := parseFreeform(b); ok && string(b.typ[:]) == "----" && ff.mean == FreeformMean && ff.hasValue {
 			if got.Freeform == nil {
@@ -65,8 +67,7 @@ func writtenIlst(t *testing.T, file []byte) Tags {
 			}
 			got.Freeform[ff.name] = ff.value
 		}
-		return nil
-	}))
+	}
 	return got
 }
 
