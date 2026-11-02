@@ -86,10 +86,12 @@ type fakeSpotify struct {
 }
 
 // resumeSpot is where Spotify resumes: a track (the played one when "")
-// and a position.
+// and a position. Spotify holds the song at exactly 0:00 until it resumes,
+// unless moving: then it first plays a moment from the top.
 type resumeSpot struct {
-	track string
-	pos   time.Duration
+	track  string
+	pos    time.Duration
+	moving bool
 }
 
 func newFakeSpotify(now func() time.Time, tracks ...simTrack) *fakeSpotify {
@@ -260,7 +262,7 @@ func (f *fakeSpotify) PlayTrack(_ context.Context, uri, ctxURI string) error {
 	}
 	f.pos, f.playing = 0, f.idx < len(f.queue)
 	f.glitched = false
-	if f.resumeIn > 0 {
+	if f.resumeIn > 0 && !f.resumeTo.moving {
 		f.hold = time.Hour // as seen live: exactly 0:00 until the resume
 	}
 	return nil

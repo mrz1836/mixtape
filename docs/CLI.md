@@ -146,7 +146,7 @@ One compact JSON object per line on stdout, also appended to
 |---|---|---|
 | `session_started` | `mode`, `capture`, `library`, `pid` | The session began |
 | `plan` | `items[]` (as in the dry run) | What will happen |
-| `track_started` | `track` | A song began recording from the top; sent once Spotify is believably playing it, so a false start (Spotify resuming elsewhere first) sends nothing |
+| `track_started` | `track` | A song began recording from the top; sent once Spotify has played its first 2 seconds, so a false start (Spotify resuming elsewhere first) sends nothing |
 | `track_saved` | `track` with `file`, `recorded_ms`, `audio_sha256`, `partial` | A song is in the library |
 | `track_copied` | `track` with `file`, `copied_from` | A song was copied from another folder |
 | `track_skipped` | `track`, `reason` | Already done, or skipped by you |

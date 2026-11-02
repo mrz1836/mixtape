@@ -142,7 +142,7 @@ func (e *Engine) observe(ctx context.Context, s spotify.Snapshot) {
 		if e.cur == t {
 			e.checkResumed(ctx, t, s)
 		}
-		if e.cur == t && t.recording && e.believable(t) {
+		if e.cur == t && t.recording && e.started(t) {
 			e.announce(t)
 		}
 	}
@@ -210,7 +210,7 @@ func (e *Engine) plausible(t *take, at time.Time, pos float64) bool {
 func (e *Engine) checkResumed(ctx context.Context, t *take, s spotify.Snapshot) {
 	mid := e.plan.Mode != ModeLive && t.item != nil && t.item.state == itemPending && !t.ad && !e.stopping &&
 		s.State == spotify.StatePlaying && s.Position > e.tn.StartSlack.Seconds()+2*e.opts.Poll.Seconds() &&
-		!e.plausible(t, s.At, s.Position) && e.reached(t) < earlyRestart
+		!e.plausible(t, s.At, s.Position) && !e.started(t)
 	switch {
 	case !mid:
 		t.midSince = time.Time{}
@@ -362,13 +362,17 @@ func (e *Engine) adopt(t *take, it *Item, at time.Time) {
 	t.item, t.recording = it, true
 	e.waiting = nil
 	e.lastActive = at
-	if e.believable(t) {
+	if e.started(t) {
 		e.announce(t)
 	}
 }
 
-// announce emits track_started for t once. It waits until the song is
-// believably playing, so a false start leaves no trace.
+// started reports whether t's song has really begun: it believably played
+// earlyRestart seconds, past every kind of false start.
+func (e *Engine) started(t *take) bool { return e.reached(t) >= earlyRestart }
+
+// announce emits track_started for t once. It waits until the song has
+// really begun, so a false start leaves no trace.
 func (e *Engine) announce(t *take) {
 	if !t.announced {
 		t.announced = true
@@ -500,7 +504,7 @@ const maxFalseStarts = 3
 func (e *Engine) falseStart(t *take, seg Segment) bool {
 	it := t.item
 	if seg.Complete || t.userSkipped || t.invalid != "" || e.stopping || e.plan.Mode == ModeLive ||
-		e.reached(t) >= earlyRestart || it.falseStarts >= maxFalseStarts {
+		e.started(t) || it.falseStarts >= maxFalseStarts {
 		return false
 	}
 	it.falseStarts++

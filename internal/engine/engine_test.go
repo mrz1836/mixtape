@@ -410,38 +410,54 @@ func TestStalePositionAfterPlayIsAFalseStart(t *testing.T) {
 	assert.Empty(t, s.eventsOf(EventTrackDiscarded), "a stale position then 0 is not a failed take")
 }
 
+// Live, Spotify either holds the song at exactly 0:00 until it resumes, or
+// first plays a fraction of a second from the top (moving).
+func resumeStarts() map[string]bool {
+	return map[string]bool{"held at 0:00": false, "moving from 0:00": true}
+}
+
 func TestResumedSongIsStartedOverFromTheTop(t *testing.T) {
 	t.Parallel()
-	s := newSim(t, songA)
-	// Without a context, "play track" picks Alpha up where it was last left.
-	s.spotify.resume = map[string]resumeSpot{songA.id: {pos: 3 * time.Second}}
+	for name, moving := range resumeStarts() {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			s := newSim(t, songA)
+			// Without a context, "play track" picks Alpha up where it was last left.
+			s.spotify.resume = map[string]resumeSpot{songA.id: {pos: 3 * time.Second, moving: moving}}
 
-	_, res := s.run(singles(songA), Options{}, nil)
-	requireComplete(t, res)
-	assert.Equal(t, 1, res.Counts.Recorded)
-	assert.Empty(t, s.eventsOf(EventTrackDiscarded), "a resume is not a failed take")
-	assert.Len(t, s.eventsOf(EventTrackStarted), 1, "the abandoned take was never announced")
-	assert.Contains(t, s.spotify.Commands(), "seek", "the song is started over")
-	saved := s.eventsOf(EventTrackSaved)
-	require.Len(t, saved, 1)
-	assert.Equal(t, 1, saved[0].Track.Attempt, "the resume did not count as an attempt")
+			_, res := s.run(singles(songA), Options{}, nil)
+			requireComplete(t, res)
+			assert.Equal(t, 1, res.Counts.Recorded)
+			assert.Empty(t, s.eventsOf(EventTrackDiscarded), "a resume is not a failed take")
+			assert.Len(t, s.eventsOf(EventTrackStarted), 1, "the abandoned take was never announced")
+			assert.Contains(t, s.spotify.Commands(), "seek", "the song is started over")
+			saved := s.eventsOf(EventTrackSaved)
+			require.Len(t, saved, 1)
+			assert.Equal(t, 1, saved[0].Track.Attempt, "the resume did not count as an attempt")
+		})
+	}
 }
 
 func TestSpotifyResumingAnotherTrackIsAFalseStart(t *testing.T) {
 	t.Parallel()
-	s := newSim(t, songA, songB)
-	// As seen live: the first play resumes another track, mid-song, where
-	// Spotify last left it; it plays on until mixtape asks again.
-	s.spotify.resume = map[string]resumeSpot{songA.id: {track: songB.id, pos: 2500 * time.Millisecond}}
+	for name, moving := range resumeStarts() {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			s := newSim(t, songA, songB)
+			// As seen live: the first play resumes another track, mid-song,
+			// where Spotify last left it; it plays on until mixtape asks again.
+			s.spotify.resume = map[string]resumeSpot{songA.id: {track: songB.id, pos: 2500 * time.Millisecond, moving: moving}}
 
-	_, res := s.run(singles(songA), Options{}, nil)
-	requireComplete(t, res)
-	assert.Equal(t, 1, res.Counts.Recorded)
-	assert.Empty(t, s.eventsOf(EventTrackDiscarded), "a false start is not a failed take")
-	assert.Len(t, s.eventsOf(EventTrackStarted), 1, "a false start leaves no trace")
-	saved := s.eventsOf(EventTrackSaved)
-	require.Len(t, saved, 1)
-	assert.Equal(t, 1, saved[0].Track.Attempt)
+			_, res := s.run(singles(songA), Options{}, nil)
+			requireComplete(t, res)
+			assert.Equal(t, 1, res.Counts.Recorded)
+			assert.Empty(t, s.eventsOf(EventTrackDiscarded), "a false start is not a failed take")
+			assert.Len(t, s.eventsOf(EventTrackStarted), 1, "a false start leaves no trace")
+			saved := s.eventsOf(EventTrackSaved)
+			require.Len(t, saved, 1)
+			assert.Equal(t, 1, saved[0].Track.Attempt)
+		})
+	}
 }
 
 func TestNextTrackBlipIsIgnored(t *testing.T) {
