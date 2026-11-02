@@ -424,6 +424,7 @@ func TestSetupFallsBackToBlackHoleWhenTheTapIsSilent(t *testing.T) {
 	h := newHarness(t)
 	h.deps.stdinTTY, h.deps.stdoutTTY = true, true
 	h.world.output = device.Info{Name: "Multi-Output Device", Output: true, DefaultOutput: true}
+	h.world.player.snap.State = spotify.StatePlaying // Spotify plays; the tap still hears nothing
 	h.deps.services.openCapture = func(r captureRequest) (capture.Source, error) {
 		if r.Method == capture.MethodTap {
 			return &nopSource{}, nil // a tap without permission hears nothing
@@ -505,4 +506,36 @@ func TestSetupOpensSettingsAndWaitsForTheTapPermission(t *testing.T) {
 	assert.Contains(t, out, "iTerm may now record system audio")
 	assert.Contains(t, out, "saved capture = tap")
 	assert.Contains(t, h.world.scripts, "open "+permission.SettingsURL(permission.SystemAudio))
+}
+
+func TestSetupPlaysSpotifyForTheTestCapture(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	h.deps.stdinTTY, h.deps.stdoutTTY = true, true
+	h.world.player.snap = spotify.Snapshot{
+		State: spotify.StatePaused, Volume: 100,
+		Track: spotify.Track{URI: "spotify:track:" + trkA, Name: "Never Gonna Give You Up"},
+	}
+	h.deps.services.openCapture = func(captureRequest) (capture.Source, error) { return &loudSource{}, nil }
+
+	require.Equal(t, ExitOK, h.run("setup", "--yes"), h.stderr.String())
+	assert.Contains(t, h.stdout.String(), `Playing "Never Gonna Give You Up" in Spotify for a 4-second test`)
+	cmds := h.world.player.Commands()
+	assert.Contains(t, cmds, "play")
+	assert.Equal(t, "pause", cmds[len(cmds)-1], "Spotify is paused again after the test")
+}
+
+func TestSetupSilentWhilePausedIsNotBlamedOnThePermission(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	h.deps.stdinTTY, h.deps.stdoutTTY = true, true
+	// The player stays paused whatever mixtape asks, and the capture is silent.
+	h.world.player.snap = spotify.Snapshot{
+		State: spotify.StatePaused, Volume: 100,
+		Track: spotify.Track{URI: "spotify:track:" + trkA, Name: "Song"},
+	}
+
+	require.Equal(t, ExitError, h.run("setup", "--yes"))
+	assert.Contains(t, h.stderr.String(), "spotify was not playing during the test")
+	assert.NotContains(t, h.stdout.String(), "quit and reopen", "no permission advice for an idle player")
 }

@@ -18,7 +18,10 @@ import (
 	"github.com/mrz1836/mixtape/internal/spotify"
 )
 
-var errProbeSilent = errors.New("captured only silence")
+var (
+	errProbeSilent = errors.New("captured only silence while Spotify played")
+	errNotPlaying  = errors.New("spotify was not playing during the test")
+)
 
 type devicesDoc struct {
 	Tap           capture.TapStatus `json:"tap"`
@@ -270,6 +273,9 @@ func (s *setupFlow) chooseCapture(ctx context.Context, settings config.Settings)
 			}
 			app := a.deps.services.hostApp()
 			s.say("%s the tap test failed: %v", a.out.paint(colorRed, "✗"), err)
+			if errors.Is(err, errNotPlaying) {
+				return "", fmt.Errorf("%w: play a song in Spotify and run 'mixtape setup' again", err)
+			}
 			if errors.Is(err, errProbeSilent) {
 				s.say("  Make sure %s is switched on under %s.\n"+
 					"  If it is, quit and reopen %s (macOS applies the permission to new launches),\n"+
@@ -401,19 +407,38 @@ func (a *app) routingCheck(s config.Settings) check {
 }
 
 // verify captures a few seconds while Spotify plays and requires audio.
+// It starts playback itself when Spotify is paused (and pauses again after),
+// so a silent result means the capture, not an idle player.
 func (s *setupFlow) verify(ctx context.Context, r captureRequest) error {
-	s.pause("Start playing a song in Spotify (any song), then press Enter to test the capture.")
+	svc := s.a.deps.services
+	p := svc.player()
+	snap := p.Poll(ctx)
+	switch {
+	case snap.Err != nil || snap.Track.URI == "":
+		s.pause("Start playing a song in Spotify (any song), then press Enter to test the capture.")
+	case snap.State != spotify.StatePlaying:
+		s.say("Playing %q in Spotify for a 4-second test…", snap.Track.Name)
+		if err := p.Play(ctx); err != nil {
+			s.pause("Start playing a song in Spotify (any song), then press Enter to test the capture.")
+		} else {
+			defer func() { _ = p.Pause(context.WithoutCancel(ctx)) }()
+			svc.sleep(ctx, time.Second) // let the audio start
+		}
+	}
 	s.say("Listening for 4 seconds…")
-	src, err := s.a.deps.services.openCapture(r)
+	src, err := svc.openCapture(r)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = src.Close() }()
-	peak, err := probe(ctx, src, 4*time.Second, s.a.deps.services.sleep)
+	peak, err := probe(ctx, src, 4*time.Second, svc.sleep)
 	if err != nil {
 		return err
 	}
 	if peak <= 64 {
+		if after := p.Poll(ctx); after.Err == nil && after.State != spotify.StatePlaying {
+			return errNotPlaying
+		}
 		return errProbeSilent
 	}
 	s.say("%s heard audio (peak level %d)", s.a.out.paint(colorGreen, "✓"), peak)
