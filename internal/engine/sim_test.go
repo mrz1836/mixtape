@@ -3,11 +3,11 @@ package engine
 import (
 	"cmp"
 	"context"
-	"crypto/sha256"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -21,6 +21,7 @@ import (
 	"github.com/mrz1836/mixtape/internal/library"
 	"github.com/mrz1836/mixtape/internal/session"
 	"github.com/mrz1836/mixtape/internal/spotify"
+	"github.com/mrz1836/mixtape/internal/testutil"
 	"github.com/mrz1836/mixtape/internal/wav"
 )
 
@@ -99,6 +100,11 @@ type resumeSpot struct {
 	track  string
 	pos    time.Duration
 	moving bool
+}
+
+// longSong is a song long enough for setbacks to be measured.
+func longSong(id string, dur time.Duration) simTrack {
+	return simTrack{id: id, name: "Song " + id[len(id)-3:], artist: "X", dur: dur}
 }
 
 func newFakeSpotify(now func() time.Time, tracks ...simTrack) *fakeSpotify {
@@ -234,6 +240,17 @@ func (f *fakeSpotify) Commands() []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]string(nil), f.commands...)
+}
+
+// plays counts the "play track" commands from the from'th command on.
+func (f *fakeSpotify) plays(from int) int {
+	n := 0
+	for _, c := range f.Commands()[from:] {
+		if strings.HasPrefix(c, "play ") {
+			n++
+		}
+	}
+	return n
 }
 
 func (f *fakeSpotify) Poll(context.Context) spotify.Snapshot { return f.snapshot() }
@@ -372,7 +389,8 @@ func (f *fakeSpotify) user(fn func(f *fakeSpotify)) {
 	fn(f)
 }
 
-// fakeSource is a capture source the driver feeds.
+// fakeSource is a capture source the test feeds: the simulator's driver,
+// or a golden trace's audio slices.
 type fakeSource struct {
 	mu     sync.Mutex
 	sink   func(capture.Block)
@@ -380,6 +398,9 @@ type fakeSource struct {
 	silent bool
 	rate   int // capture rate; 0 is testRate
 }
+
+// loudLevel is the sample level of the audio a playing song delivers.
+const loudLevel = 3000
 
 func newFakeSource() *fakeSource { return &fakeSource{events: make(chan capture.Event, 4)} }
 
@@ -400,56 +421,70 @@ func (s *fakeSource) Start(_ context.Context, sink func(capture.Block)) error {
 	return nil
 }
 
-// emit delivers frames captured at t; loud frames carry a constant level.
+// emit delivers frames captured at t; loud frames carry loudLevel.
 func (s *fakeSource) emit(frames int, t time.Time, loud bool) {
+	level := 0
+	if loud {
+		level = loudLevel
+	}
+	s.emitLevel(frames, level, t)
+}
+
+// emitLevel delivers frames captured at t whose every sample is level
+// (silence while the source is silent). Before Start it does nothing.
+func (s *fakeSource) emitLevel(frames, level int, t time.Time) {
 	s.mu.Lock()
 	sink, silent := s.sink, s.silent
 	s.mu.Unlock()
 	if sink == nil {
 		return
 	}
-	pcm := make([]byte, frames*4)
-	if loud && !silent {
-		for i := 0; i < len(pcm); i += 2 {
-			binary.LittleEndian.PutUint16(pcm[i:], 3000)
+	pcm := make([]byte, frames*s.Format().BytesPerFrame())
+	if level > 0 && !silent {
+		v := uint16(min(level, math.MaxInt16))
+		for i := 0; i+1 < len(pcm); i += 2 {
+			binary.LittleEndian.PutUint16(pcm[i:], v)
 		}
 	}
 	sink(capture.Block{PCM: pcm, Frames: frames, At: t})
 }
 
-// fakeEncoder writes a minimal valid M4A whose audio payload is derived
-// from the WAV, and records how many frames each WAV held.
-type fakeEncoder struct {
-	mu     sync.Mutex
-	frames map[string]int64 // output base name → frames
-	fail   bool
+// started reports whether the engine started the capture.
+func (s *fakeSource) started() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.sink != nil
 }
 
-func (e *fakeEncoder) Encode(_ context.Context, wavPath, m4aPath string) error {
-	data, err := os.ReadFile(wavPath)
+// stereoBytesPerFrame is the frame size of every WAV the tests render.
+const stereoBytesPerFrame = 4
+
+// fakeEncoder stands in for afconvert (see testutil.Encoder) and records
+// how many frames each WAV held.
+type fakeEncoder struct {
+	testutil.Encoder
+
+	mu     sync.Mutex
+	frames map[string]int64 // output base name → frames
+}
+
+func newFakeEncoder() *fakeEncoder { return &fakeEncoder{frames: map[string]int64{}} }
+
+func (e *fakeEncoder) Encode(ctx context.Context, wavPath, m4aPath string) error {
+	info, err := os.Stat(wavPath)
 	if err != nil {
 		return err
 	}
-	e.mu.Lock()
-	fail := e.fail
-	e.mu.Unlock()
-	if fail {
-		return errTestEncode
-	}
-	sum := sha256.Sum256(data)
-	out := mp4Box("ftyp", []byte("M4A \x00\x00\x02\x00M4A mp42isom"))
-	out = append(out, mp4Box("moov", mp4Box("mvhd", make([]byte, 100)))...)
-	out = append(out, mp4Box("mdat", sum[:])...)
-	if err := os.WriteFile(m4aPath, out, 0o600); err != nil {
+	if err := e.Encoder.Encode(ctx, wavPath, m4aPath); err != nil {
 		return err
 	}
 	e.mu.Lock()
-	e.frames[filepath.Base(m4aPath)] = int64(len(data)-wav.HeaderSize) / 4
-	e.mu.Unlock()
+	defer e.mu.Unlock()
+	e.frames[filepath.Base(m4aPath)] = (info.Size() - wav.HeaderSize) / stereoBytesPerFrame
 	return nil
 }
 
-// lastFrames is the frame count of the most recent encode.
+// totalFrames is the frame count of every encode, in no order.
 func (e *fakeEncoder) totalFrames() []int64 {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -458,13 +493,6 @@ func (e *fakeEncoder) totalFrames() []int64 {
 		out = append(out, n)
 	}
 	return out
-}
-
-func mp4Box(typ string, payload []byte) []byte {
-	b := make([]byte, 8, 8+len(payload))
-	binary.BigEndian.PutUint32(b, uint32(8+len(payload)))
-	copy(b[4:], typ)
-	return append(b, payload...)
 }
 
 // sim is one simulated session: clock, Spotify, capture and library.
@@ -496,7 +524,7 @@ func newSim(t *testing.T, tracks ...simTrack) *sim {
 	s.start = s.clock
 	s.spotify = newFakeSpotify(s.now, tracks...)
 	s.source = newFakeSource()
-	s.enc = &fakeEncoder{frames: map[string]int64{}}
+	s.enc = newFakeEncoder()
 	s.root, s.home = t.TempDir(), t.TempDir()
 	s.reopen()
 	t.Cleanup(func() {

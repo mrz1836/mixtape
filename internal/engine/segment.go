@@ -192,8 +192,10 @@ func Segmentize(tl Timeline, clock Clock, rate int, first int64, tn Tuning) Segm
 	for i := range runs {
 		r := &runs[i]
 		a := r.anchor()
-		start := runStart(runs, i)
-		end := runEnd(tl, runs, i, dur, tn)
+		start := runStart(runs, i, tn)
+		// A run can seem to end before it starts (a seek past the reported
+		// duration): it holds no audio, and must not shorten Covered.
+		end := max(runEnd(tl, runs, i, dur, tn), start)
 		if i == 0 {
 			seg.Anchor = int64(math.Round(a))
 			if start > tn.StartSlack.Seconds() {
@@ -316,12 +318,12 @@ func recentAnchor(r *run) float64 {
 }
 
 // runStart is the song position where run i began.
-func runStart(runs []run, i int) float64 {
+func runStart(runs []run, i int, tn Tuning) float64 {
 	r := runs[i]
 	s0 := r.samples[0]
-	if i > 0 && runs[i-1].pauseAt >= 0 && !runs[i-1].seekEnd {
+	if p := runs[max(i-1, 0)]; i > 0 && p.pauseAt >= 0 && !p.seekEnd && resumedInPlace(p.pauseAt, s0, r.before, tn) {
 		// Resumed after a pause: playback continues from the paused position.
-		return runs[i-1].pauseAt
+		return p.pauseAt
 	}
 	start := s0.pos
 	if !r.before.IsZero() {
@@ -331,6 +333,20 @@ func runStart(runs []run, i int) float64 {
 		start = s0.pos - s0.at.Sub(runs[i-1].samples[len(runs[i-1].samples)-1].at).Seconds()
 	}
 	return max(start, 0)
+}
+
+// resumedInPlace reports whether playback after a pause picked up where it
+// paused: the first position is the paused one, plus at most the time
+// since the observation before it (and a little slack either way).
+// Anywhere else, the listener moved the slider while paused, and the run
+// starts where its own positions say.
+func resumedInPlace(pauseAt float64, s0 sample, before time.Time, tn Tuning) bool {
+	elapsed := 0.0
+	if !before.IsZero() {
+		elapsed = s0.at.Sub(before).Seconds()
+	}
+	d := s0.pos - pauseAt
+	return d >= -tn.Gap.Seconds() && d <= elapsed+tn.Gap.Seconds()
 }
 
 // runEnd is the song position where run i ended.

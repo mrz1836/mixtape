@@ -100,8 +100,10 @@ func TestAfconvertAccepts(t *testing.T) {
 	require.NoError(t, Write(f, sine(0.25), testRate, testChans))
 	require.NoError(t, f.Close())
 
-	out := filepath.Join(dir, "out.m4a")
-	cmd := exec.CommandContext(t.Context(), "afconvert", in, out, "-f", "m4af", "-d", "aac")
+	// Reading the header is the point, so the output is plain PCM: unlike
+	// AAC, it needs no encoder the sandbox could hide.
+	out := filepath.Join(dir, "out.caf")
+	cmd := exec.CommandContext(t.Context(), "afconvert", in, out, "-f", "caff", "-d", "LEI16")
 	b, err := cmd.CombinedOutput()
 	require.NoError(t, err, string(b))
 	info, err := os.Stat(out)

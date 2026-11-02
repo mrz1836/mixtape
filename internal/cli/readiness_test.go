@@ -13,18 +13,6 @@ import (
 
 var errProcessList = errors.New("list processes: operation not permitted")
 
-// findCheck returns the doctor check with id.
-func findCheck(t *testing.T, doc map[string]any, id string) map[string]any {
-	t.Helper()
-	for _, c := range doc["checks"].([]any) {
-		if m := c.(map[string]any); m["id"] == id {
-			return m
-		}
-	}
-	require.Failf(t, "no such check", "%q in %v", id, doc["checks"])
-	return nil
-}
-
 func TestDoctorSaysWhenItCannotCheckSpotify(t *testing.T) {
 	t.Parallel()
 	h := newHarness(t)
@@ -54,9 +42,9 @@ func TestRecordGoesOnWhenSpotifyCannotBeChecked(t *testing.T) {
 func TestSetupSaysWhenItCannotCheckSpotify(t *testing.T) {
 	t.Parallel()
 	h := newHarness(t)
-	h.deps.stdinTTY, h.deps.stdoutTTY = true, true
+	h.interactive()
 	h.world.running, h.world.runningErr = false, errProcessList
-	h.deps.services.openCapture = func(captureRequest) (capture.Source, error) { return &loudSource{}, nil }
+	h.loudCapture()
 
 	require.Equal(t, ExitOK, h.run("setup", "--yes"), h.stderr.String())
 	assert.Contains(t, h.stdout.String(), "could not check Spotify: "+errProcessList.Error())
@@ -66,7 +54,7 @@ func TestSetupSaysWhenItCannotCheckSpotify(t *testing.T) {
 func TestSetupReportsADeviceListingFailure(t *testing.T) {
 	t.Parallel()
 	h := newHarness(t)
-	h.deps.stdinTTY, h.deps.stdoutTTY = true, true
+	h.interactive()
 	h.world.tap = capture.TapStatus{Reason: "macOS 13"}
 	h.world.devicesErr = errors.New("core audio: no devices") //nolint:err113 // a one-off test failure
 

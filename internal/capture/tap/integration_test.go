@@ -14,7 +14,6 @@ package tap
 import (
 	"context"
 	"encoding/binary"
-	"os"
 	"sync"
 	"testing"
 	"time"
@@ -23,11 +22,12 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/mrz1836/mixtape/internal/capture"
+	"github.com/mrz1836/mixtape/internal/testutil"
 )
 
 func TestIntegrationSpotifyProcesses(t *testing.T) {
 	t.Parallel()
-	requireLive(t)
+	testutil.RequireLive(t)
 	procs, err := SpotifyProcesses()
 	require.NoError(t, err)
 	for _, p := range procs {
@@ -37,7 +37,7 @@ func TestIntegrationSpotifyProcesses(t *testing.T) {
 
 func TestIntegrationTapRecords(t *testing.T) {
 	t.Parallel()
-	requireLive(t)
+	testutil.RequireLive(t)
 	src, err := Open(Options{Wait: 5 * time.Second})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = src.Close() })
@@ -80,13 +80,5 @@ func TestIntegrationTapRecords(t *testing.T) {
 	assert.Positive(t, frames, "the tap delivers audio callbacks")
 	if peak == 0 {
 		t.Log("all zeros: Spotify paused, or the host app lacks the System Audio Recording permission")
-	}
-}
-
-// requireLive skips unless live capture tests were asked for explicitly.
-func requireLive(t *testing.T) {
-	t.Helper()
-	if os.Getenv("MIXTAPE_LIVE_CAPTURE") != "1" {
-		t.Skip("live capture test: set MIXTAPE_LIVE_CAPTURE=1 (needs Spotify playing and the owner present)")
 	}
 }

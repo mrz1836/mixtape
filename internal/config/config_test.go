@@ -8,6 +8,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/mrz1836/mixtape/internal/testutil"
 )
 
 const testHome = "/Users/test"
@@ -15,8 +17,6 @@ const testHome = "/Users/test"
 func env(m map[string]string) func(string) string {
 	return func(k string) string { return m[k] }
 }
-
-func ptr[T any](v T) *T { return &v }
 
 func TestResolveDefaults(t *testing.T) {
 	t.Parallel()
@@ -36,13 +36,13 @@ func TestResolveDefaults(t *testing.T) {
 func TestResolvePrecedence(t *testing.T) {
 	t.Parallel()
 	f := File{
-		Library:     ptr("~/Archive"),
-		Capture:     ptr("device"),
-		Artwork:     ptr(true),
-		IdleTimeout: ptr("5m"),
+		Library:     testutil.Ptr("~/Archive"),
+		Capture:     testutil.Ptr("device"),
+		Artwork:     testutil.Ptr(true),
+		IdleTimeout: testutil.Ptr("5m"),
 	}
 	e := env(map[string]string{EnvCapture: "TAP", EnvDevice: "Loopback"})
-	o := Overrides{Library: ptr("/Volumes/Ext/Music"), IdleTimeout: ptr(time.Duration(0))}
+	o := Overrides{Library: testutil.Ptr("/Volumes/Ext/Music"), IdleTimeout: testutil.Ptr(time.Duration(0))}
 
 	s, err := Resolve(f, e, o, testHome)
 	require.NoError(t, err)
@@ -64,12 +64,12 @@ func TestResolveInvalid(t *testing.T) {
 		file File
 		env  map[string]string
 	}{
-		"bad capture in file":   {file: File{Capture: ptr("blackhole")}},
+		"bad capture in file":   {file: File{Capture: testutil.Ptr("blackhole")}},
 		"bad duration in env":   {env: map[string]string{EnvIdleTimeout: "soon"}},
 		"negative duration":     {env: map[string]string{EnvIdleTimeout: "-1m"}},
 		"bad bool in env":       {env: map[string]string{EnvArtwork: "maybe"}},
-		"empty library in file": {file: File{Library: ptr("  ")}},
-		"empty device in file":  {file: File{Device: ptr("")}},
+		"empty library in file": {file: File{Library: testutil.Ptr("  ")}},
+		"empty device in file":  {file: File{Device: testutil.Ptr("")}},
 	}
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -143,10 +143,10 @@ func TestMaxFailures(t *testing.T) {
 	assert.Equal(t, DefaultMaxFailures, s.MaxFailures)
 	assert.Equal(t, "3", s.Value(KeyMaxFailures))
 
-	s, err = Resolve(File{MaxFailures: ptr(5)}, env(map[string]string{EnvMaxFailures: "2"}), Overrides{}, testHome)
+	s, err = Resolve(File{MaxFailures: testutil.Ptr(5)}, env(map[string]string{EnvMaxFailures: "2"}), Overrides{}, testHome)
 	require.NoError(t, err)
 	assert.Equal(t, 2, s.MaxFailures, "env beats file")
-	s, err = Resolve(File{MaxFailures: ptr(5)}, env(nil), Overrides{MaxFailures: ptr(0)}, testHome)
+	s, err = Resolve(File{MaxFailures: testutil.Ptr(5)}, env(nil), Overrides{MaxFailures: testutil.Ptr(0)}, testHome)
 	require.NoError(t, err)
 	assert.Equal(t, 0, s.MaxFailures, "a flag beats both; 0 means never")
 	assert.Equal(t, SourceFlag, s.Sources[KeyMaxFailures])

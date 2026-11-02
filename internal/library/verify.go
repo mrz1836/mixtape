@@ -101,7 +101,9 @@ func (l *Library) Verify(ctx context.Context, fix, force bool) (Report, error) {
 			e := &c.Manifest.Tracks[i]
 			p := Problem{Collection: c.Folder(), File: e.File, TrackID: e.RequestedID}
 			if !e.Status.Done() {
-				if f, ok := files[c.Path(e)]; ok && f.readErr == nil && e.Status != StatusRemoved && taggedFor(f.tags, e) {
+				// Changed audio stays pending (see the hash check below), as
+				// reconcile leaves it: a second --fix must not take it back.
+				if f, ok := files[c.Path(e)]; ok && f.readErr == nil && e.Status != StatusRemoved && taggedFor(f.tags, e) && f.intact() {
 					p.Kind, p.Detail = ProblemStatusMismatch, fmt.Sprintf("file exists but status is %s", e.Status)
 					hash := f.hash
 					found = append(found, pending{p, func() { e.Status, e.AudioSHA256, e.FailReason = StatusRecorded, hash, "" }})
@@ -112,7 +114,6 @@ func (l *Library) Verify(ctx context.Context, fix, force bool) (Report, error) {
 			r.Files++
 			f, ok := files[c.Path(e)]
 			if !ok {
-				missing++
 				if moved := unreferencedByHash[e.AudioSHA256]; e.AudioSHA256 != "" && len(moved) > 0 {
 					to := moved[0]
 					claimed[to] = true
@@ -126,6 +127,7 @@ func (l *Library) Verify(ctx context.Context, fix, force bool) (Report, error) {
 					}
 					continue
 				}
+				missing++ // a song found elsewhere proves the drive is mounted: only lost ones count
 				p.Kind, p.Detail = ProblemMissing, "file not found; the next run records it again"
 				found = append(found, pending{p, func() {
 					e.Status, e.File, e.AudioSHA256, e.Partial = StatusPending, "", "", false
@@ -194,6 +196,13 @@ func (l *Library) Verify(ctx context.Context, fix, force bool) (Report, error) {
 		}
 	}
 	return r, nil
+}
+
+// intact reports whether a readable file's audio matches its own hash tag
+// (a file without one, tagged by another tool, counts as intact).
+func (f audioFile) intact() bool {
+	tagged := f.tags.Freeform[TagAudioSHA256]
+	return tagged == "" || tagged == f.hash
 }
 
 // scanAudio reads the tags and audio hash of every .m4a under the root.

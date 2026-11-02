@@ -15,8 +15,9 @@ const taggingTempPrefix = ".tagging-"
 // reconcile adopts files that exist for entries the manifest does not yet
 // count as done: the crash window between a file's rename into place and
 // the manifest write. A file is adopted only when its own SPOTIFY_ID (or
-// SPOTIFY_REQUESTED_ID) tag names the entry. It changes c in memory and
-// reports whether anything changed; Lock persists it.
+// SPOTIFY_REQUESTED_ID) tag names the entry and its audio is intact. It
+// changes c in memory and reports whether anything changed; Lock persists
+// it.
 func (l *Library) reconcile(c *Collection) bool {
 	var open []int
 	referenced := map[string]bool{}
@@ -35,17 +36,24 @@ func (l *Library) reconcile(c *Collection) bool {
 	}
 
 	changed := false
-	adopt := func(i int, name string, tags mp4tag.Tags) {
+	adopt := func(i int, name string, tags mp4tag.Tags) bool {
 		e := &c.Manifest.Tracks[i]
-		hash := tags.Freeform[TagAudioSHA256]
-		if hash == "" {
-			var err error
-			if hash, err = mp4tag.HashFile(filepath.Join(c.Dir, name)); err != nil {
-				return
-			}
+		// A file from the crash window always matches its own hash tag. One
+		// that does not (or cannot be hashed) is a song verify sent back to
+		// pending for changed or truncated audio: it must be recorded again,
+		// not adopted on the next Open.
+		hash, err := mp4tag.HashFile(filepath.Join(c.Dir, name))
+		if err != nil {
+			return false
+		}
+		if tagged := tags.Freeform[TagAudioSHA256]; tagged != "" && tagged != hash {
+			return false
 		}
 		if e.PendingWAV != "" {
 			c.staleWAVs = append(c.staleWAVs, e.PendingWAV) // Lock removes it: Open must not write
+		}
+		if played := tags.Freeform[TagSpotifyID]; played != "" && played != e.RequestedID {
+			e.PlayedID = played // the relink the lost manifest write held
 		}
 		e.Status, e.File, e.AudioSHA256 = StatusRecorded, name, hash
 		e.Partial = tags.Freeform[TagPartial] == "1"
@@ -53,6 +61,7 @@ func (l *Library) reconcile(c *Collection) bool {
 		referenced[strings.ToLower(name)] = true
 		changed = true
 		l.warn("%s: found %s on disk; marked it recorded", c.Folder(), name)
+		return true
 	}
 
 	// First the name each entry has or would get.
@@ -63,8 +72,7 @@ func (l *Library) reconcile(c *Collection) bool {
 		if name == "" {
 			name = trackFileName(c.Manifest.Kind, e.Position, e.Artist, e.Title)
 		}
-		if tags, err := mp4tag.ReadFile(filepath.Join(c.Dir, name)); err == nil && taggedFor(tags, e) {
-			adopt(i, name, tags)
+		if tags, err := mp4tag.ReadFile(filepath.Join(c.Dir, name)); err == nil && taggedFor(tags, e) && adopt(i, name, tags) {
 			continue
 		}
 		rest = append(rest, i)
@@ -88,8 +96,7 @@ func (l *Library) reconcile(c *Collection) bool {
 			continue
 		}
 		for k, i := range rest {
-			if taggedFor(tags, &c.Manifest.Tracks[i]) {
-				adopt(i, name, tags)
+			if taggedFor(tags, &c.Manifest.Tracks[i]) && adopt(i, name, tags) {
 				rest = append(rest[:k], rest[k+1:]...)
 				break
 			}

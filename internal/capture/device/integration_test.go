@@ -22,11 +22,12 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/mrz1836/mixtape/internal/capture"
+	"github.com/mrz1836/mixtape/internal/testutil"
 )
 
 func TestIntegrationDeviceRecords(t *testing.T) {
 	t.Parallel()
-	requireLive(t)
+	testutil.RequireLive(t)
 	name := os.Getenv("MIXTAPE_TEST_DEVICE")
 	if name == "" {
 		name = "BlackHole"
@@ -63,12 +64,4 @@ func TestIntegrationDeviceRecords(t *testing.T) {
 	defer mu.Unlock()
 	t.Logf("%d frames (%.2fs), peak %d, largest block gap %v", frames, float64(frames)/float64(f.Rate), peak, maxGap)
 	assert.Positive(t, frames)
-}
-
-// requireLive skips unless live capture tests were asked for explicitly.
-func requireLive(t *testing.T) {
-	t.Helper()
-	if os.Getenv("MIXTAPE_LIVE_CAPTURE") != "1" {
-		t.Skip("live capture test: set MIXTAPE_LIVE_CAPTURE=1 (needs Spotify playing and the owner present)")
-	}
 }

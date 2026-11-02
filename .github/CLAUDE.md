@@ -45,6 +45,7 @@ stores it in a library with manifests, `.m3u8` playlists and audio hashes.
 | `internal/permission` | macOS privacy permissions of the host app: check, prompt, Settings deep links (C) |
 | `internal/fileutil` | atomic writes and copies |
 | `internal/wav` | PCM16 WAV header |
+| `internal/testutil` | test-only: synthetic M4A/WAV files, a stand-in encoder, AAC and live-capture skips |
 
 <br>
 

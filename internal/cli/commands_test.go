@@ -1,9 +1,7 @@
 package cli
 
 import (
-	"bufio"
-	"bytes"
-	"encoding/json"
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -13,13 +11,11 @@ import (
 	"testing"
 	"time"
 
-	selfupdate "github.com/mrz1836/go-selfupdate"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/mrz1836/mixtape/internal/capture"
 	"github.com/mrz1836/mixtape/internal/capture/device"
-	"github.com/mrz1836/mixtape/internal/capture/tap"
 	"github.com/mrz1836/mixtape/internal/config"
 	"github.com/mrz1836/mixtape/internal/engine"
 	"github.com/mrz1836/mixtape/internal/library"
@@ -40,19 +36,6 @@ func songs() []spotify.CatalogTrack {
 		{ID: trkA, Title: "Never Gonna Give You Up", Artist: "Rick Astley", Duration: 213 * time.Second},
 		{ID: trkB, Title: "Second", Artist: "Someone", Duration: 180 * time.Second},
 	}
-}
-
-// ndjson decodes stdout as an event stream.
-func (h *harness) ndjson() []engine.Event {
-	h.t.Helper()
-	var out []engine.Event
-	sc := bufio.NewScanner(bytes.NewReader(h.stdout.Bytes()))
-	for sc.Scan() {
-		var ev engine.Event
-		require.NoError(h.t, json.Unmarshal(sc.Bytes(), &ev), "line: %s", sc.Text())
-		out = append(out, ev)
-	}
-	return out
 }
 
 func TestRecordDryRun(t *testing.T) {
@@ -112,23 +95,25 @@ func TestRecordNotFoundLink(t *testing.T) {
 func TestRecordNotReady(t *testing.T) {
 	t.Parallel()
 	tests := map[string]struct {
-		setup func(w *fakeWorld)
+		setup func(h *harness)
 		want  string
 	}{
-		"crossfade on":      {func(w *fakeWorld) { w.prefs.Crossfade, w.prefs.CrossfadeSeconds = true, 6.658 }, "Crossfade songs"},
-		"spotify stopped":   {func(w *fakeWorld) { w.running = false }, "open -a Spotify"},
-		"spotify missing":   {func(w *fakeWorld) { w.installed = false }, "spotify.com/download"},
-		"tap but not mac14": {func(w *fakeWorld) { w.tap = capture.TapStatus{Reason: "old macOS"} }, ""},
+		"crossfade on": {func(h *harness) {
+			h.world.prefs.Crossfade, h.world.prefs.CrossfadeSeconds = true, 6.658
+		}, "Crossfade songs"},
+		"spotify stopped": {func(h *harness) { h.world.running = false }, "open -a Spotify"},
+		"spotify missing": {func(h *harness) { h.world.installed = false }, "spotify.com/download"},
+		"tap but not mac14": {func(h *harness) {
+			h.world.tap = capture.TapStatus{Reason: "old macOS"}
+			h.env["MIXTAPE_CAPTURE"] = "tap"
+		}, ""},
 	}
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 			h := newHarness(t)
 			h.world.addPlaylist("List", songs()...)
-			tc.setup(h.world)
-			if name == "tap but not mac14" {
-				h.env["MIXTAPE_CAPTURE"] = "tap"
-			}
+			tc.setup(h)
 			assert.Equal(t, ExitNotReady, h.run("record", plURL))
 			e := h.errDoc()
 			assert.Equal(t, "not_ready", e["code"])
@@ -164,9 +149,7 @@ func TestRecordEverythingDoneNeedsNoPlayback(t *testing.T) {
 	h := newHarness(t)
 	ref := h.world.addPlaylist("Done List", songs()...)
 	spec := library.Spec{Kind: library.KindPlaylist, SpotifyID: ref.ID, Name: "Done List"}
-	for _, s := range songs() {
-		recordDone(t, h.env["MIXTAPE_LIBRARY"], spec, library.Track{ID: s.ID, Title: s.Title, Artist: s.Artist, DurationMS: s.Duration.Milliseconds()})
-	}
+	h.seedLibrary(spec, songs()...)
 	h.world.running = false // not even needed
 
 	require.Equal(t, ExitOK, h.run("record", plURL))
@@ -246,10 +229,7 @@ func TestStopRacingTheSessionsEndReportsItsResult(t *testing.T) {
 	t.Parallel()
 	h := newHarness(t)
 	home := h.env["MIXTAPE_HOME"]
-	lock, err := session.Acquire(h.world.lockPath, session.LockInfo{PID: 4242, SessionID: "s1", Home: home})
-	require.NoError(t, err)
-	st := session.State{ID: "s1", PID: 4242, Phase: session.PhaseRecording, StartedAt: h.now()}
-	require.NoError(t, session.WriteState(home, st))
+	lock, st := h.runningSession()
 
 	// The session finishes on its own just before the signal arrives.
 	h.world.onKill = func(int) {
@@ -266,23 +246,13 @@ func TestStopRacingTheSessionsEndReportsItsResult(t *testing.T) {
 func TestStatusFollowStreamsTheEventsUntilTheSessionEnds(t *testing.T) {
 	t.Parallel()
 	h := newHarness(t)
-	home := h.env["MIXTAPE_HOME"]
-	lock, err := session.Acquire(h.world.lockPath, session.LockInfo{PID: 4242, SessionID: "s1", Home: home})
-	require.NoError(t, err)
-	log, err := session.OpenEventLog(session.EventsPath(home, "s1"))
-	require.NoError(t, err)
+	lock, st := h.runningSession()
 	code := 0
-	for _, ev := range []engine.Event{
-		{Type: engine.EventTrackStarted, Track: &engine.EventTrack{Title: "Song", Artist: "Band", DurationMS: 64333}},
-		{Type: engine.EventTrackSaved, Track: &engine.EventTrack{Title: "Song", Artist: "Band", File: "Singles/Band-Song.m4a"}},
-		{Type: engine.EventSessionFinished, Result: engine.OutcomeComplete, Counts: &session.Counts{Total: 1, Recorded: 1}, ExitCode: &code},
-	} {
-		require.NoError(t, log.Write(ev))
-	}
-	require.NoError(t, log.Close())
-	require.NoError(t, session.WriteState(home, session.State{
-		ID: "s1", PID: 4242, Phase: session.PhaseRecording, StartedAt: h.now(), Events: session.EventsPath(home, "s1"),
-	}))
+	h.eventsLog(st.Events,
+		engine.Event{Type: engine.EventTrackStarted, Track: &engine.EventTrack{Title: "Song", Artist: "Band", DurationMS: 64333}},
+		engine.Event{Type: engine.EventTrackSaved, Track: &engine.EventTrack{Title: "Song", Artist: "Band", File: "Singles/Band-Song.m4a"}},
+		engine.Event{Type: engine.EventSessionFinished, Result: engine.OutcomeComplete, Counts: &session.Counts{Total: 1, Recorded: 1}, ExitCode: &code},
+	)
 	// The session ends while status follows it.
 	h.world.onSleep = func() { _ = lock.Release() }
 
@@ -300,9 +270,7 @@ func TestCrashLeftSpotifySettingsSurviveARunThatCannotRestoreThem(t *testing.T) 
 	home := h.env["MIXTAPE_HOME"]
 	ref := h.world.addPlaylist("Done List", songs()...)
 	spec := library.Spec{Kind: library.KindPlaylist, SpotifyID: ref.ID, Name: "Done List"}
-	for _, s := range songs() {
-		recordDone(t, h.env["MIXTAPE_LIBRARY"], spec, library.Track{ID: s.ID, Title: s.Title, Artist: s.Artist, DurationMS: s.Duration.Milliseconds()})
-	}
+	h.seedLibrary(spec, songs()...)
 	vol, set := 47, 100
 	crashed := session.State{ID: "old", Phase: session.PhaseRecording, Spotify: &session.SpotifyState{
 		Original: session.PlayerSettings{Volume: &vol}, Set: session.PlayerSettings{Volume: &set},
@@ -355,15 +323,11 @@ func TestDoctor(t *testing.T) {
 	h.world.prefs.Crossfade, h.world.prefs.CrossfadeSeconds = true, 6.658
 	h.world.player.snap.Volume = 48
 	require.Equal(t, ExitNotReady, h.run("doctor"))
-	checks := map[string]map[string]any{}
-	for _, raw := range h.json()["checks"].([]any) {
-		c := raw.(map[string]any)
-		checks[c["id"].(string)] = c
-	}
-	assert.Equal(t, "fail", checks["crossfade"]["status"])
-	assert.Contains(t, checks["crossfade"]["detail"], "6.7s")
-	assert.Equal(t, "warn", checks["volume"]["status"])
-	assert.Equal(t, "ok", checks["library"]["status"])
+	doc = h.json()
+	assert.Equal(t, checkFail, findCheck(t, doc, "crossfade")["status"])
+	assert.Contains(t, findCheck(t, doc, "crossfade")["detail"], "6.7s")
+	assert.Equal(t, checkWarn, findCheck(t, doc, "volume")["status"])
+	assert.Equal(t, checkOK, findCheck(t, doc, "library")["status"])
 }
 
 func TestDoctorDeviceRouting(t *testing.T) {
@@ -390,7 +354,7 @@ func TestListAndVerify(t *testing.T) {
 
 	ref := h.world.addPlaylist("Mix", songs()...)
 	spec := library.Spec{Kind: library.KindPlaylist, SpotifyID: ref.ID, Name: "Mix"}
-	recordDone(t, h.env["MIXTAPE_LIBRARY"], spec, library.Track{ID: trkA, Title: "Never Gonna Give You Up", Artist: "Rick Astley"})
+	h.seedLibrary(spec, songs()[0])
 
 	require.Equal(t, ExitOK, h.run("ls"))
 	cols := h.json()["collections"].([]any)
@@ -424,41 +388,66 @@ func TestDevicesAndSetupWithoutTerminal(t *testing.T) {
 	assert.Contains(t, h.stdout.String(), "Manual setup:")
 }
 
+// TestExitCodeTable checks every rule of the public exit-code contract:
+// its sentinel, however deeply wrapped, maps to its exit code, the matching
+// error code, and its hint, with the error's own text as the message.
 func TestExitCodeTable(t *testing.T) {
 	t.Parallel()
-	tests := []struct {
-		err  error
-		exit int
-	}{
-		{nil, ExitOK},
-		{errors.New("boom"), ExitError}, //nolint:err113 // an arbitrary error
-		{spotify.ErrBadLink, ExitUsage},
-		{config.ErrInvalidValue, ExitUsage},
-		{errCrossfade, ExitNotReady},
-		{spotify.ErrNotRunning, ExitNotReady},
-		{device.ErrNoDevice, ExitNotReady},
-		{engine.ErrSilentDevice, ExitNotReady},
-		{spotify.ErrNotFound, ExitNotFound},
-		{session.ErrNoSession, ExitNotFound},
-		{spotify.ErrNotAuthorized, ExitPermission},
-		{engine.ErrSilentTap, ExitPermission},
-		{tap.ErrCreateTap, ExitPermission},
-		{selfupdate.ErrInstallDirNotWritable, ExitPermission},
-		{selfupdate.ErrManagedInstall, ExitPermission},
-		{os.ErrPermission, ExitPermission},
-		{session.ErrBusy, ExitBusy},
-		{library.ErrLocked, ExitBusy},
-		{errTimeout, ExitTimeout},
-		{fmt.Errorf("wrapped: %w", spotify.ErrNotRunning), ExitNotReady},
+	for _, r := range rules() {
+		t.Run(r.target.Error(), func(t *testing.T) {
+			t.Parallel()
+			err := fmt.Errorf("outer: %w", fmt.Errorf("inner: %w", r.target))
+			e := mapErr(err)
+			require.NotNil(t, e)
+			assert.Equal(t, r.exit, e.Exit)
+			assert.Equal(t, codeFor(r.exit), e.Code)
+			assert.Equal(t, r.hint, e.Hint)
+			assert.Equal(t, err.Error(), e.Message)
+			assert.ErrorIs(t, e, r.target, "the cause stays reachable")
+		})
 	}
-	for _, tc := range tests {
-		got := ExitOK
-		if e := mapErr(tc.err); e != nil {
-			got = e.Exit
-			assert.Equal(t, codeFor(e.Exit), e.Code)
+}
+
+// TestExitCodesOutsideTheTable covers what mapErr decides without a rule.
+func TestExitCodesOutsideTheTable(t *testing.T) {
+	t.Parallel()
+	assert.Nil(t, mapErr(nil))
+	assert.Equal(t, ExitError, mapErr(errors.New("boom")).Exit) //nolint:err113 // an arbitrary error
+	assert.Equal(t, ExitInterrupted, mapErr(fmt.Errorf("x: %w", context.Canceled)).Exit)
+	own := newError(ExitTimeout, nil, "hint", "message")
+	assert.Same(t, own, mapErr(fmt.Errorf("wrapped: %w", own)), "an *Error passes through")
+	for exit, code := range map[int]string{
+		ExitError: codeError, ExitUsage: codeUsage, ExitNotReady: codeNotReady,
+		ExitNotFound: codeNotFound, ExitPermission: codePermission, ExitBusy: codeBusy,
+		ExitIncomplete: codeIncomplete, ExitTimeout: codeTimeout, ExitInterrupted: codeInterrupted,
+	} {
+		assert.Equal(t, code, codeFor(exit), "exit %d", exit)
+	}
+}
+
+// TestEveryRuleIsReachable guards the order of rules: a rule placed after a
+// broader one that also matches its sentinel would never apply.
+func TestEveryRuleIsReachable(t *testing.T) {
+	t.Parallel()
+	rs := rules()
+	for i, r := range rs {
+		for _, earlier := range rs[:i] {
+			assert.NotErrorIs(t, r.target, earlier.target, "%q is shadowed by %q", r.target, earlier.target)
 		}
-		assert.Equal(t, tc.exit, got, "%v", tc.err)
 	}
+}
+
+func TestRecordReportsACatalogFailure(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	h.world.addPlaylist("List", songs()...)
+	h.world.catalog.err = fmt.Errorf("%w: offline", spotify.ErrCatalog)
+
+	require.Equal(t, ExitError, h.run("record", plURL))
+	e := h.errDoc()
+	assert.Contains(t, e["message"], plID, "the link is named")
+	assert.Contains(t, e["hint"], "internet connection")
+	assert.Empty(t, h.world.player.Commands(), "nothing played")
 }
 
 func TestDoctorLibraryCheckCreatesNothing(t *testing.T) {
@@ -488,7 +477,7 @@ func TestHumanDurations(t *testing.T) {
 func TestSetupInteractiveVerifiesAndSavesTheTap(t *testing.T) {
 	t.Parallel()
 	h := newHarness(t)
-	h.deps.stdinTTY, h.deps.stdoutTTY = true, true
+	h.interactive()
 	h.deps.stdin = strings.NewReader("y\n\n~/Tapes\n")
 	h.deps.services.openCapture = func(r captureRequest) (capture.Source, error) {
 		assert.Equal(t, capture.MethodTap, r.Method)
@@ -510,7 +499,7 @@ func TestSetupInteractiveVerifiesAndSavesTheTap(t *testing.T) {
 func TestSetupFallsBackToBlackHoleWhenTheTapIsSilent(t *testing.T) {
 	t.Parallel()
 	h := newHarness(t)
-	h.deps.stdinTTY, h.deps.stdoutTTY = true, true
+	h.interactive()
 	h.world.output = device.Info{Name: "Multi-Output Device", Output: true, DefaultOutput: true}
 	h.world.player.snap.State = spotify.StatePlaying // Spotify plays; the tap still hears nothing
 	h.deps.services.openCapture = func(r captureRequest) (capture.Source, error) {
@@ -595,7 +584,7 @@ func TestRecordingKeepsTheMacAwakeUntilItEnds(t *testing.T) {
 	t.Parallel()
 	h := newHarness(t)
 	h.world.addPlaylist("List", songs()...)
-	h.deps.services.openCapture = func(captureRequest) (capture.Source, error) { return &loudSource{}, nil }
+	h.loudCapture()
 	// The setup guard's signals never fire; the session's own handler
 	// gets a stop at once, so the session ends as soon as it runs.
 	calls := 0
@@ -631,11 +620,11 @@ func TestRecordSetupFailureIsRecordedInTheSessionState(t *testing.T) {
 func TestSetupOpensSettingsAndWaitsForTheTapPermission(t *testing.T) {
 	t.Parallel()
 	h := newHarness(t)
-	h.deps.stdinTTY, h.deps.stdoutTTY = true, true
+	h.interactive()
 	h.world.perms[permission.SystemAudio] = permission.Undecided
 	h.world.perms[permission.ScreenRecording] = permission.Granted // the common mix-up
 	h.world.grantAfter[permission.SystemAudio] = 65                // switched on about a minute later
-	h.deps.services.openCapture = func(captureRequest) (capture.Source, error) { return &loudSource{}, nil }
+	h.loudCapture()
 
 	require.Equal(t, ExitOK, h.run("setup", "--yes"), h.stderr.String())
 	out := h.stdout.String()
@@ -653,12 +642,12 @@ func TestSetupOpensSettingsAndWaitsForTheTapPermission(t *testing.T) {
 func TestSetupPlaysSpotifyForTheTestCapture(t *testing.T) {
 	t.Parallel()
 	h := newHarness(t)
-	h.deps.stdinTTY, h.deps.stdoutTTY = true, true
+	h.interactive()
 	h.world.player.snap = spotify.Snapshot{
 		State: spotify.StatePaused, Volume: 100,
 		Track: spotify.Track{URI: "spotify:track:" + trkA, Name: "Never Gonna Give You Up"},
 	}
-	h.deps.services.openCapture = func(captureRequest) (capture.Source, error) { return &loudSource{}, nil }
+	h.loudCapture()
 
 	require.Equal(t, ExitOK, h.run("setup", "--yes"), h.stderr.String())
 	assert.Contains(t, h.stdout.String(), `Playing "Never Gonna Give You Up" in Spotify for a 4-second test`)
@@ -670,7 +659,7 @@ func TestSetupPlaysSpotifyForTheTestCapture(t *testing.T) {
 func TestSetupSilentWhilePausedIsNotBlamedOnThePermission(t *testing.T) {
 	t.Parallel()
 	h := newHarness(t)
-	h.deps.stdinTTY, h.deps.stdoutTTY = true, true
+	h.interactive()
 	// The player stays paused whatever mixtape asks, and the capture is silent.
 	h.world.player.snap = spotify.Snapshot{
 		State: spotify.StatePaused, Volume: 100,

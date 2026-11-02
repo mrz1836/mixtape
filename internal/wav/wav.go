@@ -38,13 +38,15 @@ func MaxDuration(rate, channels int) time.Duration {
 func WriteHeader(w io.Writer, dataSize int64, rate, channels int) error {
 	blockAlign := int64(channels) * BitsPerSample / 8
 	byteRate := int64(rate) * blockAlign
-	riffSize := 36 + dataSize // rest of the file after the RIFF size field
 
+	// dataSize is bounded before 36 is added to it: near MaxInt64 the sum
+	// would wrap negative and pass a check on the sum.
 	if rate <= 0 || rate > math.MaxUint32 || channels <= 0 || channels > math.MaxUint16 ||
 		blockAlign <= 0 || blockAlign > math.MaxUint16 || byteRate <= 0 || byteRate > math.MaxUint32 ||
-		dataSize < 0 || riffSize > math.MaxUint32 {
+		dataSize < 0 || dataSize > math.MaxUint32-36 {
 		return fmt.Errorf("%w: %d Hz, %d channels, %d data bytes", ErrHeader, rate, channels, dataSize)
 	}
+	riffSize := 36 + dataSize // rest of the file after the RIFF size field
 
 	var h [HeaderSize]byte
 	copy(h[0:4], "RIFF")

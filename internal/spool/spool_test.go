@@ -16,10 +16,21 @@ import (
 	"github.com/mrz1836/mixtape/internal/capture"
 )
 
-// smallFormat has tiny chunks: 100 Hz mono gives 3000-frame chunks.
+// smallRate makes chunks tiny: at 100 Hz mono a 30-second chunk holds 3000
+// frames.
 const smallRate = 100
 
 func smallFormat() capture.Format { return capture.Format{Rate: smallRate, Channels: 1} }
+
+// newSpool opens a spool in dir for the test and closes it when the test
+// ends.
+func newSpool(t *testing.T, dir string, f capture.Format) *Spool {
+	t.Helper()
+	s, err := Open(dir, f)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = s.Close() })
+	return s
+}
 
 // frames returns n frames whose samples encode their own frame index, so
 // any read can be checked for exactly which frames it returned.
@@ -85,9 +96,7 @@ func TestOpenRemovesStaleChunks(t *testing.T) {
 	require.NoError(t, os.WriteFile(stale, []byte("old"), 0o600))
 	require.NoError(t, os.WriteFile(other, []byte("x"), 0o600))
 
-	s, err := Open(dir, smallFormat())
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = s.Close() })
+	newSpool(t, dir, smallFormat())
 
 	assert.NoFileExists(t, stale)
 	assert.FileExists(t, other, "only chunk files are removed")
@@ -96,9 +105,7 @@ func TestOpenRemovesStaleChunks(t *testing.T) {
 func TestAppendAcrossChunksAndReadBack(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
-	s, err := Open(dir, smallFormat())
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = s.Close() })
+	s := newSpool(t, dir, smallFormat())
 
 	start := time.Now()
 	appendSeconds(t, s, start, 75) // 7500 frames: three chunks (3000, 3000, 1500)
@@ -122,9 +129,7 @@ func TestAppendAcrossChunksAndReadBack(t *testing.T) {
 
 func TestBlockSplitAcrossChunk(t *testing.T) {
 	t.Parallel()
-	s, err := Open(t.TempDir(), smallFormat())
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = s.Close() })
+	s := newSpool(t, t.TempDir(), smallFormat())
 
 	// One 4000-frame block fills the first chunk and spills into the next.
 	require.NoError(t, s.Append(capture.Block{PCM: frames(smallFormat(), 0, 4000), Frames: 4000, At: time.Now()}))
@@ -140,9 +145,7 @@ func TestBlockSplitAcrossChunk(t *testing.T) {
 
 func TestReadRangeClips(t *testing.T) {
 	t.Parallel()
-	s, err := Open(t.TempDir(), smallFormat())
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = s.Close() })
+	s := newSpool(t, t.TempDir(), smallFormat())
 	appendSeconds(t, s, time.Now(), 2)
 
 	var buf bytes.Buffer
@@ -160,9 +163,7 @@ func TestReadRangeClips(t *testing.T) {
 func TestStereoFrames(t *testing.T) {
 	t.Parallel()
 	f := capture.Format{Rate: 48000, Channels: 2}
-	s, err := Open(t.TempDir(), f)
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = s.Close() })
+	s := newSpool(t, t.TempDir(), f)
 
 	require.NoError(t, s.Append(capture.Block{PCM: frames(f, 0, 512), Frames: 512, At: time.Now()}))
 	var buf bytes.Buffer
@@ -174,9 +175,7 @@ func TestStereoFrames(t *testing.T) {
 
 func TestAppendRejectsShortBlock(t *testing.T) {
 	t.Parallel()
-	s, err := Open(t.TempDir(), smallFormat())
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = s.Close() })
+	s := newSpool(t, t.TempDir(), smallFormat())
 	require.ErrorIs(t, s.Append(capture.Block{PCM: make([]byte, 10), Frames: 6}), ErrShortBlock)
 	require.NoError(t, s.Append(capture.Block{}), "an empty block is a no-op")
 	assert.Zero(t, s.Frames())
@@ -185,9 +184,7 @@ func TestAppendRejectsShortBlock(t *testing.T) {
 func TestFrameAtInterpolates(t *testing.T) {
 	t.Parallel()
 	f := capture.Format{Rate: 1000, Channels: 1}
-	s, err := Open(t.TempDir(), f)
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = s.Close() })
+	s := newSpool(t, t.TempDir(), f)
 
 	// 100 ms blocks whose timestamps jitter by up to ±3 ms.
 	start := time.Now()
@@ -213,9 +210,7 @@ func TestFrameAtInterpolates(t *testing.T) {
 func TestFrameAtThinsAndIgnoresBackwardTime(t *testing.T) {
 	t.Parallel()
 	f := capture.Format{Rate: 1000, Channels: 1}
-	s, err := Open(t.TempDir(), f)
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = s.Close() })
+	s := newSpool(t, t.TempDir(), f)
 
 	start := time.Now()
 	for i := range 100 { // 10 ms blocks: thinned to one anchor per 50 ms
@@ -234,9 +229,7 @@ func TestFrameAtThinsAndIgnoresBackwardTime(t *testing.T) {
 
 func TestFrameAtWithoutAnchors(t *testing.T) {
 	t.Parallel()
-	s, err := Open(t.TempDir(), smallFormat())
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = s.Close() })
+	s := newSpool(t, t.TempDir(), smallFormat())
 	assert.Zero(t, s.FrameAt(time.Now()))
 	assert.True(t, s.TimeAt(10).IsZero())
 
@@ -248,9 +241,7 @@ func TestFrameAtWithoutAnchors(t *testing.T) {
 func TestPrune(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
-	s, err := Open(dir, smallFormat())
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = s.Close() })
+	s := newSpool(t, dir, smallFormat())
 	start := time.Now()
 	appendSeconds(t, s, start, 75) // chunks [0,3000) [3000,6000) [6000,7500)
 
@@ -297,9 +288,7 @@ func TestCloseRemovesFilesAndIsIdempotent(t *testing.T) {
 func TestConcurrentAppendAndRead(t *testing.T) {
 	t.Parallel()
 	f := capture.Format{Rate: 1000, Channels: 2}
-	s, err := Open(t.TempDir(), f)
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = s.Close() })
+	s := newSpool(t, t.TempDir(), f)
 
 	const blocks = 400 // 100 s of 250-frame blocks: several 30 000-frame chunks
 	start := time.Now()
@@ -353,9 +342,7 @@ func TestPruneRetriesChunksItCouldNotDelete(t *testing.T) {
 	}
 	dir := t.TempDir()
 	f := smallFormat()
-	s, err := Open(dir, f)
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = s.Close() })
+	s := newSpool(t, dir, f)
 	require.NoError(t, s.Append(capture.Block{PCM: frames(f, 0, 7000), Frames: 7000, At: time.Now()}))
 	require.Len(t, chunkFiles(t, dir), 3)
 

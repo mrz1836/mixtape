@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"strings"
@@ -217,7 +218,7 @@ func collectionFromEntity(ref Ref, e *embedEntity) (Collection, error) {
 			ID:       ref.ID,
 			Title:    col.Name,
 			Artist:   strings.Join(artists, ", "),
-			Duration: time.Duration(e.Duration) * time.Millisecond,
+			Duration: msDuration(e.Duration),
 			Playable: boolOr(e.IsPlayable, true),
 			Position: 1,
 		}}
@@ -244,10 +245,15 @@ func collectionFromEntity(ref Ref, e *embedEntity) (Collection, error) {
 			ID:       id,
 			Title:    t.Title,
 			Artist:   t.Subtitle,
-			Duration: time.Duration(t.Duration) * time.Millisecond,
+			Duration: msDuration(t.Duration),
 			Playable: boolOr(t.IsPlayable, true),
 			Position: len(col.Tracks) + 1,
 		})
+	}
+	if len(col.Tracks) == 0 {
+		// Entries, but none a track: the page changed shape (or lists only
+		// episodes and local files). Either way it is no empty list.
+		return Collection{}, fmt.Errorf("%w: no tracks in the track list", errEmbed)
 	}
 	col.Truncated = ref.Kind == KindPlaylist && len(e.TrackList) >= embedTrackCap
 	col.Complete = !col.Truncated
@@ -368,6 +374,15 @@ func largestImage(imgs []embedImage) string {
 		}
 	}
 	return best
+}
+
+// msDuration converts a page's duration in milliseconds; a negative one,
+// or one too large for a time.Duration, is unknown (0).
+func msDuration(ms int64) time.Duration {
+	if ms <= 0 || ms > math.MaxInt64/int64(time.Millisecond) {
+		return 0
+	}
+	return time.Duration(ms) * time.Millisecond
 }
 
 func boolOr(b *bool, def bool) bool {

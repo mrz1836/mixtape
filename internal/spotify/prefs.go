@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"io/fs"
+	"math"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -92,7 +93,8 @@ func parsePrefs(data []byte) Prefs {
 		case key == prefMigrated:
 			p.Stale = value == "true"
 		case key == prefCrossfadeTime:
-			if ms, err := strconv.ParseFloat(value, 64); err == nil && ms > 0 {
+			// ParseFloat accepts "Inf", which is no crossfade length.
+			if ms, err := strconv.ParseFloat(value, 64); err == nil && ms > 0 && !math.IsInf(ms, 0) {
 				p.CrossfadeSeconds = ms / 1000
 			}
 		case strings.Contains(strings.ToLower(key), prefAutomixWord) && value == "true":

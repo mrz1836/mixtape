@@ -6,26 +6,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-
-	"github.com/mrz1836/mixtape/internal/session"
 )
-
-// runningSession holds the recorder lock for session id, as a recorder in
-// another process would, and writes its session.json. The lock is released
-// when the test ends.
-func runningSession(t *testing.T, h *harness, id string) session.State {
-	t.Helper()
-	home := h.env["MIXTAPE_HOME"]
-	lock, err := session.Acquire(h.world.lockPath, session.LockInfo{PID: 4242, SessionID: id, Home: home})
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = lock.Release() })
-	st := session.State{
-		ID: id, PID: 4242, Phase: session.PhaseRecording, StartedAt: h.now(),
-		Events: session.EventsPath(home, id),
-	}
-	require.NoError(t, session.WriteState(home, st))
-	return st
-}
 
 // unreadableLock makes the recorder lock impossible to open from now on,
 // and restores it when the test ends.
@@ -41,7 +22,7 @@ func TestStopDoesNotReportAStopItCouldNotSee(t *testing.T) {
 		t.Skip("root opens any file")
 	}
 	h := newHarness(t)
-	runningSession(t, h, "s1")
+	h.runningSession()
 	// The signal is sent, then the lock cannot be read any more.
 	h.world.onKill = func(int) { unreadableLock(t, h.world.lockPath) }
 
@@ -56,10 +37,8 @@ func TestStatusFollowGivesUpWhenTheLockStaysUnreadable(t *testing.T) {
 		t.Skip("root opens any file")
 	}
 	h := newHarness(t)
-	st := runningSession(t, h, "s1")
-	log, err := session.OpenEventLog(st.Events)
-	require.NoError(t, err)
-	require.NoError(t, log.Close())
+	_, st := h.runningSession()
+	h.eventsLog(st.Events)
 	h.world.onSleep = func() { unreadableLock(t, h.world.lockPath) }
 
 	code := h.run("status", "--follow")

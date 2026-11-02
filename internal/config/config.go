@@ -158,6 +158,11 @@ func Load(path string) (File, []string, error) {
 	if err != nil {
 		return File{}, nil, err
 	}
+	if len(raw) == 0 {
+		// Nothing is set. Decoding the File as well would refuse a blank
+		// file, which decodeRaw and Set take for an empty config.
+		return File{}, nil, nil
+	}
 	var warnings []string
 	for _, k := range sortedKeys(raw) {
 		if !isKnown(k) {

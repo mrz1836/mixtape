@@ -12,27 +12,32 @@ import (
 
 func TestUsageErrorsExit2(t *testing.T) {
 	t.Parallel()
-	tests := map[string][]string{
-		"unknown command":     {"bogus"},
-		"unknown flag":        {"version", "--bogus"},
-		"extra argument":      {"version", "extra"},
-		"bad output format":   {"version", "-o", "yaml"},
-		"verbose with quiet":  {"version", "-v", "-q"},
-		"completion no shell": {"completion"},
-		"bad completion":      {"completion", "tcsh"},
+	tests := map[string]struct {
+		args []string
+		// jsonOnly: the failure is the output flag itself, so it cannot
+		// also be asked for as text.
+		jsonOnly bool
+	}{
+		"unknown command":     {args: []string{"bogus"}},
+		"unknown flag":        {args: []string{"version", "--bogus"}},
+		"extra argument":      {args: []string{"version", "extra"}},
+		"bad output format":   {args: []string{"version", "-o", "yaml"}, jsonOnly: true},
+		"verbose with quiet":  {args: []string{"version", "-v", "-q"}},
+		"completion no shell": {args: []string{"completion"}},
+		"bad completion":      {args: []string{"completion", "tcsh"}},
 	}
-	for name, args := range tests {
+	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 			h := newHarness(t)
-			assert.Equal(t, ExitUsage, h.run(args...))
+			assert.Equal(t, ExitUsage, h.run(tc.args...))
 			assert.Empty(t, h.stdout.String())
 			assert.Equal(t, "usage", h.errDoc()["code"])
 
-			if name == "bad output format" {
+			if tc.jsonOnly {
 				return // an unusable --output falls back to auto, which is JSON here
 			}
-			assert.Equal(t, ExitUsage, h.run(append([]string{"-o", "text"}, args...)...))
+			assert.Equal(t, ExitUsage, h.run(append([]string{"-o", "text"}, tc.args...)...))
 			assert.Contains(t, h.stderr.String(), "mixtape: ")
 		})
 	}
@@ -112,24 +117,17 @@ func TestConfigCommands(t *testing.T) {
 
 	h.env["MIXTAPE_DEVICE"] = "Loopback"
 	require.Equal(t, ExitOK, h.run("config", "show"))
-	settings := map[string]map[string]any{}
-	for _, raw := range h.json()["settings"].([]any) {
-		row := raw.(map[string]any)
-		settings[row["key"].(string)] = row
-	}
-	assert.Equal(t, "device", settings["capture"]["value"])
-	assert.Equal(t, "file", settings["capture"]["source"])
-	assert.Equal(t, "Loopback", settings["device"]["value"])
-	assert.Equal(t, "env", settings["device"]["source"])
-	assert.Equal(t, "default", settings["artwork"]["source"])
+	doc := h.json()
+	assert.Equal(t, "device", findSetting(t, doc, "capture")["value"])
+	assert.Equal(t, "file", findSetting(t, doc, "capture")["source"])
+	assert.Equal(t, "Loopback", findSetting(t, doc, "device")["value"])
+	assert.Equal(t, "env", findSetting(t, doc, "device")["source"])
+	assert.Equal(t, "default", findSetting(t, doc, "artwork")["source"])
 
 	require.Equal(t, ExitOK, h.run("config", "show", "-L", "/Volumes/X"))
-	for _, raw := range h.json()["settings"].([]any) {
-		if row := raw.(map[string]any); row["key"] == "library" {
-			assert.Equal(t, "/Volumes/X", row["value"])
-			assert.Equal(t, "flag", row["source"])
-		}
-	}
+	library := findSetting(t, h.json(), "library")
+	assert.Equal(t, "/Volumes/X", library["value"])
+	assert.Equal(t, "flag", library["source"])
 
 	require.Equal(t, ExitUsage, h.run("config", "set", "volume", "11"))
 	assert.Equal(t, "usage", h.errDoc()["code"])
@@ -176,9 +174,12 @@ func TestHomeFlag(t *testing.T) {
 func TestCompletion(t *testing.T) {
 	t.Parallel()
 	for _, shell := range []string{"bash", "zsh", "fish", "powershell"} {
-		h := newHarness(t)
-		require.Equal(t, ExitOK, h.run("completion", shell), shell)
-		assert.Contains(t, h.stdout.String(), "mixtape", shell)
+		t.Run(shell, func(t *testing.T) {
+			t.Parallel()
+			h := newHarness(t)
+			require.Equal(t, ExitOK, h.run("completion", shell))
+			assert.Contains(t, h.stdout.String(), "mixtape")
+		})
 	}
 }
 

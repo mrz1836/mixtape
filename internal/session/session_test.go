@@ -13,6 +13,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/mrz1836/mixtape/internal/spotify"
+	"github.com/mrz1836/mixtape/internal/testutil"
 )
 
 func TestLockAcquireInspectRelease(t *testing.T) {
@@ -159,13 +160,11 @@ func (f *fakeRestorer) SetVolume(_ context.Context, v int) error {
 	return nil
 }
 
-func ptr[T any](v T) *T { return &v }
-
 func TestRestoreCompareAndSet(t *testing.T) {
 	t.Parallel()
 	st := SpotifyState{
-		Original: PlayerSettings{Shuffle: ptr(true), Repeat: ptr(false), Volume: ptr(40)},
-		Set:      PlayerSettings{Shuffle: ptr(false), Repeat: ptr(true), Volume: ptr(100)},
+		Original: PlayerSettings{Shuffle: testutil.Ptr(true), Repeat: testutil.Ptr(false), Volume: testutil.Ptr(40)},
+		Set:      PlayerSettings{Shuffle: testutil.Ptr(false), Repeat: testutil.Ptr(true), Volume: testutil.Ptr(100)},
 	}
 	assert.True(t, st.NeedsRestore())
 
@@ -186,7 +185,7 @@ func TestRestoreCompareAndSet(t *testing.T) {
 func TestRestorePollError(t *testing.T) {
 	t.Parallel()
 	p := &fakeRestorer{snap: spotify.Snapshot{Err: spotify.ErrNotRunning}}
-	_, err := Restore(t.Context(), p, SpotifyState{Set: PlayerSettings{Volume: ptr(1)}})
+	_, err := Restore(t.Context(), p, SpotifyState{Set: PlayerSettings{Volume: testutil.Ptr(1)}})
 	require.ErrorIs(t, err, spotify.ErrNotRunning)
 }
 

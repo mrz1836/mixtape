@@ -139,6 +139,10 @@ const (
 	watchBackoffMax  = 5 * time.Second
 )
 
+// maxDurationMS is the longest track duration, in milliseconds, that a
+// time.Duration can hold (about 292 years). A longer one would wrap.
+const maxDurationMS = float64(math.MaxInt64 / int64(time.Millisecond))
+
 // errBadSnapshot reports a script line Mixtape cannot parse.
 var errBadSnapshot = errors.New("unexpected snapshot output")
 
@@ -375,7 +379,7 @@ func (p *Player) parseSnapshot(line string, at time.Time) Snapshot {
 		Popularity:  atoi(f[fPopularity]),
 		ArtworkURL:  strings.TrimSpace(f[fArtwork]),
 	}
-	if ms, ok := parseReal(f[fDuration]); ok && ms > 0 {
+	if ms, ok := parseReal(f[fDuration]); ok && ms > 0 && ms < maxDurationMS {
 		snap.Track.Duration = time.Duration(ms) * time.Millisecond
 	}
 	return snap

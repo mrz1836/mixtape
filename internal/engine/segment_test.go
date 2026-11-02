@@ -31,29 +31,31 @@ type song struct {
 	dur        float64
 	audioStart float64
 	latency    float64
-	poll       float64
 	jitter     func(i int) float64
 	// pauses: song position → pause length (seconds).
 	pauseAt, pauseFor float64
+	// pauseSeek moves the position this far while paused (the listener
+	// drags the slider before resuming).
+	pauseSeek float64
 	// rateSkew > 0 makes the reported position run faster than audio.
 	rateSkew float64
 	// granularity > 0 quantizes the reported position (held values).
 	granularity float64
 }
 
+// simPoll is the observation interval of a simulated song, in seconds.
+const simPoll = 0.15
+
 // timeline renders observations from the first poll after the song starts
 // until it ends at playedTo (song seconds), plus the surrounding markers.
 func (s song) timeline(playedTo float64) Timeline {
-	poll := s.poll
-	if poll == 0 {
-		poll = 0.15
-	}
+	const poll = simPoll
 	tl := Timeline{Duration: time.Duration(s.dur * float64(time.Second))}
 	tl.Before = at(s.audioStart - s.latency - poll/2) // last obs of the previous track
 	start := s.audioStart - s.latency                 // wall time Spotify reports position 0
 	pausedFor := 0.0
 	for i := 0; ; i++ {
-		w := start + poll/2 + float64(i)*poll
+		w := start + poll/2 + float64(i)*poll + pausedFor // wall time runs on through the pause
 		if s.jitter != nil {
 			w += s.jitter(i)
 		}
@@ -66,6 +68,9 @@ func (s song) timeline(playedTo float64) Timeline {
 			}
 			pausedFor = s.pauseFor
 			continue
+		}
+		if pausedFor > 0 {
+			pos += s.pauseSeek
 		}
 		if s.rateSkew != 0 {
 			pos *= 1 + s.rateSkew
@@ -156,6 +161,25 @@ func TestSegmentPauseIsExcised(t *testing.T) {
 	assertNear(t, frames(1+20+3+margin), seg.Ranges[1].To, 0.001, "end")
 	assertNear(t, frames(20+2*margin), seg.Frames(), 0.01, "the pause adds nothing")
 	assert.Equal(t, 2, seg.Runs)
+}
+
+func TestSegmentSeekWhilePausedIsNotComplete(t *testing.T) {
+	t.Parallel()
+	for name, seek := range map[string]float64{"forward": 90, "back": -6} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			// Paused at 0:30, the slider moved, then resumed: the song never
+			// played the part skipped (or played part of it twice).
+			s := song{dur: 240, audioStart: 1, pauseAt: 30, pauseFor: 4, pauseSeek: seek}
+			seg := segmentize(t, s.timeline(240), 0)
+			assert.False(t, seg.Complete, "ranges: %+v", seg.Ranges)
+			want := ReasonSeekForward
+			if seek < 0 {
+				want = ReasonSeekBack
+			}
+			assert.Equal(t, want, seg.Reason)
+		})
+	}
 }
 
 func TestSegmentStalePositionsAfterChange(t *testing.T) {
@@ -276,7 +300,21 @@ func TestSegmentStopWhileStillPlaying(t *testing.T) {
 
 func TestMedian(t *testing.T) {
 	t.Parallel()
-	assert.InDelta(t, 0.0, median(nil), 0)
-	assert.InDelta(t, 2.0, median([]float64{3, 1, 2}), 0)
-	assert.InDelta(t, 2.5, median([]float64{4, 1, 3, 2}), 0)
+	for name, tc := range map[string]struct {
+		in   []float64
+		want float64
+	}{
+		"empty":    {nil, 0},
+		"one":      {[]float64{7}, 7},
+		"odd":      {[]float64{3, 1, 2}, 2},
+		"even":     {[]float64{4, 1, 3, 2}, 2.5},
+		"repeated": {[]float64{5, 5, 1}, 5},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			in := append([]float64(nil), tc.in...)
+			assert.InDelta(t, tc.want, median(in), 0)
+			assert.Equal(t, tc.in, in, "the input is not reordered")
+		})
+	}
 }

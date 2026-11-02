@@ -3,6 +3,7 @@ package spotify
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -64,7 +65,7 @@ func newCatalogServer(t *testing.T, embeds map[string]page, oembed page) (*catal
 	return cs, c
 }
 
-func fixture(t *testing.T, name string) page {
+func fixture(t testing.TB, name string) page {
 	t.Helper()
 	b, err := os.ReadFile(filepath.Join("testdata", name))
 	require.NoError(t, err)
@@ -72,7 +73,7 @@ func fixture(t *testing.T, name string) page {
 }
 
 // embedHTML wraps an entity the way the embed page does.
-func embedHTML(t *testing.T, entity any) string {
+func embedHTML(t testing.TB, entity any) string {
 	t.Helper()
 	b, err := json.Marshal(map[string]any{
 		"props": map[string]any{"pageProps": map[string]any{"state": map[string]any{
@@ -173,8 +174,10 @@ func TestISODate(t *testing.T) {
 	assert.Empty(t, isoDate(""))
 }
 
-func TestResolveTruncatedAndFiltered(t *testing.T) {
-	t.Parallel()
+// truncatedPlaylist is a playlist entity at the embed page's 100-track
+// cap: a local file and an episode, then 98 songs, every tenth one
+// unplayable.
+func truncatedPlaylist() map[string]any {
 	items := make([]map[string]any, 0, 100)
 	items = append(items,
 		map[string]any{"uri": "spotify:local:Artist:Album:Title:180", "title": "Local", "duration": 180000},
@@ -187,7 +190,12 @@ func TestResolveTruncatedAndFiltered(t *testing.T) {
 			"duration": 200000, "isPlayable": i%10 != 0,
 		})
 	}
-	body := embedHTML(t, map[string]any{"type": "playlist", "name": "Big", "subtitle": "someone", "trackList": items})
+	return map[string]any{"type": "playlist", "name": "Big", "subtitle": "someone", "trackList": items}
+}
+
+func TestResolveTruncatedAndFiltered(t *testing.T) {
+	t.Parallel()
+	body := embedHTML(t, truncatedPlaylist())
 	_, c := newCatalogServer(t, map[string]page{"playlist/" + testPlaylistID: {http.StatusOK, body}}, page{})
 
 	col, err := c.Resolve(t.Context(), Ref{KindPlaylist, testPlaylistID})
@@ -347,4 +355,29 @@ func TestReleaseDateFailures(t *testing.T) {
 	c.EmbedBase = "http://127.0.0.1:1/embed"
 	_, err = c.ReleaseDate(t.Context(), testTrackID)
 	require.ErrorIs(t, err, ErrCatalog)
+}
+
+func TestResolveTrackListWithoutTracksIsNotAnEmptyList(t *testing.T) {
+	t.Parallel()
+	// A page whose entries are all episodes (or whose URI field moved): a
+	// complete, empty list would mark every recorded song removed.
+	body := embedHTML(t, map[string]any{
+		"type": "playlist", "name": "Talk",
+		"trackList": []map[string]any{{"uri": "spotify:episode:4cOdK2wGLETKBW3PvgPWqT", "title": "Ep"}},
+	})
+	_, c := newCatalogServer(t, map[string]page{"playlist/" + testPlaylistID: {status: http.StatusOK, body: body}},
+		page{status: http.StatusOK, body: `{"title":"Talk"}`})
+	col, err := c.Resolve(t.Context(), Ref{KindPlaylist, testPlaylistID})
+	require.NoError(t, err)
+	assert.Equal(t, SourceOEmbed, col.Source, "the list is followed in Spotify instead")
+	assert.False(t, col.Complete)
+	assert.Empty(t, col.Tracks)
+}
+
+func TestMSDuration(t *testing.T) {
+	t.Parallel()
+	assert.Equal(t, 1500*time.Millisecond, msDuration(1500))
+	assert.Zero(t, msDuration(0))
+	assert.Zero(t, msDuration(-5), "a negative duration is unknown")
+	assert.Zero(t, msDuration(math.MaxInt64), "an overflowing one too")
 }
