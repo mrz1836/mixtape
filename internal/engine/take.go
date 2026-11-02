@@ -77,7 +77,7 @@ func (e *Engine) onSnapshot(ctx context.Context, s spotify.Snapshot) {
 	e.last = s
 	if e.cur != nil && s.Track.URI == e.cur.key {
 		e.refineDuration(s)
-		if e.restarted(s) && e.cur.lastPos() < earlyRestart {
+		if e.restarted(s) && (e.cur.lastPos() < earlyRestart || !e.believable(e.cur)) {
 			e.resetTake(s) // Spotify starting the song over right after it began
 		}
 	}
@@ -124,6 +124,22 @@ const (
 	restartJump  = 0.05
 	earlyRestart = 2.0
 )
+
+// believable reports whether any playing observation of t has a position a
+// song that began with the take could have reached. After "play track",
+// Spotify can report the previous track's position under the new URI for a
+// moment, then jump to 0; that jump is a false start, not a restart.
+func (e *Engine) believable(t *take) bool {
+	for _, o := range t.obs {
+		if !o.Playing || o.Position <= 0 {
+			continue
+		}
+		if t.before.IsZero() || o.Position <= o.At.Sub(t.before).Seconds()+e.tn.StaleSlack.Seconds() {
+			return true
+		}
+	}
+	return false
+}
 
 // resetTake discards the observations of a false start, keeping the take
 // (and whether it records) as it is.
@@ -218,9 +234,14 @@ func (e *Engine) beginRecording(ctx context.Context, t *take, it *Item, s spotif
 		return // loaded but not playing yet: promoted when it starts
 	}
 	if s.Position > e.tn.StartSlack.Seconds()+2*e.opts.Poll.Seconds() {
-		// Joined mid-song: restart it from the top in a fresh take.
+		if !t.before.IsZero() && s.Position > s.At.Sub(t.before).Seconds()+e.tn.StaleSlack.Seconds() {
+			return // the previous track's position under the new URI: wait for a real one
+		}
+		// Joined mid-song: restart it from the top in a fresh take, and give
+		// Spotify time to do it before steering anything else.
 		e.releaseCur()
 		e.command(ctx, "restart", func(c context.Context) error { return e.cfg.Player.SetPosition(c, 0) })
+		e.waiting = &request{item: it, at: s.At}
 		return
 	}
 	e.adopt(t, it, s.At)
@@ -242,6 +263,7 @@ func (e *Engine) promote(ctx context.Context, s spotify.Snapshot) {
 // its observations, so the song's start is still known.
 func (e *Engine) adopt(t *take, it *Item, at time.Time) {
 	t.item, t.recording = it, true
+	e.waiting = nil
 	e.lastActive = at
 	e.emit(Event{Type: EventTrackStarted, Track: t.eventTrack()})
 }

@@ -56,11 +56,16 @@ type fakeSpotify struct {
 	// startGlitch replays Spotify's habit of starting a freshly played song
 	// over about 0.2 s in; glitched is set once it happened for this play.
 	startGlitch, glitched bool
-	hold                  time.Duration // position frozen at 0 while it re-buffers
-	shuffle               bool
-	repeat                bool
-	volume                int
-	commands              []string
+	// stalePlay replays Spotify reporting the previous track's position
+	// under a newly played track for a few observations.
+	stalePlay bool
+	staleFor  int
+	stalePos  time.Duration
+	hold      time.Duration // position frozen at 0 while it re-buffers
+	shuffle   bool
+	repeat    bool
+	volume    int
+	commands  []string
 
 	now   func() time.Time
 	watch chan spotify.Snapshot
@@ -127,6 +132,10 @@ func (f *fakeSpotify) snapshot() spotify.Snapshot {
 	}
 	if t, ok := f.current(); ok {
 		s.Position = f.pos.Seconds()
+		if f.staleFor > 0 {
+			f.staleFor--
+			s.Position = f.stalePos.Seconds()
+		}
 		dur := t.dur
 		if f.crossfade > 0 && f.pos > time.Second {
 			dur -= f.crossfade // like Spotify: the duration shrinks once playback settles
@@ -173,6 +182,9 @@ func (f *fakeSpotify) PlayTrack(_ context.Context, uri, ctxURI string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.log("play " + uri + " in " + ctxURI)
+	if f.stalePlay {
+		f.stalePos, f.staleFor = f.pos+12*time.Second, 3
+	}
 	id := uri[strings.LastIndex(uri, ":")+1:]
 	switch {
 	case strings.HasPrefix(uri, "spotify:playlist:"), strings.HasPrefix(uri, "spotify:album:"):

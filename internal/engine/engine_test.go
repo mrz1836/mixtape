@@ -398,6 +398,17 @@ func TestLimitCountsSongsInFlight(t *testing.T) {
 	assert.Len(t, s.eventsOf(EventTrackStarted), 2)
 }
 
+func TestStalePositionAfterPlayIsAFalseStart(t *testing.T) {
+	t.Parallel()
+	s := newSim(t, songA)
+	s.spotify.stalePlay = true // the old track's 12 s position shows under the new song first
+
+	_, res := s.run(singles(songA), Options{}, nil)
+	requireComplete(t, res)
+	assert.Equal(t, 1, res.Counts.Recorded)
+	assert.Empty(t, s.eventsOf(EventTrackDiscarded), "a stale position then 0 is not a failed take")
+}
+
 func TestRelinkMatching(t *testing.T) {
 	t.Parallel()
 	want := library.Track{Title: "Time - 2011 Remaster", Artist: "Pink Floyd", DurationMS: 413000}

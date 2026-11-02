@@ -149,8 +149,13 @@ func (f *fakeRestorer) SetRepeat(_ context.Context, on bool) error {
 	return nil
 }
 
-func (f *fakeRestorer) SetVolume(context.Context, int) error {
+// SetVolume behaves like Spotify: most values read back one lower.
+func (f *fakeRestorer) SetVolume(_ context.Context, v int) error {
 	f.calls = append(f.calls, "volume")
+	if v > 0 && v < 100 {
+		v--
+	}
+	f.snap.Volume = v
 	return nil
 }
 
@@ -170,7 +175,8 @@ func TestRestoreCompareAndSet(t *testing.T) {
 	restored, err := Restore(t.Context(), p, st)
 	require.NoError(t, err)
 	assert.Equal(t, []string{"shuffle", "volume"}, restored)
-	assert.Equal(t, []string{"shuffle=on", "volume"}, p.calls)
+	assert.Equal(t, []string{"shuffle=on", "volume", "volume"}, p.calls, "the volume is nudged once")
+	assert.Equal(t, 40, p.snap.Volume, "the original volume reads back exactly")
 
 	st.Restored = true
 	assert.False(t, st.NeedsRestore())

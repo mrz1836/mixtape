@@ -35,8 +35,7 @@ func (e *Engine) beginQueued(ctx context.Context, t *take, s spotify.Snapshot) {
 			e.unavailable(w.item, "Spotify skipped it (not playable here)")
 		}
 	}
-	e.waiting = nil
-	e.beginRecording(ctx, t, it, s)
+	e.beginRecording(ctx, t, it, s) // the request is settled once it records
 }
 
 // match finds the pending planned song a track is: by requested ID, by
