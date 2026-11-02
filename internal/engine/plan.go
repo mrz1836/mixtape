@@ -72,7 +72,8 @@ type Item struct {
 
 	state       itemState
 	attempts    int
-	falseStarts int // takes that ended before the song really began
+	falseStarts int  // takes that ended before the song really began
+	retake      bool // live mode: a take was cut short; record the song if it plays again
 	reason      string
 }
 

@@ -96,7 +96,7 @@ type Options struct {
 	Poll time.Duration
 	// StartTimeout is how long a requested song may take to start.
 	StartTimeout time.Duration
-	// MaxFailures ends a queue session after this many songs in a row
+	// MaxFailures ends a queue session after this many attempts in a row
 	// could not be recorded (silent, not started, cut short); 0 never does.
 	MaxFailures int
 	// Verbose emits boundary diagnostics.
@@ -343,6 +343,7 @@ func (e *Engine) loop(ctx context.Context, controls <-chan Control) {
 			return
 		case s, ok := <-snaps:
 			if !ok {
+				snaps = nil // a closed channel would be chosen on every turn
 				e.fail(ErrSpotifyGone)
 				continue
 			}

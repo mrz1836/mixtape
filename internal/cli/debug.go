@@ -235,9 +235,15 @@ func analyzeTrace(path string) string {
 		if c.ID == p.ID {
 			kind = "resume"
 		}
+		// The audio starts where playback starts: at position 0 after a
+		// change, at the paused position after a resume.
+		estimate := anchor
+		if kind == "resume" {
+			estimate += p.Pos * float64(rate)
+		}
 		fmt.Fprintf(&b, "\n  %6.2fs %-6s %-32.32s stale=%d", float64(c.T)/1e9, kind, c.Name, stale)
 		if onset := audioOnset(audio, p.T); onset >= 0 {
-			fmt.Fprintf(&b, "  onset−estimate = %+.3fs", (onset-anchor)/float64(rate))
+			fmt.Fprintf(&b, "  onset−estimate = %+.3fs", (onset-estimate)/float64(rate))
 		}
 	}
 	if len(steps) > 0 {

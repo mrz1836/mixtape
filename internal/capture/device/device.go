@@ -247,11 +247,7 @@ func (s *Source) drain(ctx context.Context, sink func(capture.Block)) {
 			if n == 0 {
 				break
 			}
-			var at time.Time
-			if o.ok {
-				at = o.at.Add(s.format.Duration(o.offset / int64(bpf)))
-			}
-			sink(capture.Block{PCM: buf[:n], Frames: n / bpf, At: at})
+			sink(capture.Block{PCM: buf[:n], Frames: n / bpf, At: o.capturedAt(s.format)})
 		}
 		if dropped := s.ring.takeOverflows(); dropped > 0 {
 			s.events.Emit(capture.EventOverflow, fmt.Sprintf("%d audio callbacks dropped: the reader fell behind", dropped))

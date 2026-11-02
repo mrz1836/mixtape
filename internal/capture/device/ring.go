@@ -5,6 +5,8 @@ package device
 import (
 	"sync/atomic"
 	"time"
+
+	"github.com/mrz1836/mixtape/internal/capture"
 )
 
 // ring is a single-producer, single-consumer byte queue between the
@@ -71,6 +73,16 @@ type origin struct {
 	at     time.Time
 	offset int64 // bytes
 	ok     bool  // false when no stamp covers the byte
+}
+
+// capturedAt is when the first byte read was captured: its stamp's time
+// plus the frames between the stamp and that byte; zero when no stamp
+// covers it.
+func (o origin) capturedAt(f capture.Format) time.Time {
+	if !o.ok {
+		return time.Time{}
+	}
+	return o.at.Add(f.Duration(o.offset / int64(f.BytesPerFrame())))
 }
 
 // readInto moves up to len(dst) buffered bytes into dst and returns the

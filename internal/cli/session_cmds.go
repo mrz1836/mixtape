@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"strings"
 	"syscall"
 	"time"
@@ -83,7 +84,10 @@ func (a *app) current() (session.State, bool, error) {
 	case held && (errors.Is(err, session.ErrNoSession) || err == nil && st.ID != info.SessionID):
 		// The running session has not written its session.json yet (the one
 		// there, if any, belongs to an older session in this home).
-		return session.State{ID: info.SessionID, PID: info.PID, Phase: session.PhaseStarting, StartedAt: info.StartedAt}, true, nil
+		return session.State{
+			ID: info.SessionID, PID: info.PID, Phase: session.PhaseStarting, StartedAt: info.StartedAt,
+			Events: session.EventsPath(home, info.SessionID),
+		}, true, nil
 	case err != nil:
 		return session.State{}, held, err
 	}
@@ -173,11 +177,29 @@ func (a *app) follow(ctx context.Context, st session.State) error {
 	if st.Events == "" {
 		return session.ErrNoSession
 	}
+	// A session that just started holds the lock a moment before it
+	// creates its event log: wait for the log while the session runs.
+	err := a.pollUntil(ctx, a.deps.now().Add(lockErrorGrace), pollEvery, func() (bool, error) {
+		if _, statErr := os.Stat(st.Events); statErr == nil {
+			return true, nil
+		}
+		_, held, _ := a.inspectSession()
+		if !held {
+			return false, session.ErrNoSession // it ended before it logged anything
+		}
+		return false, nil
+	})
+	if errors.Is(err, errDeadline) {
+		err = fmt.Errorf("%w: session %s has not started its event log", session.ErrNoSession, st.ID)
+	}
+	if err != nil {
+		return err
+	}
 	// A lock that cannot be read says nothing about the session: keep
 	// following, and give up only when it stays unreadable.
 	var lockErr error
 	var failingSince time.Time
-	_, err := session.Follow(st.Events, 0, &eventWriter{a: a}, func() bool {
+	_, err = session.Follow(st.Events, 0, &eventWriter{a: a}, func() bool {
 		_, held, inspectErr := a.inspectSession()
 		switch {
 		case inspectErr == nil && !held:

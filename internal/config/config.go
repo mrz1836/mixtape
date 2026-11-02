@@ -223,7 +223,7 @@ func table() []setting {
 		{
 			Key: Key{
 				KeyMaxFailures, EnvMaxFailures, strconv.Itoa(DefaultMaxFailures),
-				"End a session after this many songs in a row could not be recorded (0 = never)",
+				"End a session after this many failed attempts in a row (a song is tried twice; 0 = never)",
 			},
 			apply: func(s *Settings, value, _ string) error {
 				n, err := strconv.Atoi(strings.TrimSpace(value))

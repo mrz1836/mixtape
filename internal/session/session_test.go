@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -274,4 +275,66 @@ func TestSpawn(t *testing.T) {
 
 	_, err = Spawn(filepath.Join(t.TempDir(), "missing"), nil, nil, logPath)
 	require.Error(t, err)
+}
+
+func TestDefaultLockPathIsPerUser(t *testing.T) {
+	t.Parallel()
+	path, err := DefaultLockPath()
+	require.NoError(t, err)
+	cache, err := os.UserCacheDir()
+	require.NoError(t, err)
+	assert.Equal(t, filepath.Join(cache, "mixtape", "recorder.lock"), path)
+}
+
+func TestSessionFilesUnderAPlainFileFail(t *testing.T) {
+	t.Parallel()
+	file := filepath.Join(t.TempDir(), "plain")
+	require.NoError(t, os.WriteFile(file, nil, 0o600))
+	under := filepath.Join(file, "inside")
+
+	err := WriteState(under, State{ID: "s1"})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "write session state: ")
+
+	_, err = OpenEventLog(filepath.Join(under, "events.ndjson"))
+	require.ErrorContains(t, err, "open event log: ")
+
+	_, err = Acquire(filepath.Join(under, "recorder.lock"), LockInfo{})
+	require.ErrorContains(t, err, "open the recorder lock: ")
+	_, _, err = Inspect(filepath.Join(under, "recorder.lock"))
+	require.ErrorContains(t, err, "open the recorder lock: ")
+
+	_, err = Follow(filepath.Join(under, "events.ndjson"), 0, io.Discard, func() bool { return false })
+	require.ErrorContains(t, err, "follow the event log: ")
+
+	_, err = Spawn("/bin/sh", nil, nil, filepath.Join(under, "child.log"))
+	require.ErrorContains(t, err, "open session log: ")
+}
+
+func TestReadStateOfAFolderIsAnError(t *testing.T) {
+	t.Parallel()
+	home := t.TempDir()
+	require.NoError(t, os.Mkdir(StatePath(home), 0o700))
+	_, err := ReadState(home)
+	require.Error(t, err)
+	require.NotErrorIs(t, err, ErrNoSession, "a session.json that cannot be read is not a missing one")
+	assert.Contains(t, err.Error(), "read session state: ")
+}
+
+func TestEventLogRejectsWhatJSONCannotHold(t *testing.T) {
+	t.Parallel()
+	log, err := OpenEventLog(filepath.Join(t.TempDir(), "events.ndjson"))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = log.Close() })
+	require.ErrorContains(t, log.Write(func() {}), "encode event: ")
+}
+
+func TestWaitEndsWithTheContext(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(t.Context())
+	assert.True(t, wait(ctx, 0), "no wait while the context lives")
+	cancel()
+	assert.False(t, wait(ctx, 0))
+	assert.False(t, wait(ctx, time.Hour), "a canceled wait returns at once")
+	assert.True(t, wait(t.Context(), time.Millisecond))
 }

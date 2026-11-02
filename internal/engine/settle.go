@@ -158,7 +158,9 @@ func (e *Engine) discardOrRetry(t *take, reason string, kept bool) {
 	case t.userSkipped:
 		e.skip(it, t.eventTrack(), "skipped by you")
 	case e.plan.Mode == ModeLive:
-		it.state = itemDone // live mode records what plays; nothing to retry
+		// Live mode records what plays: nothing is requested again, but
+		// the song is recorded if the listener plays it again.
+		it.state, it.retake = itemDone, true
 	case it.attempts >= maxTakes:
 		e.failItem(it, reason)
 	}

@@ -231,7 +231,8 @@ Exits 0 when the library is consistent and 1 when problems remain.`,
 			if serious := seriousProblems(rep); serious > 0 {
 				hint := "run 'mixtape verify --fix'"
 				if fix {
-					hint = "the next 'mixtape record' run re-records songs set back to pending"
+					hint = "--fix leaves these to you: move a file back into its folder, or replace or delete a file " +
+						"tagged for another song (then 'mixtape record' records what is missing)"
 				}
 				return newError(ExitError, errVerify, hint, "%d problem(s) in the library", serious)
 			}

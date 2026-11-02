@@ -56,8 +56,8 @@ Links may be open.spotify.com URLs (any ?si= share link) or spotify: URIs.
 Track links go to the Singles folder (or --into). With no links, mixtape
 records whatever you play, and presses "next" on songs it already has.
 
-Spotify must be running, and crossfade must be off (Settings → Playback):
-crossfaded songs overlap and cannot be cut. Shuffle is turned off for the
+Spotify must be running, and crossfade and automix must be off (Settings →
+Playback): blended songs overlap and cannot be cut. Shuffle is turned off for the
 session and restored afterwards.
 
 On a terminal: [space] pause/resume, [n] skip the song, [q] quit (Ctrl-C
@@ -97,8 +97,8 @@ Exit codes: 0 complete or stopped, 2 usage, 3 not ready, 4 link not found,
 	fl.BoolVar(&f.mute, "mute", false, "Tap only: silence Spotify on the speakers while recording")
 	fl.DurationVar(&f.idleTimeout, "idle-timeout", 0, "End after this long with nothing recording (config: idle_timeout)")
 	fl.IntVar(&f.maxFailures, "max-failures", config.DefaultMaxFailures,
-		"End after this many songs in a row could not be recorded; 0 = never (config: max_failures)")
-	fl.BoolVar(&f.allowCrossfade, "allow-crossfade", false, "Record even though Spotify's crossfade is on")
+		"End after this many failed attempts in a row (a song is tried twice); 0 = never (config: max_failures)")
+	fl.BoolVar(&f.allowCrossfade, "allow-crossfade", false, "Record even though Spotify's crossfade or automix is on")
 	return cmd
 }
 

@@ -112,3 +112,28 @@ func TestOpenAppend(t *testing.T) {
 	_, err = OpenAppend(filepath.Join(file, "under-a-file.log"))
 	require.Error(t, err)
 }
+
+func TestWriteAtomicFailures(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	require.ErrorIs(t, WriteAtomic("", nil, 0o600), ErrEmptyPath)
+	require.Error(t, WriteAtomic(filepath.Join(dir, "missing", "x"), nil, 0o600), "no folder to hold the temp file")
+
+	// The target is a folder with something in it: the rename fails, and
+	// the temp file is removed rather than left behind.
+	target := filepath.Join(dir, "taken")
+	require.NoError(t, os.MkdirAll(filepath.Join(target, "inside"), 0o700))
+	require.Error(t, WriteAtomic(target, []byte("x"), 0o600))
+	entries, err := os.ReadDir(dir)
+	require.NoError(t, err)
+	for _, e := range entries {
+		assert.False(t, IsTemp(e.Name()), "leftover %s", e.Name())
+	}
+
+	require.Error(t, CopyFile(filepath.Join(dir, "no-such-source"), filepath.Join(dir, "dst"), 0o600))
+	// A folder opens, but cannot be read as a file: the copy fails while
+	// filling the temp file, and nothing lands at dst.
+	err = CopyFile(target, filepath.Join(dir, "dst"), 0o600)
+	require.ErrorContains(t, err, "writing temp file")
+	assert.NoFileExists(t, filepath.Join(dir, "dst"))
+}

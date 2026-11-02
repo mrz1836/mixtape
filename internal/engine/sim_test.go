@@ -10,6 +10,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -80,6 +81,17 @@ type fakeSpotify struct {
 	hold     time.Duration // position frozen at 0 while it re-buffers
 	// ignorePlay makes "play track" do nothing (signed out, offline).
 	ignorePlay bool
+	// cutEarly lists tracks Spotify moves on from this long before their
+	// end without reporting a shorter duration first: a blend the duration
+	// check cannot see.
+	cutEarly map[string]time.Duration
+	// adBreak is an ad Spotify plays before the next requested track.
+	adBreak string
+	// refuse makes the next command of each name ("play", "pause") fail.
+	refuse map[string]error
+	// hungUp: the observation stream ended, as when the osascript watcher
+	// dies; the driver delivers nothing more.
+	hungUp bool
 	// failNext makes the next observations fail with failErr.
 	failNext int
 	failErr  error
@@ -111,6 +123,7 @@ func newFakeSpotify(now func() time.Time, tracks ...simTrack) *fakeSpotify {
 	f := &fakeSpotify{
 		tracks: map[string]simTrack{}, contexts: map[string][]string{},
 		unplayable: map[string]bool{}, relink: map[string]string{}, volume: 50, now: now,
+		cutEarly: map[string]time.Duration{}, refuse: map[string]error{},
 	}
 	for _, t := range tracks {
 		f.tracks[t.id] = t
@@ -143,7 +156,7 @@ func (f *fakeSpotify) advance(d time.Duration) {
 		f.glitched, f.pos, f.hold = true, 0, 400*time.Millisecond
 		return
 	}
-	if f.pos < t.dur-f.crossfade {
+	if f.pos < t.dur-f.crossfade-f.cutEarly[t.id] {
 		return
 	}
 	f.pos = 0
@@ -266,6 +279,9 @@ func (f *fakeSpotify) PlayTrack(_ context.Context, uri, ctxURI string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.log("play " + uri + " in " + ctxURI)
+	if err := f.refused("play"); err != nil {
+		return err
+	}
 	if f.ignorePlay {
 		return nil
 	}
@@ -300,6 +316,10 @@ func (f *fakeSpotify) PlayTrack(_ context.Context, uri, ctxURI string) error {
 		if to, ok := f.relink[f.queue[f.idx]]; ok {
 			f.queue[f.idx] = to
 		}
+		if f.adBreak != "" {
+			f.queue = slices.Insert(f.queue, f.idx, f.adBreak)
+			f.adBreak = ""
+		}
 	}
 	f.pos, f.playing = 0, f.idx < len(f.queue)
 	f.glitched = false
@@ -313,8 +333,29 @@ func (f *fakeSpotify) Pause(context.Context) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.log("pause")
+	if err := f.refused("pause"); err != nil {
+		return err
+	}
 	f.playing = false
 	return nil
+}
+
+// refused returns, once, the failure set for the command name.
+func (f *fakeSpotify) refused(name string) error {
+	err := f.refuse[name]
+	delete(f.refuse, name)
+	return err
+}
+
+// hangUp ends the observation stream, as the osascript watcher dying
+// would.
+func (f *fakeSpotify) hangUp() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.watch != nil && !f.hungUp {
+		close(f.watch)
+	}
+	f.hungUp = true
 }
 
 func (f *fakeSpotify) PlayPause(context.Context) error {
@@ -389,6 +430,10 @@ type fakeSource struct {
 	events chan capture.Event
 	silent bool
 	rate   int // capture rate; 0 is testRate
+	// method is the backend it poses as ("" is a capture device).
+	method capture.Method
+	// startErr makes Start fail.
+	startErr error
 }
 
 // loudLevel is the sample level of the audio a playing song delivers.
@@ -397,7 +442,7 @@ const loudLevel = 3000
 func newFakeSource() *fakeSource { return &fakeSource{events: make(chan capture.Event, 4)} }
 
 func (s *fakeSource) Name() string           { return "fake" }
-func (s *fakeSource) Method() capture.Method { return capture.MethodDevice }
+func (s *fakeSource) Method() capture.Method { return cmp.Or(s.method, capture.MethodDevice) }
 func (s *fakeSource) Format() capture.Format {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -409,6 +454,9 @@ func (s *fakeSource) Close() error                 { return nil }
 func (s *fakeSource) Start(_ context.Context, sink func(capture.Block)) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.startErr != nil {
+		return s.startErr
+	}
 	s.sink = sink
 	return nil
 }
@@ -505,6 +553,11 @@ type sim struct {
 	eng   *Engine // the running engine, for actions that inject faults
 	// pending is an interrupted session's Spotify state to put back.
 	pending *session.SpotifyState
+	// save, when set, is the session's SaveSpotify.
+	save func(session.SpotifyState) error
+	// forceQuit cancels the context Run was given, as a second Ctrl-C does.
+	// Simulated time stops with it.
+	forceQuit context.CancelFunc
 	// actionErrs collects failures of scripted actions, which run on the
 	// driver goroutine and so cannot fail the test themselves.
 	actionErrs []error
@@ -554,7 +607,7 @@ func (s *sim) now() time.Time {
 func (s *sim) run(cols []spotify.Collection, o Options, controls chan Control) (*Plan, Result) {
 	s.t.Helper()
 	s.spotify.mu.Lock()
-	s.spotify.watch, s.spotify.wdone = nil, nil // a new process: no watcher yet
+	s.spotify.watch, s.spotify.wdone, s.spotify.hungUp = nil, nil, false // a new process: no watcher yet
 	s.spotify.mu.Unlock()
 	plan := BuildPlan(s.lib, cols, PlanOptions{Redo: o.Redo})
 	require.NoError(s.t, Prepare(s.lib, plan))
@@ -565,7 +618,7 @@ func (s *sim) run(cols []spotify.Collection, o Options, controls chan Control) (
 	eng, err := New(Config{
 		Player: s.spotify, Source: s.source, Library: s.lib,
 		SpoolDir: filepath.Join(s.home, "spool"), WorkDir: filepath.Join(s.home, "work"),
-		Options: o, Now: s.now, PendingSpotify: s.pending,
+		Options: o, Now: s.now, PendingSpotify: s.pending, SaveSpotify: s.save,
 		Emit: func(ev Event) {
 			s.mu.Lock()
 			s.events = append(s.events, ev)
@@ -574,11 +627,11 @@ func (s *sim) run(cols []spotify.Collection, o Options, controls chan Control) (
 	})
 	require.NoError(s.t, err)
 
-	s.mu.Lock()
-	s.eng = eng
-	s.mu.Unlock()
 	ctx, cancel := context.WithTimeout(s.t.Context(), 30*time.Second)
 	defer cancel()
+	s.mu.Lock()
+	s.eng, s.forceQuit = eng, cancel
+	s.mu.Unlock()
 	done := make(chan struct{})
 	var driver sync.WaitGroup
 	driver.Go(func() { s.drive(ctx, done, eng) })
@@ -642,9 +695,9 @@ func (s *sim) drive(ctx context.Context, done <-chan struct{}, eng *Engine) {
 		}
 		sincePoll = 0
 		s.spotify.mu.Lock()
-		ch, wdone := s.spotify.watch, s.spotify.wdone
+		ch, wdone, hungUp := s.spotify.watch, s.spotify.wdone, s.spotify.hungUp
 		s.spotify.mu.Unlock()
-		if ch == nil {
+		if ch == nil || hungUp {
 			continue
 		}
 		select {

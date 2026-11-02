@@ -162,7 +162,7 @@ func (r *run) anchor() float64 {
 	for i, s := range r.samples {
 		a[i] = s.anchor
 	}
-	return median(a)
+	return medianInPlace(a)
 }
 
 // Segmentize turns a track's observations into the frame ranges to keep
@@ -311,16 +311,19 @@ func rejected(o Obs, cur *run, accepted bool, before time.Time, tn Tuning) bool 
 	return false
 }
 
+// recentSamples is how many of a run's last samples recentAnchor uses.
+const recentSamples = 5
+
 // recentAnchor is the median anchor of a run's last few samples, the
-// reference a new sample is compared with to detect a seek.
+// reference a new sample is compared with to detect a seek. It runs for
+// every observation, so it works in a buffer on the stack.
 func recentAnchor(r *run) float64 {
-	n := len(r.samples)
-	from := max(n-5, 0)
-	a := make([]float64, 0, n-from)
-	for _, s := range r.samples[from:] {
+	var buf [recentSamples]float64
+	a := buf[:0]
+	for _, s := range r.samples[max(len(r.samples)-recentSamples, 0):] {
 		a = append(a, s.anchor)
 	}
-	return median(a)
+	return medianInPlace(a)
 }
 
 // runStart is the song position where run i began.
@@ -377,15 +380,18 @@ func runEnd(tl Timeline, runs []run, i int, dur float64, tn Tuning) float64 {
 	return min(last.pos+tl.EndAt.Sub(last.at).Seconds(), dur)
 }
 
-func median(v []float64) float64 {
-	if len(v) == 0 {
+// median is the median of v (0 for none); v is left as it was.
+func median(v []float64) float64 { return medianInPlace(slices.Clone(v)) }
+
+// medianInPlace is the median of v (0 for none), sorting v to find it.
+func medianInPlace(v []float64) float64 {
+	n := len(v)
+	if n == 0 {
 		return 0
 	}
-	s := slices.Clone(v)
-	slices.Sort(s)
-	n := len(s)
+	slices.Sort(v)
 	if n%2 == 1 {
-		return s[n/2]
+		return v[n/2]
 	}
-	return (s[n/2-1] + s[n/2]) / 2
+	return (v[n/2-1] + v[n/2]) / 2
 }

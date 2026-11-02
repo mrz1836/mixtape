@@ -48,9 +48,9 @@ func newDoctorCmd(a *app) *cobra.Command {
 		Short: "Check that everything needed to record is in place",
 		Long: `Check every prerequisite for recording and say how to fix what is missing:
 macOS version, the Spotify app (installed, running, Automation permission),
-crossfade (must be off), volume, the capture method (process tap, or
-BlackHole with the output routed through it), afconvert, the library folder,
-the config file, and any running or interrupted session.
+crossfade and automix (must be off), volume, the capture method (process
+tap, or BlackHole with the output routed through it), afconvert, the library
+folder, the config file, and any running or interrupted session.
 
 Exits 0 when ready and 3 when a check fails. Warnings do not block.`,
 		Example: `  mixtape doctor

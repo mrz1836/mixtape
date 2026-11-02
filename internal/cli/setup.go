@@ -104,7 +104,7 @@ func newSetupCmd(a *app) *cobra.Command {
      Multi-Output Device; setup can install BlackHole with Homebrew and
      opens Audio MIDI Setup with the steps.
   2. A short test capture while Spotify plays proves the method works.
-  3. The Spotify Automation prompt, crossfade and volume.
+  3. The Spotify Automation prompt, crossfade, automix and volume.
   4. The library folder.
 
 Only a verified capture method is saved to the config. --yes accepts every
@@ -143,7 +143,7 @@ func (a *app) setupNonInteractive(ctx context.Context) error {
 }
 
 const setupSteps = `Manual setup:
-  1. Spotify: Settings → Playback → turn off "Crossfade songs"; set Spotify's volume to the maximum.
+  1. Spotify: Settings → Playback → turn off "Crossfade songs" and "Automix"; set Spotify's volume to the maximum.
   2. Capture, either:
      a. Process tap (macOS 14.2+): mixtape config set capture tap — the first recording asks
         macOS for audio-recording permission for your terminal app.
@@ -245,7 +245,7 @@ func (s *setupFlow) run(ctx context.Context) error {
 
 	if c := a.checkCrossfade(); c.Status == checkFail {
 		s.say("%s %s\n  %s", a.out.paint(colorRed, "✗"), c.Detail, c.Fix)
-		s.pause("Turn crossfade off, then press Enter.")
+		s.pause("Turn it off, then press Enter.")
 	}
 
 	path := config.Path(a.home)
