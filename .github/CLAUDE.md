@@ -34,7 +34,7 @@ stores it in a library with manifests, `.m3u8` playlists and audio hashes.
 | `internal/cli` | cobra tree, output (text/JSON/NDJSON), error → exit-code mapping, commands |
 | `internal/config` | `config.json` + `MIXTAPE_*` env + flags, with value sources |
 | `internal/spotify` | link parsing, AppleScript player, catalog (embed/oEmbed), prefs |
-| `internal/capture` | backend-neutral types and method selection (no cgo) |
+| `internal/capture` | backend-neutral types, method selection and the shared source lifecycle (no cgo) |
 | `internal/capture/tap` | Core Audio process tap (ObjC, C ring) |
 | `internal/capture/device` | malgo capture device |
 | `internal/spool` | chunked PCM spool with a time index |
