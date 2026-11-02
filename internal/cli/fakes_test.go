@@ -131,6 +131,7 @@ type fakeWorld struct {
 	lockPath  string
 	killed    []int
 	onKill    func(pid int)
+	killErr   error // returned by kill after onKill
 	// perms answers permission checks (missing kinds are granted); grantAfter
 	// flips a kind to granted after that many checks, like a user switching
 	// it on in System Settings.
@@ -194,12 +195,12 @@ func (w *fakeWorld) services(h *harness) services {
 		kill: func(pid int, _ syscall.Signal) error {
 			w.mu.Lock()
 			w.killed = append(w.killed, pid)
-			fn := w.onKill
+			fn, err := w.onKill, w.killErr
 			w.mu.Unlock()
 			if fn != nil {
 				fn(pid)
 			}
-			return nil
+			return err
 		},
 		sleep: func(ctx context.Context, d time.Duration) bool {
 			h.advance(d)

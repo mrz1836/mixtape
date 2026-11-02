@@ -15,6 +15,9 @@ type Collection struct {
 	Manifest Manifest
 
 	dirty bool // reconciled in memory, not yet saved
+	// staleWAVs are kept WAVs whose songs reconcile found on disk; they are
+	// removed only by a writer, once the manifest no longer needs them.
+	staleWAVs []string
 }
 
 // Folder returns the folder's base name.

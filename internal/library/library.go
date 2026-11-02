@@ -144,6 +144,10 @@ func (l *Library) Lock() (unlock func(), err error) {
 			unlock()
 			return nil, saveErr
 		}
+		for _, w := range c.staleWAVs {
+			_ = os.Remove(w)
+		}
+		c.staleWAVs = nil
 	}
 	return unlock, nil
 }

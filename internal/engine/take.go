@@ -333,6 +333,10 @@ func (e *Engine) beginTake(ctx context.Context, s spotify.Snapshot) {
 // beginRecording marks t as recording item, restarting the song from the
 // top when it was joined mid-song.
 func (e *Engine) beginRecording(ctx context.Context, t *take, it *Item, s spotify.Snapshot) {
+	if reason := e.tooLong(s.Track.Duration); reason != "" {
+		e.failItem(it, reason) // it would only fail after playing for hours
+		return
+	}
 	t.item = it // a candidate until it records
 	if s.State != spotify.StatePlaying {
 		return // loaded but not playing yet: promoted when it starts
@@ -586,13 +590,18 @@ func (e *Engine) failItem(it *Item, reason string) {
 
 // render writes a segment's frames to a WAV in the work directory.
 func (e *Engine) render(t *take, seg Segment) (string, error) {
+	// The engine lock is held only to pick the spool and its bounds: render
+	// runs on the engine goroutine, as do pruning and reopening, so the
+	// spool stays put while it is read, and capture keeps appending (the
+	// spool guards itself) instead of waiting for the whole WAV write.
 	e.spoolMu.Lock()
-	defer e.spoolMu.Unlock()
 	sp := e.spool
 	if sp == nil {
+		e.spoolMu.Unlock()
 		return "", errNoSpool
 	}
 	oldest, newest := sp.Oldest(), sp.Frames()
+	e.spoolMu.Unlock()
 	ranges := make([]Range, 0, len(seg.Ranges))
 	var total int64
 	for _, r := range seg.Ranges {
@@ -762,4 +771,18 @@ func (e *Engine) streakError() error {
 		return fmt.Errorf("%w (%d in a row)", ErrNotStarting, n)
 	}
 	return fmt.Errorf("%w (%d in a row; the last: %s)", ErrFailing, n, e.lastSetback)
+}
+
+// tooLong explains why a song of duration d cannot be recorded (its WAV
+// would pass the format's 4 GiB limit), or returns "".
+func (e *Engine) tooLong(d time.Duration) string {
+	if e.cfg.Source == nil || d <= 0 {
+		return ""
+	}
+	f := e.cfg.Source.Format()
+	if limit := wav.MaxDuration(f.Rate, f.Channels); limit > 0 && d > limit {
+		return fmt.Sprintf("too long to record: %s, and a recording can hold at most %s at %d Hz",
+			d.Round(time.Minute), limit.Round(time.Minute), f.Rate)
+	}
+	return ""
 }

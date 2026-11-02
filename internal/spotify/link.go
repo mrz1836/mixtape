@@ -70,6 +70,9 @@ func ParseRef(s string) (Ref, error) {
 
 func parseURI(raw, orig string) (Ref, error) {
 	parts := strings.Split(raw, ":")
+	if hasCollection(parts) {
+		return Ref{}, fmt.Errorf("%w: %s", ErrUnsupportedLink, kindName("collection"))
+	}
 	// spotify:user:<name>:playlist:<id> → spotify:playlist:<id>
 	if len(parts) == 5 && strings.EqualFold(parts[1], "user") {
 		parts = []string{parts[0], parts[3], parts[4]}
@@ -103,6 +106,9 @@ func parseURL(raw, orig string) (Ref, error) {
 	segs := strings.FieldsFunc(u.Path, func(r rune) bool { return r == '/' })
 	if len(segs) > 0 && strings.HasPrefix(strings.ToLower(segs[0]), "intl-") {
 		segs = segs[1:] // locale prefix: /intl-de/track/<id>
+	}
+	if hasCollection(segs) {
+		return Ref{}, fmt.Errorf("%w: %s", ErrUnsupportedLink, kindName("collection"))
 	}
 	// /user/<name>/playlist/<id> (legacy share links)
 	if len(segs) == 4 && strings.EqualFold(segs[0], "user") && strings.EqualFold(segs[2], "playlist") {
@@ -140,8 +146,19 @@ func makeRef(kind, id, orig string) (Ref, error) {
 // be recorded as songs.
 func isUnsupportedKind(kind string) bool {
 	switch kind {
-	case "episode", "show", "artist", "local", "user", "ad", "concert", "audiobook", "chapter", "genre":
+	case "episode", "show", "artist", "local", "user", "ad", "concert", "audiobook", "chapter", "genre", "collection":
 		return true
+	}
+	return false
+}
+
+// hasCollection reports a link into the listener's own library (Liked
+// Songs is spotify:collection:tracks, or spotify:user:<name>:collection).
+func hasCollection(parts []string) bool {
+	for _, p := range parts {
+		if strings.EqualFold(p, "collection") {
+			return true
+		}
 	}
 	return false
 }
@@ -155,6 +172,13 @@ func kindName(kind string) string {
 		return "user profiles are not collections (link a playlist)"
 	case "ad":
 		return "ads cannot be recorded"
+	case "collection":
+		return "Liked Songs and Your Library are private to your account, so mixtape cannot read their track list; " +
+			"add the songs to a playlist and link that, or play them in Spotify and run 'mixtape record' with no link"
+	case "artist":
+		return "artist links are not supported (link one of the artist's albums, or a playlist)"
+	case "episode", "show", "audiobook", "chapter":
+		return kind + " links are not supported (mixtape records songs, not podcasts or audiobooks)"
 	}
 	return kind + " links are not supported (link a track, album or playlist)"
 }

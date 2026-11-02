@@ -303,7 +303,12 @@ func (a *app) stop(ctx context.Context, noWait bool) error {
 		return errNotRunning
 	}
 	if killErr := a.deps.services.kill(info.PID, syscall.SIGTERM); killErr != nil {
-		return fmt.Errorf("signal session %s (pid %d): %w", info.SessionID, info.PID, killErr)
+		if !errors.Is(killErr, syscall.ESRCH) {
+			return fmt.Errorf("signal session %s (pid %d): %w", info.SessionID, info.PID, killErr)
+		}
+		// The session ended between the lock check and the signal: it is
+		// stopped either way, so report how it finished.
+		noWait = false
 	}
 	if noWait {
 		return a.out.Result(fmt.Sprintf("stopping session %s (pid %d)", info.SessionID, info.PID),

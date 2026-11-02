@@ -45,6 +45,22 @@ const (
 // behind `application "Spotify" is running`. Track reads are wrapped in
 // their own try so a stopped player with nothing loaded still reports.
 const snapshotHandler = `
+on mixtapeClean(t)
+	-- One line per snapshot: no line breaks or separators inside a field,
+	-- and "missing value" (a podcast, a local file) reads as empty.
+	if t is missing value then return ""
+	set t to t as text
+	set saved to AppleScript's text item delimiters
+	repeat with c in {linefeed, return, character id 31}
+		set AppleScript's text item delimiters to (contents of c)
+		set parts to text items of t
+		set AppleScript's text item delimiters to " "
+		set t to parts as text
+	end repeat
+	set AppleScript's text item delimiters to saved
+	return t
+end mixtapeClean
+
 on mixtapeSnapshot()
 	set US to character id 31
 	if application "Spotify" is not running then return "N"
@@ -66,16 +82,16 @@ on mixtapeSnapshot()
 			set mArtwork to ""
 			try
 				set mTrack to current track
-				set mID to id of mTrack
-				set mName to name of mTrack
-				set mArtist to artist of mTrack
-				set mAlbum to album of mTrack
-				set mAlbumArtist to album artist of mTrack
+				set mID to my mixtapeClean(id of mTrack)
+				set mName to my mixtapeClean(name of mTrack)
+				set mArtist to my mixtapeClean(artist of mTrack)
+				set mAlbum to my mixtapeClean(album of mTrack)
+				set mAlbumArtist to my mixtapeClean(album artist of mTrack)
 				set mDuration to duration of mTrack
 				set mTrackNumber to track number of mTrack
 				set mDiscNumber to disc number of mTrack
 				set mPopularity to popularity of mTrack
-				set mArtwork to artwork url of mTrack
+				set mArtwork to my mixtapeClean(artwork url of mTrack)
 			end try
 			set mPosition to player position
 		end tell
@@ -350,10 +366,10 @@ func (p *Player) parseSnapshot(line string, at time.Time) Snapshot {
 	snap.Track = Track{
 		ID:          parseTrackURI(uri),
 		URI:         uri,
-		Name:        f[fName],
-		Artist:      f[fArtist],
-		Album:       f[fAlbum],
-		AlbumArtist: f[fAlbumArtist],
+		Name:        textField(f[fName]),
+		Artist:      textField(f[fArtist]),
+		Album:       textField(f[fAlbum]),
+		AlbumArtist: textField(f[fAlbumArtist]),
 		TrackNumber: atoi(f[fTrackNumber]),
 		DiscNumber:  atoi(f[fDiscNumber]),
 		Popularity:  atoi(f[fPopularity]),
@@ -363,6 +379,15 @@ func (p *Player) parseSnapshot(line string, at time.Time) Snapshot {
 		snap.Track.Duration = time.Duration(ms) * time.Millisecond
 	}
 	return snap
+}
+
+// textField is a text field as read: AppleScript's "missing value" (no
+// value at all) becomes empty.
+func textField(s string) string {
+	if s == "missing value" {
+		return ""
+	}
+	return s
 }
 
 // isSnapshotLine reports whether a streamed line is one the watch script

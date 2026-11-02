@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -33,6 +34,13 @@ type recordFlags struct {
 	match, into, capture, device                                     string
 	idleTimeout                                                      time.Duration
 }
+
+// How long `record --detach` waits for the background session to start:
+// a base, plus a catalog lookup per link.
+const (
+	detachWait        = 30 * time.Second
+	spotifyLookupWait = 15 * time.Second
+)
 
 var (
 	errCrossfade   = errors.New("spotify crossfade is on, so songs overlap and cannot be cut cleanly")
@@ -287,31 +295,69 @@ func (a *app) record(ctx context.Context, cmd *cobra.Command, lib *library.Libra
 	}
 	defer func() { _ = lock.Release() }()
 
+	// From here a stop request (Ctrl-C, `mixtape stop`) ends the setup
+	// gracefully instead of killing the process mid-way.
+	setupCtx, stopGuard, stopped := a.guardSetup(ctx)
+	defer stopGuard()
+
 	p := svc.player()
-	pending := a.recoverSpotify(ctx, p) // even when nothing plays: a copy-only run must not lose it
+	pending := a.recoverSpotify(setupCtx, p) // even when nothing plays: a copy-only run must not lose it
 	unlock, err := lib.Lock()
 	if err != nil {
 		return err
 	}
 	defer unlock()
 
-	var src capture.Source
-	if playback {
-		if src, err = a.openSource(ctx, cmd, p, settings, f); err != nil {
-			return err
-		}
-	}
-	rec, err := a.newRecorder(id, plan, settings, src, args, pending)
+	rec, err := a.newRecorder(id, plan, settings, nil, args, pending)
 	if err != nil {
-		closeSource(src)
 		return err
 	}
 	defer rec.close()
+	var src capture.Source
+	if playback {
+		if src, err = a.openSource(setupCtx, cmd, p, settings, f); err != nil {
+			return rec.abort(err, stopped())
+		}
+		rec.setCapture(src)
+	}
 	if err := engine.Prepare(lib, plan); err != nil {
 		closeSource(src)
-		return err
+		return rec.abort(err, false)
 	}
+	if stopped() {
+		closeSource(src)
+		return rec.abort(context.Canceled, true)
+	}
+	// The guard stays until the end: the session's own handler starts inside
+	// run, and a signal reaches both, so none falls in between.
 	return rec.run(ctx, lib, plan, p, src, settings, f)
+}
+
+// guardSetup handles stop signals while a session sets up: they cancel the
+// returned context, and stopped reports whether one arrived. release ends
+// the guard (it is safe to call more than once).
+func (a *app) guardSetup(ctx context.Context) (setup context.Context, release func(), stopped func() bool) {
+	setup, cancel := context.WithCancel(ctx)
+	sigs, stopSigs := a.deps.services.signals()
+	signal.Ignore(syscall.SIGHUP, syscall.SIGPIPE)
+	var got atomic.Bool
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-done:
+		case <-sigs:
+			got.Store(true)
+			cancel()
+		}
+	}()
+	var once sync.Once
+	release = func() {
+		once.Do(func() {
+			close(done)
+			stopSigs()
+		})
+	}
+	return setup, release, got.Load
 }
 
 // needsPlayback reports whether the plan records anything.
@@ -453,7 +499,9 @@ func (a *app) detach(ctx context.Context, cmd *cobra.Command, args []string) err
 		_, _ = proc.Wait()
 		close(exited)
 	}()
-	wctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	// The child looks every link up before it takes the lock: allow for
+	// that, and never leave it running unseen when the wait gives up.
+	wctx, cancel := context.WithTimeout(ctx, detachWait+time.Duration(len(args))*spotifyLookupWait)
 	defer cancel()
 	err = session.AwaitStart(wctx, lockPath, id, func() bool {
 		select {
@@ -464,6 +512,7 @@ func (a *app) detach(ctx context.Context, cmd *cobra.Command, args []string) err
 		}
 	})
 	if err != nil {
+		_ = svc.kill(proc.Pid, syscall.SIGTERM)
 		return fmt.Errorf("%w; see %s", err, logPath)
 	}
 	doc := detachDoc{SessionID: id, PID: proc.Pid, Events: session.EventsPath(a.home, id), Log: logPath}
@@ -517,7 +566,7 @@ func (a *app) newRecorder(
 	now := a.deps.now()
 	captureName := "none (nothing to play)"
 	if src != nil {
-		captureName = string(src.Method()) + " (" + src.Name() + ")"
+		captureName = captureLabel(src)
 	}
 	r := &recorder{a: a, id: id, log: log, state: session.State{
 		ID: id, PID: os.Getpid(), Phase: session.PhaseStarting, Mode: plan.Mode,
@@ -531,6 +580,32 @@ func (a *app) newRecorder(
 	}
 	r.write()
 	return r, nil
+}
+
+func captureLabel(src capture.Source) string { return string(src.Method()) + " (" + src.Name() + ")" }
+
+// setCapture records the capture backend once it is open.
+func (r *recorder) setCapture(src capture.Source) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.state.Capture = captureLabel(src)
+	r.write()
+}
+
+// abort ends a session that failed (or was stopped) before it ran, so its
+// state says how it ended rather than "starting".
+func (r *recorder) abort(err error, stopped bool) error {
+	r.mu.Lock()
+	counts := r.state.Counts
+	r.mu.Unlock()
+	counts.Remaining = counts.Total
+	res := engine.Result{Outcome: engine.OutcomeIncomplete, Counts: counts, Err: err}
+	if stopped {
+		res = engine.Result{Outcome: engine.OutcomeStopped, Counts: counts}
+	}
+	exit, failure := outcomeExit(res, false)
+	r.finish(res, exit, failure)
+	return failure
 }
 
 func (r *recorder) close() {

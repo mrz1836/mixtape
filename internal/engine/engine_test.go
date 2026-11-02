@@ -323,6 +323,22 @@ func TestMergePending(t *testing.T) {
 	assert.Equal(t, session.SpotifyState{}, mergePending(session.SpotifyState{}, nil, spotify.Snapshot{}))
 }
 
+func TestSongTooLongForAWAVFailsWithoutPlaying(t *testing.T) {
+	t.Parallel()
+	// At the test's 8 kHz a WAV holds about 37 hours.
+	marathon := simTrack{id: "0000000000000000000lng", name: "Marathon", artist: "Drone", dur: 40 * time.Hour}
+	s := newSim(t, marathon, songA)
+	_, res := s.run(singles(marathon, songA), Options{}, nil)
+	assert.Equal(t, 1, res.Counts.Recorded)
+	assert.Equal(t, 1, res.Counts.Failed)
+	failed := s.eventsOf(EventTrackFailed)
+	require.Len(t, failed, 1)
+	assert.Contains(t, failed[0].Reason, "too long to record")
+	for _, c := range s.spotify.Commands() {
+		assert.NotContains(t, c, marathon.id, "it is never played")
+	}
+}
+
 func TestUserPauseIsExcised(t *testing.T) {
 	t.Parallel()
 	s := newSim(t, songC)

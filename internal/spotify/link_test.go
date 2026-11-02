@@ -135,3 +135,18 @@ func TestParseTrackURI(t *testing.T) {
 	assert.Empty(t, parseTrackURI("spotify:track:"))
 	assert.Empty(t, parseTrackURI(""))
 }
+
+func TestParseRefLikedSongsIsUnsupported(t *testing.T) {
+	t.Parallel()
+	for _, in := range []string{
+		"https://open.spotify.com/collection/tracks",
+		"open.spotify.com/collection/tracks?si=abc",
+		"spotify:collection:tracks",
+		"spotify:user:someone:collection",
+		"spotify:user:someone:collection:tracks",
+	} {
+		_, err := ParseRef(in)
+		require.ErrorIs(t, err, ErrUnsupportedLink, in)
+		assert.Contains(t, err.Error(), "Liked Songs", in)
+	}
+}

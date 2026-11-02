@@ -123,6 +123,28 @@ func TestPollLocaleAndEmptyTrack(t *testing.T) {
 	assert.Equal(t, Track{}, s.Track)
 }
 
+func TestPollMissingTextFieldsAreEmpty(t *testing.T) {
+	t.Parallel()
+	f := []string{
+		"playing", "80", "false", "false", "spotify:track:" + testTrackID, "Song", "missing value",
+		"missing value", "missing value", "1000", "1", "1", "0", "", "1.5",
+	}
+	line := markSnapshot + fieldSep + strings.Join(f, fieldSep)
+	p := newTestPlayer(&fakeRunner{run: func(string) (string, error) { return line, nil }}, true)
+	s := p.Poll(t.Context())
+	require.NoError(t, s.Err)
+	assert.Equal(t, "Song", s.Track.Name)
+	assert.Empty(t, s.Track.Artist)
+	assert.Empty(t, s.Track.Album)
+	assert.Empty(t, s.Track.AlbumArtist)
+}
+
+func TestSnapshotScriptKeepsEachSnapshotOnOneLine(t *testing.T) {
+	t.Parallel()
+	assert.Contains(t, snapshotHandler, "my mixtapeClean(name of mTrack)", "names are cleaned of line breaks")
+	assert.Contains(t, snapshotHandler, "repeat with c in {linefeed, return, character id 31}")
+}
+
 func TestPollMissingPosition(t *testing.T) {
 	t.Parallel()
 	line := snapLine("stopped", "", "", "", "missing value")

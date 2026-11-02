@@ -464,6 +464,11 @@ func TestReconcileAfterCrash(t *testing.T) {
 	for i := range m.Tracks {
 		m.Tracks[i].Status, m.Tracks[i].File, m.Tracks[i].AudioSHA256 = StatusPending, "", ""
 	}
+	// Time had been kept as a WAV for a re-encode before it was stored.
+	kept := filepath.Join(f.work, "failed", "kept.wav")
+	require.NoError(t, os.MkdirAll(filepath.Dir(kept), 0o750))
+	require.NoError(t, os.WriteFile(kept, []byte("RIFF"), 0o600))
+	m.Tracks[0].Status, m.Tracks[0].PendingWAV = StatusEncodeFailed, kept
 	data, err := json.Marshal(m)
 	require.NoError(t, err)
 	require.NoError(t, os.WriteFile(filepath.Join(c.Dir, ManifestName), data, 0o600))
@@ -474,12 +479,14 @@ func TestReconcileAfterCrash(t *testing.T) {
 	assert.True(t, c2.Done(idTime))
 	assert.Equal(t, timeEntry.AudioSHA256, c2.Entry(idTime).AudioSHA256)
 	assert.Equal(t, "renamed.m4a", c2.Entry(idMoney).File)
-	assert.Equal(t, StatusPending, readManifest(t, c.Dir).Tracks[0].Status, "Open itself never writes")
+	assert.Equal(t, StatusEncodeFailed, readManifest(t, c.Dir).Tracks[0].Status, "Open itself never writes")
+	assert.FileExists(t, kept, "a read-only Open deletes nothing")
 
 	unlock, err := lib.Lock()
 	require.NoError(t, err)
 	defer unlock()
 	assert.Equal(t, StatusRecorded, readManifest(t, c.Dir).Tracks[0].Status, "Lock persists the repair")
+	assert.NoFileExists(t, kept, "the writer removes the WAV the repair made unnecessary")
 }
 
 func TestUnreadableManifestIsSkipped(t *testing.T) {

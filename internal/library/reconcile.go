@@ -45,7 +45,7 @@ func (l *Library) reconcile(c *Collection) bool {
 			}
 		}
 		if e.PendingWAV != "" {
-			_ = os.Remove(e.PendingWAV)
+			c.staleWAVs = append(c.staleWAVs, e.PendingWAV) // Lock removes it: Open must not write
 		}
 		e.Status, e.File, e.AudioSHA256 = StatusRecorded, name, hash
 		e.Partial = tags.Freeform[TagPartial] == "1"

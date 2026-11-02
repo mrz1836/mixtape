@@ -169,6 +169,10 @@ func (e *Engine) nextRecord() *Item {
 
 // request asks Spotify to play it in its collection's context.
 func (e *Engine) request(ctx context.Context, it *Item, at time.Time) {
+	if reason := e.tooLong(time.Duration(it.Track.DurationMS) * time.Millisecond); reason != "" {
+		e.failItem(it, reason) // never played: it could not be saved
+		return
+	}
 	e.releaseCur()
 	err := e.cfg.Player.PlayTrack(ctx, spotify.TrackURI(it.Track.ID), it.Group.ContextURI)
 	if err != nil {

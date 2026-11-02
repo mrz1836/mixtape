@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"time"
 )
 
 // BitsPerSample is the only sample width Mixtape records.
@@ -20,6 +21,16 @@ const HeaderSize = 44
 // ErrHeader reports a format or size that the 32-bit RIFF header cannot
 // describe (data over ~4 GiB, or an absurd sample rate or channel count).
 var ErrHeader = errors.New("wav: value does not fit the RIFF header")
+
+// MaxDuration is the longest recording a WAV can hold at rate Hz with the
+// given channel count (about 6.2 hours of 48 kHz stereo).
+func MaxDuration(rate, channels int) time.Duration {
+	perSecond := int64(rate) * int64(channels) * BitsPerSample / 8
+	if perSecond <= 0 {
+		return 0
+	}
+	return time.Duration((math.MaxUint32 - 36) / perSecond * int64(time.Second))
+}
 
 // WriteHeader writes the header for dataSize bytes of interleaved PCM16LE
 // audio at rate Hz with the given channel count. The caller streams exactly

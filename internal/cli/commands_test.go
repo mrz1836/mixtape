@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -239,6 +240,27 @@ func TestStatusWaitStop(t *testing.T) {
 	require.Equal(t, ExitOK, h.run("wait"), "a finished session returns its own result at once")
 	require.Equal(t, ExitOK, h.run("status"))
 	assert.Equal(t, false, h.json()["running"])
+}
+
+func TestStopRacingTheSessionsEndReportsItsResult(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	home := h.env["MIXTAPE_HOME"]
+	lock, err := session.Acquire(h.world.lockPath, session.LockInfo{PID: 4242, SessionID: "s1", Home: home})
+	require.NoError(t, err)
+	st := session.State{ID: "s1", PID: 4242, Phase: session.PhaseRecording, StartedAt: h.now()}
+	require.NoError(t, session.WriteState(home, st))
+
+	// The session finishes on its own just before the signal arrives.
+	h.world.onKill = func(int) {
+		code := 0
+		st.Phase, st.Result, st.ExitCode = session.PhaseFinished, session.ResultComplete, &code
+		require.NoError(t, session.WriteState(home, st))
+		require.NoError(t, lock.Release())
+	}
+	h.world.killErr = syscall.ESRCH
+	require.Equal(t, ExitOK, h.run("stop", "--no-wait"), "a session that already ended is stopped")
+	assert.Equal(t, "complete", h.json()["session"].(map[string]any)["result"])
 }
 
 func TestWaitReturnsTheSessionExitCode(t *testing.T) {
@@ -484,6 +506,37 @@ func TestRecordStopsAtOnceWithoutTheTapPermission(t *testing.T) {
 	assert.Contains(t, e["message"], "iTerm may not record system audio yet")
 	assert.Contains(t, e["hint"], "System Audio Recording Only")
 	assert.Contains(t, e["hint"], "mixtape setup")
+}
+
+func TestStopDuringSetupEndsTheSessionAsStopped(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	h.world.addPlaylist("List", songs()...)
+	// `mixtape stop` arrives while the session is still setting up.
+	h.deps.services.signals = func() (<-chan os.Signal, func()) {
+		ch := make(chan os.Signal, 1)
+		ch <- syscall.SIGTERM
+		return ch, func() {}
+	}
+	require.Equal(t, ExitOK, h.run("record", plURL))
+	st, err := session.ReadState(h.env["MIXTAPE_HOME"])
+	require.NoError(t, err)
+	assert.Equal(t, session.PhaseFinished, st.Phase)
+	assert.Equal(t, session.ResultStopped, st.Result, "the session says it was stopped, not starting")
+}
+
+func TestRecordSetupFailureIsRecordedInTheSessionState(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	h.world.addPlaylist("List", songs()...)
+	h.world.perms[permission.SystemAudio] = permission.Undecided
+
+	require.Equal(t, ExitPermission, h.run("record", plURL))
+	st, err := session.ReadState(h.env["MIXTAPE_HOME"])
+	require.NoError(t, err)
+	assert.Equal(t, session.PhaseFinished, st.Phase)
+	assert.Equal(t, session.ResultError, st.Result)
+	assert.Contains(t, st.Error, "may not record system audio")
 }
 
 func TestSetupOpensSettingsAndWaitsForTheTapPermission(t *testing.T) {

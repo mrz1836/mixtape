@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -106,4 +107,12 @@ func TestAfconvertAccepts(t *testing.T) {
 	info, err := os.Stat(out)
 	require.NoError(t, err)
 	assert.Positive(t, info.Size())
+}
+
+func TestMaxDuration(t *testing.T) {
+	t.Parallel()
+	d := MaxDuration(48000, 2)
+	assert.Greater(t, d, 6*time.Hour)
+	assert.Less(t, d, 6*time.Hour+15*time.Minute)
+	assert.Zero(t, MaxDuration(0, 2))
 }
