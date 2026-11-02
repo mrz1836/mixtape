@@ -90,29 +90,37 @@ func (a *app) diagnose(ctx context.Context) doctorDoc {
 			Fix: "install Spotify from https://www.spotify.com/download",
 		})
 	}
-	running, _ := svc.spotifyRunning()
 	snap := spotify.Snapshot{Err: spotify.ErrNotRunning}
-	if running {
+	proc, procErr := a.spotifyStatus()
+	switch proc {
+	case spotifyRunning:
 		add(check{ID: "spotify_running", Name: "Spotify running", Status: checkOK, Detail: "running"})
-		// Ask macOS first: polling Spotify while Automation is undecided
-		// would put a prompt on screen, and doctor never prompts.
-		if c, ok := a.automationState(); ok {
-			add(c)
-		} else {
-			pctx, cancel := context.WithTimeout(ctx, 8*time.Second)
-			snap = svc.player().Poll(pctx)
-			cancel()
-			add(automationCheck(snap))
-		}
-	} else {
+	case spotifyStopped:
 		add(check{
 			ID: "spotify_running", Name: "Spotify running", Status: checkFail, Detail: "not running",
 			Fix: "open Spotify (open -a Spotify)",
 		})
+	case spotifyUnknown:
+		// Polling never launches Spotify, so it still tells whether it runs.
+		add(check{
+			ID: "spotify_running", Name: "Spotify running", Status: checkWarn,
+			Detail: "could not check Spotify: " + procErr.Error(),
+		})
+	}
+	if proc == spotifyStopped {
 		add(check{
 			ID: "automation", Name: "Automation permission", Status: checkSkip,
 			Detail: "checked once Spotify is running",
 		})
+	} else if c, ok := a.automationState(); ok {
+		// Ask macOS first: polling Spotify while Automation is undecided
+		// would put a prompt on screen, and doctor never prompts.
+		add(c)
+	} else {
+		pctx, cancel := context.WithTimeout(ctx, 8*time.Second)
+		snap = svc.player().Poll(pctx)
+		cancel()
+		add(automationCheck(snap))
 	}
 	add(a.checkCrossfade())
 	add(volumeCheck(snap))

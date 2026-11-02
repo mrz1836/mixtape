@@ -215,8 +215,12 @@ func (s *setupFlow) run(ctx context.Context) error {
 	if _, ok := svc.spotifyApp(a.deps.userHome); !ok {
 		return spotify.ErrNotInstalled
 	}
-	if running, _ := svc.spotifyRunning(); !running {
+	switch proc, err := a.spotifyStatus(); proc {
+	case spotifyStopped:
 		s.pause("Open Spotify, then press Enter.")
+	case spotifyUnknown:
+		s.say("%s could not check Spotify: %v", a.out.paint(colorYellow, "!"), err)
+	case spotifyRunning:
 	}
 	s.say("Checking that mixtape can control Spotify (macOS may ask you to allow it)…")
 	if !s.ensure(ctx, permission.Automation) {
@@ -293,7 +297,10 @@ func (s *setupFlow) chooseCapture(ctx context.Context, settings config.Settings)
 func (s *setupFlow) setupDevice(ctx context.Context, settings config.Settings) (capture.Method, error) {
 	a := s.a
 	svc := a.deps.services
-	devs, _ := svc.devices()
+	devs, err := svc.devices()
+	if err != nil {
+		return "", fmt.Errorf("list audio devices: %w", err)
+	}
 	if findDevice(devs, settings.Device) == nil {
 		if !s.ask("BlackHole 2ch is not installed. Install it with Homebrew now (brew install blackhole-2ch)?", true) {
 			return "", fmt.Errorf("%w: no capture device", errNotReady)

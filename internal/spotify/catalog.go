@@ -255,11 +255,15 @@ func collectionFromEntity(ref Ref, e *embedEntity) (Collection, error) {
 }
 
 // ReleaseDate looks a track's release date up on its embed page; it returns
-// YYYY-MM-DD, or "" when the page does not name one.
+// YYYY-MM-DD, or "" when the page does not name one. A track Spotify does
+// not know is ErrNotFound; any other failure wraps ErrCatalog.
 func (c *Catalog) ReleaseDate(ctx context.Context, trackID string) (string, error) {
 	col, err := c.embed(ctx, Ref{Kind: KindTrack, ID: trackID})
-	if err != nil {
+	if errors.Is(err, ErrNotFound) {
 		return "", err
+	}
+	if err != nil {
+		return "", fmt.Errorf("%w: %w", ErrCatalog, err)
 	}
 	if len(col.Tracks) == 0 {
 		return "", nil
@@ -312,7 +316,7 @@ func (c *Catalog) oembedTitle(ctx context.Context, ref Ref) (string, error) {
 func (c *Catalog) get(ctx context.Context, endpoint string, limit int64) ([]byte, int, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
-		return nil, 0, fmt.Errorf("%w: %w", ErrCatalog, err)
+		return nil, 0, err
 	}
 	ua := c.UserAgent
 	if ua == "" {
@@ -327,12 +331,12 @@ func (c *Catalog) get(ctx context.Context, endpoint string, limit int64) ([]byte
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, 0, fmt.Errorf("%w: %w", ErrCatalog, err)
+		return nil, 0, err
 	}
 	defer func() { _ = resp.Body.Close() }()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, limit))
 	if err != nil {
-		return nil, 0, fmt.Errorf("%w: read body: %w", ErrCatalog, err)
+		return nil, 0, fmt.Errorf("read %s: %w", endpoint, err)
 	}
 	return body, resp.StatusCode, nil
 }

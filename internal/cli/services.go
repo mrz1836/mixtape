@@ -56,11 +56,13 @@ type services struct {
 	executable     func() (string, error)
 	lookPath       func(name string) (string, error)
 	encoder        library.Encoder // nil: afconvert
-	signals        func() (<-chan os.Signal, func())
-	spawn          func(exe string, args, env []string, logPath string) (*os.Process, error)
-	kill           func(pid int, sig syscall.Signal) error
-	sleep          func(ctx context.Context, d time.Duration) bool
-	runScript      func(ctx context.Context, name string, args ...string) error
+	// signals delivers SIGINT and SIGTERM until its stop func is called,
+	// and makes the process ignore SIGHUP and SIGPIPE.
+	signals   func() (<-chan os.Signal, func())
+	spawn     func(exe string, args, env []string, logPath string) (*os.Process, error)
+	kill      func(pid int, sig syscall.Signal) error
+	sleep     func(ctx context.Context, d time.Duration) bool
+	runScript func(ctx context.Context, name string, args ...string) error
 	// permission checks a macOS privacy permission without prompting;
 	// requestPermission shows the system prompt where macOS allows one.
 	permission        func(permission.Kind) permission.State
@@ -86,6 +88,8 @@ func newProcessServices() services {
 		executable:     os.Executable,
 		lookPath:       exec.LookPath,
 		signals: func() (<-chan os.Signal, func()) {
+			// A closed terminal or pipe must not kill a session mid-song.
+			signal.Ignore(syscall.SIGHUP, syscall.SIGPIPE)
 			ch := make(chan os.Signal, 4)
 			signal.Notify(ch, os.Interrupt, syscall.SIGTERM)
 			return ch, func() { signal.Stop(ch) }

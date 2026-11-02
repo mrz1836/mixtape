@@ -651,10 +651,12 @@ func (e *Engine) render(t *take, seg Segment) (string, error) {
 
 // emitBoundary reports the measured timing of a song (--verbose).
 func (e *Engine) emitBoundary(t *take, seg Segment) {
-	rate := 0
+	var rate int
+	var observed int64 // the frame at the first observation of the track
 	e.spoolMu.Lock()
 	if e.spool != nil {
 		rate = e.spool.Format().Rate
+		observed = e.spool.FrameAt(t.startedAt)
 	}
 	e.spoolMu.Unlock()
 	if rate == 0 {
@@ -665,9 +667,7 @@ func (e *Engine) emitBoundary(t *take, seg Segment) {
 	if len(seg.Ranges) > 0 {
 		// Seconds between the capture's first observation of the track and
 		// the estimated start of its audio: latency plus poll delay.
-		e.spoolMu.Lock()
-		first := float64(seg.Anchor-e.spool.FrameAt(t.startedAt)) / float64(rate)
-		e.spoolMu.Unlock()
+		first := float64(seg.Anchor-observed) / float64(rate)
 		ev.OffsetSeconds = &first
 	}
 	e.emit(ev)

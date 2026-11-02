@@ -3,6 +3,7 @@ package spotify
 import (
 	"context"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -100,4 +101,23 @@ func TestOSAScriptStartCancel(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("Start did not stop after cancel")
 	}
+}
+
+func TestStreamLinesSurvivesAnOverlongLine(t *testing.T) {
+	t.Parallel()
+	long := strings.Repeat("x", maxLineBytes+100)
+	r := strings.NewReader("first\r\n" + long + "\nS\x1fsnapshot\nlast without newline")
+	out := make(chan Line, 8)
+	last := streamLines(t.Context(), r, out)
+	close(out)
+	var got []string
+	for l := range out {
+		got = append(got, l.Text)
+	}
+	require.Len(t, got, 4, "the lines after the long one still arrive")
+	assert.Equal(t, "first", got[0])
+	assert.Len(t, got[1], maxLineBytes, "the long line is cut")
+	assert.Equal(t, "S\x1fsnapshot", got[2])
+	assert.Equal(t, "last without newline", last)
+	assert.Zero(t, r.Len(), "the pipe is read to its end")
 }

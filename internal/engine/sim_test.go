@@ -485,6 +485,9 @@ type sim struct {
 	eng   *Engine // the running engine, for actions that inject faults
 	// pending is an interrupted session's Spotify state to put back.
 	pending *session.SpotifyState
+	// actionErrs collects failures of scripted actions, which run on the
+	// driver goroutine and so cannot fail the test themselves.
+	actionErrs []error
 }
 
 func newSim(t *testing.T, tracks ...simTrack) *sim {
@@ -512,6 +515,7 @@ func newSim(t *testing.T, tracks ...simTrack) *sim {
 
 // reopen opens the library afresh, as a new mixtape process would.
 func (s *sim) reopen() {
+	s.t.Helper()
 	lib, err := library.Open(s.root, library.Options{
 		Encoder: s.enc, WorkDir: filepath.Join(s.home, "work"), Now: s.now,
 	})
@@ -556,10 +560,24 @@ func (s *sim) run(cols []spotify.Collection, o Options, controls chan Control) (
 	ctx, cancel := context.WithTimeout(s.t.Context(), 30*time.Second)
 	defer cancel()
 	done := make(chan struct{})
-	go s.drive(ctx, done, eng)
+	var driver sync.WaitGroup
+	driver.Go(func() { s.drive(ctx, done, eng) })
 	res := eng.Run(ctx, plan, controls)
 	close(done)
+	driver.Wait() // the scripted actions are over: their state is the test's again
+	s.mu.Lock()
+	actionErr := errors.Join(s.actionErrs...)
+	s.mu.Unlock()
+	require.NoError(s.t, actionErr, "a scripted action failed")
 	return plan, res
+}
+
+// actionFailed records the failure of a scripted action; run fails the
+// test with it once the session is over.
+func (s *sim) actionFailed(err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.actionErrs = append(s.actionErrs, err)
 }
 
 // drive advances simulated time in small steps: playback moves, audio is

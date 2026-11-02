@@ -111,7 +111,11 @@ func (e *Engine) onCaptureEvent(ev capture.Event) {
 	}
 	switch ev.Kind {
 	case capture.EventStopped:
-		e.fail(fmt.Errorf("%w: %s", ErrCaptureStopped, ev.Detail))
+		err := ErrCaptureStopped
+		if ev.Detail != "" {
+			err = fmt.Errorf("%w: %s", ErrCaptureStopped, ev.Detail)
+		}
+		e.fail(err)
 	case capture.EventFormatChanged, capture.EventDeviceChanged, capture.EventProcessChanged, capture.EventOverflow:
 		// Whatever the event says, a source whose format no longer matches
 		// the spool needs a new spool: until then every block is dropped.
@@ -211,9 +215,14 @@ func (e *Engine) pruneSpool() {
 		}
 	}
 	e.spoolMu.Lock()
-	defer e.spoolMu.Unlock()
+	var err error
 	if e.spool != nil {
-		_ = e.spool.Prune(e.spool.FrameAt(keepFrom))
+		err = e.spool.Prune(e.spool.FrameAt(keepFrom))
+	}
+	e.spoolMu.Unlock()
+	if err != nil {
+		// The spool retries the deletion; the disk fills meanwhile.
+		e.warnOnce("prune", "could not delete old spooled audio (the spool retries): "+err.Error())
 	}
 }
 

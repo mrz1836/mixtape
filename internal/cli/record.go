@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/signal"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -320,14 +319,15 @@ func (a *app) record(ctx context.Context, cmd *cobra.Command, lib *library.Libra
 		if src, err = a.openSource(setupCtx, cmd, p, settings, f); err != nil {
 			return rec.abort(err, stopped())
 		}
+		// The engine closes the source when it stops capturing, but a
+		// session that fails before that must not leave it open.
+		defer closeSource(src)
 		rec.setCapture(src)
 	}
 	if err := engine.Prepare(lib, plan); err != nil {
-		closeSource(src)
 		return rec.abort(err, false)
 	}
 	if stopped() {
-		closeSource(src)
 		return rec.abort(context.Canceled, true)
 	}
 	if playback {
@@ -347,7 +347,6 @@ func (a *app) record(ctx context.Context, cmd *cobra.Command, lib *library.Libra
 func (a *app) guardSetup(ctx context.Context) (setup context.Context, release func(), stopped func() bool) {
 	setup, cancel := context.WithCancel(ctx)
 	sigs, stopSigs := a.deps.services.signals()
-	signal.Ignore(syscall.SIGHUP, syscall.SIGPIPE)
 	var got atomic.Bool
 	done := make(chan struct{})
 	go func() {
@@ -428,7 +427,9 @@ func (a *app) checkRecordReady(f *recordFlags) error {
 	if _, ok := svc.spotifyApp(a.deps.userHome); !ok {
 		return spotify.ErrNotInstalled
 	}
-	if running, err := svc.spotifyRunning(); err == nil && !running {
+	// When the process list cannot be read, the poll that follows reports
+	// precisely what is wrong.
+	if st, _ := a.spotifyStatus(); st == spotifyStopped {
 		return spotify.ErrNotRunning
 	}
 	if prefs, err := svc.prefs(a.deps.userHome); err == nil && !prefs.Stale &&
@@ -491,8 +492,11 @@ func (a *app) detach(ctx context.Context, cmd *cobra.Command, args []string) err
 	if err != nil {
 		return err
 	}
-	if info, held, _ := session.Inspect(lockPath); held {
+	switch info, held, inspectErr := session.Inspect(lockPath); {
+	case held:
 		return fmt.Errorf("%w (session %s, pid %d)", session.ErrBusy, info.SessionID, info.PID)
+	case inspectErr != nil:
+		return inspectErr
 	}
 	id := session.NewID(a.deps.now())
 	logPath := session.LogPath(a.home, id)
@@ -562,6 +566,9 @@ type recorder struct {
 	eng    *engine.Engine
 	saved  time.Time
 	closed bool
+	// stateFailed and logFailed report a failed write of session.json or
+	// the event log, so each is warned about once.
+	stateFailed, logFailed bool
 }
 
 func (a *app) newRecorder(
@@ -625,10 +632,23 @@ func (r *recorder) close() {
 	}
 }
 
-// write saves session.json.
+// write saves session.json. A failure is reported once: the session goes
+// on, but status, wait and stop cannot follow it.
 func (r *recorder) write() {
 	r.state.UpdatedAt = r.a.deps.now()
-	_ = session.WriteState(r.a.home, r.state)
+	if err := session.WriteState(r.a.home, r.state); err != nil && !r.stateFailed {
+		r.stateFailed = true
+		r.warn("could not save the session state (status, wait and stop will not see it): %v", err)
+	}
+}
+
+// warn reports a recorder problem above the status line, or on stderr.
+func (r *recorder) warn(format string, args ...any) {
+	if r.ui != nil {
+		r.ui.log(r.a.out.paint(colorYellow, "! "+fmt.Sprintf(format, args...)))
+		return
+	}
+	r.a.out.Warn(format, args...)
 }
 
 // run executes the session and reports how it ended.
@@ -650,7 +670,7 @@ func (r *recorder) run(ctx context.Context, lib *library.Library, plan *engine.P
 		Now:            a.deps.now,
 	})
 	if err != nil {
-		return err
+		return r.abort(err, false)
 	}
 	r.eng = eng
 
@@ -741,7 +761,10 @@ func (r *recorder) emit(ev engine.Event) {
 	if r.closed {
 		return
 	}
-	_ = r.log.Write(ev)
+	if err := r.log.Write(ev); err != nil && !r.logFailed {
+		r.logFailed = true
+		r.warn("could not write the session's event log (status --follow will miss events): %v", err)
+	}
 	r.track(ev)
 	if r.a.out.JSON() {
 		if ev.Type != engine.EventBoundary || r.a.out.Verbose() {
@@ -845,11 +868,9 @@ func (r *recorder) saveSpotify(st session.SpotifyState) error {
 }
 
 // watchSignals turns SIGINT/SIGTERM into a graceful stop, and a second
-// SIGINT into a forced quit. SIGHUP and SIGPIPE are ignored so a closed
-// terminal or pipe cannot kill a session mid-song.
+// SIGINT into a forced quit.
 func (r *recorder) watchSignals(controls chan<- engine.Control, force context.CancelFunc) func() {
 	sigs, stop := r.a.deps.services.signals()
-	signal.Ignore(syscall.SIGHUP, syscall.SIGPIPE)
 	done := make(chan struct{})
 	go func() {
 		interrupts := 0

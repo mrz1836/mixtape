@@ -77,6 +77,13 @@ func (f *fixture) open(enc Encoder) *Library {
 	return lib
 }
 
+// warnings returns the warnings reported so far.
+func (f *fixture) warnings() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.warns...)
+}
+
 // wav writes a short stereo sine WAV at freq Hz; distinct frequencies give
 // distinct audio hashes.
 func (f *fixture) wav(freq float64) string {

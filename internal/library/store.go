@@ -56,8 +56,16 @@ func (a AFConvert) Encode(ctx context.Context, wavPath, m4aPath string) error {
 			return err
 		}
 	}
-	info, statErr := os.Stat(m4aPath)
-	if statErr != nil || info.Size() == 0 {
+	return checkOutput(m4aPath)
+}
+
+// checkOutput makes sure the encoder left a non-empty file at path.
+func checkOutput(path string) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		return fmt.Errorf("afconvert output: %w", err)
+	}
+	if info.Size() == 0 {
 		return errEmptyOutput
 	}
 	return nil
@@ -86,9 +94,9 @@ type CommitOptions struct {
 // file in c, replacing any earlier file for t in place. The manifest and
 // playlist are saved before it returns.
 //
-// If encoding fails the WAV moves to WorkDir/failed, the entry becomes
-// encode_failed with PendingWAV set (so RetryEncode can finish the job
-// without recording again), and the error wraps ErrEncode.
+// If encoding or tagging fails the WAV moves to WorkDir/failed, the entry
+// becomes encode_failed with PendingWAV set (so RetryEncode can finish the
+// job without recording again), and the error wraps ErrEncode.
 func (l *Library) Commit(ctx context.Context, c *Collection, t Track, wavPath string, o CommitOptions) (Entry, error) {
 	if t.ID == "" {
 		return Entry{}, fmt.Errorf("%w: track without an ID", errSpec)
@@ -154,7 +162,9 @@ func (l *Library) Commit(ctx context.Context, c *Collection, t Track, wavPath st
 		tagged, err = mp4tag.Tag(data, tags)
 	}
 	if err != nil {
-		return *e, fmt.Errorf("tag %s: %w", e.Title, err)
+		// The audio is fine but cannot be stored yet: keep the WAV, like a
+		// failed encode, so the next run finishes it without recording.
+		return l.encodeFailed(c, id, wavPath, fmt.Errorf("tag: %w", err))
 	}
 
 	name := c.fileName(e)

@@ -303,17 +303,32 @@ func TestConcurrentAppendAndRead(t *testing.T) {
 
 	const blocks = 400 // 100 s of 250-frame blocks: several 30 000-frame chunks
 	start := time.Now()
-	var wg sync.WaitGroup
+	var (
+		wg        sync.WaitGroup
+		appendErr error // written by the appender, read after wg.Wait
+	)
+	written := make(chan struct{})
 	wg.Go(func() {
+		defer close(written)
 		for i := range blocks {
 			first := int64(i) * 250
-			_ = s.Append(capture.Block{
+			if err := s.Append(capture.Block{
 				PCM: frames(f, first, 250), Frames: 250,
 				At: start.Add(time.Duration(i) * 250 * time.Millisecond),
-			})
+			}); err != nil {
+				appendErr = err
+				return
+			}
 		}
 	})
-	for {
+	deadline := time.Now().Add(30 * time.Second)
+	for finished := false; !finished; {
+		select {
+		case <-written:
+			finished = true // one last read of everything appended
+		default:
+		}
+		require.False(t, time.Now().After(deadline), "the appender did not finish")
 		end := s.Frames()
 		if end > 2000 {
 			var buf bytes.Buffer
@@ -325,10 +340,50 @@ func TestConcurrentAppendAndRead(t *testing.T) {
 			require.Equal(t, (end-1)%65536, got[len(got)-1])
 			_ = s.FrameAt(start.Add(time.Second))
 		}
-		if end == blocks*250 {
-			break
-		}
 	}
 	wg.Wait()
+	require.NoError(t, appendErr)
 	assert.Equal(t, int64(blocks*250), s.Frames())
+}
+
+func TestPruneRetriesChunksItCouldNotDelete(t *testing.T) {
+	t.Parallel()
+	if os.Geteuid() == 0 {
+		t.Skip("root deletes from read-only folders")
+	}
+	dir := t.TempDir()
+	f := smallFormat()
+	s, err := Open(dir, f)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = s.Close() })
+	require.NoError(t, s.Append(capture.Block{PCM: frames(f, 0, 7000), Frames: 7000, At: time.Now()}))
+	require.Len(t, chunkFiles(t, dir), 3)
+
+	require.NoError(t, os.Chmod(dir, 0o500)) // deletions now fail
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+	require.Error(t, s.Prune(6000))
+	assert.Len(t, chunkFiles(t, dir), 3, "nothing could be deleted")
+	assert.Equal(t, int64(6000), s.Oldest(), "the pruned chunks are gone from the spool all the same")
+
+	require.NoError(t, os.Chmod(dir, 0o700))
+	require.NoError(t, s.Prune(6000), "the next prune deletes what the last one could not")
+	assert.Len(t, chunkFiles(t, dir), 1)
+}
+
+func TestCloseDeletesChunksPruneCouldNotDelete(t *testing.T) {
+	t.Parallel()
+	if os.Geteuid() == 0 {
+		t.Skip("root deletes from read-only folders")
+	}
+	dir := t.TempDir()
+	f := smallFormat()
+	s, err := Open(dir, f)
+	require.NoError(t, err)
+	require.NoError(t, s.Append(capture.Block{PCM: frames(f, 0, 7000), Frames: 7000, At: time.Now()}))
+	require.NoError(t, os.Chmod(dir, 0o500))
+	require.Error(t, s.Prune(6000))
+	require.NoError(t, os.Chmod(dir, 0o700))
+
+	require.NoError(t, s.Close())
+	assert.Empty(t, chunkFiles(t, dir))
 }

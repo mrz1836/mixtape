@@ -89,17 +89,7 @@ func (o *OSAScript) Start(ctx context.Context, script string, args ...string) (<
 	out := make(chan Line, 16)
 	go func() {
 		defer close(out)
-		var last string
-		sc := bufio.NewScanner(stderr)
-		sc.Buffer(make([]byte, 0, 4096), 1<<20)
-		for sc.Scan() {
-			text := sc.Text()
-			last = text
-			select {
-			case out <- Line{Text: text, At: time.Now()}:
-			case <-ctx.Done():
-			}
-		}
+		last := streamLines(ctx, stderr, out)
 		waitErr := cmd.Wait()
 		switch {
 		case ctx.Err() != nil:
@@ -115,6 +105,47 @@ func (o *OSAScript) Start(ctx context.Context, script string, args ...string) (<
 		}
 	}()
 	return out, nil
+}
+
+// maxLineBytes bounds one streamed line; a longer one (system log noise)
+// is cut, and the lines after it still arrive.
+const maxLineBytes = 1 << 20
+
+// streamLines sends each line of r to out, stamped on arrival, until r
+// ends, and returns the last line. It always reads r to its end, so the
+// script never blocks on a full pipe.
+func streamLines(ctx context.Context, r io.Reader, out chan<- Line) string {
+	br := bufio.NewReader(r)
+	var last string
+	for {
+		text, err := readLine(br, maxLineBytes)
+		if text != "" || err == nil {
+			last = text
+			select {
+			case out <- Line{Text: text, At: time.Now()}:
+			case <-ctx.Done():
+			}
+		}
+		if err != nil {
+			return last
+		}
+	}
+}
+
+// readLine returns the next line of br without its line ending, cut to
+// limit bytes. The error is set only when br has nothing more.
+func readLine(br *bufio.Reader, limit int) (string, error) {
+	var line []byte
+	for {
+		frag, err := br.ReadSlice('\n')
+		if room := limit - len(line); room > 0 {
+			line = append(line, frag[:min(len(frag), room)]...)
+		}
+		if errors.Is(err, bufio.ErrBufferFull) {
+			continue // the rest of a long line
+		}
+		return strings.TrimRight(string(line), "\r\n"), err
+	}
 }
 
 // scriptArgs builds the osascript argument list: the script inline, then

@@ -425,11 +425,15 @@ func (e *Engine) onTick(ctx context.Context) {
 }
 
 // warn emits a warning event once per distinct message.
-func (e *Engine) warn(msg string) {
-	if e.warned[msg] {
+func (e *Engine) warn(msg string) { e.warnOnce(msg, msg) }
+
+// warnOnce emits a warning event the first time key comes up: for a
+// problem whose message changes each time it recurs.
+func (e *Engine) warnOnce(key, msg string) {
+	if e.warned[key] {
 		return
 	}
-	e.warned[msg] = true
+	e.warned[key] = true
 	e.emit(Event{Type: EventWarning, Message: msg})
 }
 

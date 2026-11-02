@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
@@ -64,6 +65,9 @@ type Spool struct {
 	frames  int64 // frames appended so far
 	anchors []anchor
 	closed  bool
+	// orphans are pruned chunk files that could not be deleted yet; every
+	// Prune and Close tries again.
+	orphans []string
 }
 
 type chunk struct {
@@ -304,20 +308,36 @@ func (s *Spool) Prune(before int64) error {
 	if s.closed {
 		return ErrClosed
 	}
-	var errs []error
 	keep := 0
 	for keep < len(s.chunks)-1 && s.chunks[keep].start+s.chunks[keep].frames <= before {
 		c := s.chunks[keep]
-		errs = append(errs, c.f.Close(), os.Remove(c.path))
+		_ = c.f.Close() // read-only from here on: nothing to lose
+		s.orphans = append(s.orphans, c.path)
 		keep++
 	}
 	s.chunks = s.chunks[keep:]
+	err := s.removeOrphans()
 
 	cut := 0
 	for cut+1 < len(s.anchors) && s.anchors[cut+1].frame <= before {
 		cut++
 	}
 	s.anchors = s.anchors[cut:]
+	return err
+}
+
+// removeOrphans deletes the pruned chunk files, keeping those that could
+// not be deleted for the next try.
+func (s *Spool) removeOrphans() error {
+	var errs []error
+	left := s.orphans[:0]
+	for _, path := range s.orphans {
+		if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			errs = append(errs, err)
+			left = append(left, path)
+		}
+	}
+	s.orphans = left
 	return errors.Join(errs...)
 }
 
@@ -329,11 +349,11 @@ func (s *Spool) Close() error {
 		return nil
 	}
 	s.closed = true
-	var errs []error
+	errs := []error{s.removeOrphans()}
 	for _, c := range s.chunks {
 		errs = append(errs, c.f.Close(), os.Remove(c.path))
 	}
-	s.chunks, s.w, s.anchors = nil, nil, nil
+	s.chunks, s.w, s.anchors, s.orphans = nil, nil, nil, nil
 	return errors.Join(errs...)
 }
 

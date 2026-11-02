@@ -463,7 +463,7 @@ func TestLock(t *testing.T) {
 	unlock, err := f.lib.Lock()
 	require.NoError(t, err)
 	assert.NoFileExists(t, stale, "taking the lock removes temp files of a crashed write")
-	assert.NotEmpty(t, f.warns)
+	assert.NotEmpty(t, f.warnings())
 
 	_, err = f.open(nil).Lock()
 	require.ErrorIs(t, err, ErrLocked)
@@ -528,7 +528,7 @@ func TestUnreadableManifestIsSkipped(t *testing.T) {
 
 	lib := f.open(nil)
 	require.Len(t, lib.Collections(), 1)
-	joined := strings.Join(f.warns, "\n")
+	joined := strings.Join(f.warnings(), "\n")
 	assert.Contains(t, joined, "skipping Broken")
 	assert.Contains(t, joined, "schema 99")
 }

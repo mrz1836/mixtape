@@ -326,3 +326,25 @@ func TestNewCatalogDefaults(t *testing.T) {
 	var zero Catalog
 	assert.Equal(t, defaultEmbedBase, zero.embedBase())
 }
+
+func TestResolveNamesTheCatalogFailureOnce(t *testing.T) {
+	t.Parallel()
+	_, c := newCatalogServer(t, nil, page{})
+	c.EmbedBase, c.OEmbedBase = "http://127.0.0.1:1/embed", "http://127.0.0.1:1/oembed"
+	_, err := c.Resolve(t.Context(), Ref{KindTrack, testTrackID})
+	require.ErrorIs(t, err, ErrCatalog)
+	assert.Equal(t, 1, strings.Count(err.Error(), ErrCatalog.Error()), err.Error())
+	assert.Contains(t, err.Error(), "embed: ")
+	assert.Contains(t, err.Error(), "; oembed: ")
+}
+
+func TestReleaseDateFailures(t *testing.T) {
+	t.Parallel()
+	_, c := newCatalogServer(t, map[string]page{"track/" + testTrackID: {status: http.StatusNotFound}}, page{})
+	_, err := c.ReleaseDate(t.Context(), testTrackID)
+	require.ErrorIs(t, err, ErrNotFound)
+
+	c.EmbedBase = "http://127.0.0.1:1/embed"
+	_, err = c.ReleaseDate(t.Context(), testTrackID)
+	require.ErrorIs(t, err, ErrCatalog)
+}

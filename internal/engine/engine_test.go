@@ -178,11 +178,17 @@ func TestUnwritableLibraryEndsTheSession(t *testing.T) {
 	var dirs []string
 	s.at[time.Second] = func(s *sim) {
 		entries, err := os.ReadDir(s.root)
-		require.NoError(t, err)
+		if err != nil {
+			s.actionFailed(err)
+			return
+		}
 		for _, e := range entries {
 			if e.IsDir() {
 				dir := filepath.Join(s.root, e.Name())
-				require.NoError(t, os.Chmod(dir, 0o500))
+				if err := os.Chmod(dir, 0o500); err != nil {
+					s.actionFailed(err)
+					return
+				}
 				dirs = append(dirs, dir)
 			}
 		}
@@ -804,4 +810,25 @@ func abs64(v int64) int64 {
 		return -v
 	}
 	return v
+}
+
+func TestCaptureStoppedWithoutDetail(t *testing.T) {
+	t.Parallel()
+	s := newSim(t, songA)
+	s.at[2*time.Second] = func(s *sim) { s.source.events <- capture.Event{Kind: capture.EventStopped} }
+	_, res := s.run(singles(songA), Options{}, nil)
+	require.ErrorIs(t, res.Err, ErrCaptureStopped)
+	assert.Equal(t, ErrCaptureStopped.Error(), res.Err.Error(), "no dangling separator")
+}
+
+func TestWarnOnceIsKeyed(t *testing.T) {
+	t.Parallel()
+	var got []string
+	e, err := New(Config{Player: &fakeSpotify{}, Library: &library.Library{}, Emit: func(ev Event) { got = append(got, ev.Message) }})
+	require.NoError(t, err)
+	e.warnOnce("prune", "could not delete a.pcm")
+	e.warnOnce("prune", "could not delete b.pcm")
+	e.warn("same")
+	e.warn("same")
+	assert.Equal(t, []string{"could not delete a.pcm", "same"}, got)
 }

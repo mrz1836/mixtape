@@ -363,8 +363,8 @@ func (w *builder) ilst(oldIlst *box, tags Tags) ([]byte, error) {
 	var entries [][]byte
 	if oldIlst != nil {
 		err := walkChildren(oldIlst.payload(), func(b box) error {
-			if isTagAtom(b.typ) {
-				return nil // managed: rebuilt below
+			if _, managed := findTagAtom(b.typ); managed {
+				return nil // rebuilt below
 			}
 			if string(b.typ[:]) == "----" {
 				if ff, ok := parseFreeform(b); ok && ff.mean == FreeformMean {
@@ -373,25 +373,16 @@ func (w *builder) ilst(oldIlst *box, tags Tags) ([]byte, error) {
 					}
 				}
 			}
-			entries = append(entries, b.data)
+			entries = append(entries, b.raw())
 			return nil
 		})
 		if err != nil {
 			return nil, err
 		}
 	}
-	entries = append(entries,
-		w.textAtom("\xa9nam", tags.Title),
-		w.textAtom("\xa9ART", tags.Artist),
-		w.textAtom("aART", tags.AlbumArtist),
-		w.textAtom("\xa9alb", tags.Album),
-		w.textAtom("\xa9grp", tags.Grouping),
-		w.textAtom("\xa9cmt", tags.Comment),
-		w.textAtom("\xa9day", tags.Date),
-		w.pairAtom("trkn", tags.TrackNumber, tags.TrackTotal),
-		w.pairAtom("disk", tags.DiscNumber, tags.DiscTotal),
-		w.coverAtom(tags.Cover),
-	)
+	for _, a := range tagAtoms() {
+		entries = append(entries, w.tagAtom(a, &tags))
+	}
 	names := make([]string, 0, len(tags.Freeform))
 	for name := range tags.Freeform {
 		names = append(names, name)
@@ -403,12 +394,66 @@ func (w *builder) ilst(oldIlst *box, tags Tags) ([]byte, error) {
 	return w.box("ilst", concat(entries)), nil
 }
 
-func isTagAtom(typ [4]byte) bool {
-	switch string(typ[:]) {
-	case "\xa9nam", "\xa9ART", "aART", "\xa9alb", "\xa9grp", "\xa9cmt", "\xa9day", "trkn", "disk", "covr":
-		return true
+// atomKind is how a managed atom stores its value.
+type atomKind int
+
+const (
+	atomText  atomKind = iota // UTF-8 text
+	atomPair                  // number and total (trkn, disk)
+	atomCover                 // JPEG or PNG image
+)
+
+// tagAtom is one atom Tags manages: its type and where its value lives.
+type tagAtom struct {
+	typ  string
+	kind atomKind
+	text func(*Tags) *string
+	pair func(*Tags) (num, total *int)
+}
+
+// tagAtoms lists the atoms Tags manages, in the order they are written.
+// Building, recognizing and reading tags all go through it, so a retag can
+// never leave a managed atom behind or write it twice.
+func tagAtoms() []tagAtom {
+	text := func(typ string, f func(*Tags) *string) tagAtom { return tagAtom{typ: typ, kind: atomText, text: f} }
+	pair := func(typ string, f func(*Tags) (*int, *int)) tagAtom {
+		return tagAtom{typ: typ, kind: atomPair, pair: f}
 	}
-	return false
+	return []tagAtom{
+		text("\xa9nam", func(t *Tags) *string { return &t.Title }),
+		text("\xa9ART", func(t *Tags) *string { return &t.Artist }),
+		text("aART", func(t *Tags) *string { return &t.AlbumArtist }),
+		text("\xa9alb", func(t *Tags) *string { return &t.Album }),
+		text("\xa9grp", func(t *Tags) *string { return &t.Grouping }),
+		text("\xa9cmt", func(t *Tags) *string { return &t.Comment }),
+		text("\xa9day", func(t *Tags) *string { return &t.Date }),
+		pair("trkn", func(t *Tags) (*int, *int) { return &t.TrackNumber, &t.TrackTotal }),
+		pair("disk", func(t *Tags) (*int, *int) { return &t.DiscNumber, &t.DiscTotal }),
+		{typ: "covr", kind: atomCover},
+	}
+}
+
+// findTagAtom returns the managed atom of type typ.
+func findTagAtom(typ [4]byte) (tagAtom, bool) {
+	for _, a := range tagAtoms() {
+		if a.typ == string(typ[:]) {
+			return a, true
+		}
+	}
+	return tagAtom{}, false
+}
+
+// tagAtom builds atom a from tags (nothing for an empty value).
+func (w *builder) tagAtom(a tagAtom, tags *Tags) []byte {
+	switch a.kind {
+	case atomPair:
+		num, total := a.pair(tags)
+		return w.pairAtom(a.typ, *num, *total)
+	case atomCover:
+		return w.coverAtom(tags.Cover)
+	case atomText:
+	}
+	return w.textAtom(a.typ, *a.text(tags))
 }
 
 // parseMoov collects the tags found anywhere under moov.
@@ -436,8 +481,8 @@ func parseMoov(moov box) (Tags, error) {
 			}
 			return nil
 		default:
-			if isTagAtom(b.typ) {
-				return readTagAtom(&tags, b)
+			if a, ok := findTagAtom(b.typ); ok {
+				return readTagAtom(&tags, a, b)
 			}
 			return nil
 		}
@@ -448,7 +493,9 @@ func parseMoov(moov box) (Tags, error) {
 	return tags, nil
 }
 
-func readTagAtom(tags *Tags, b box) error {
+// readTagAtom reads managed atom a from box b into tags. Values of an
+// unexpected type are ignored.
+func readTagAtom(tags *Tags, a tagAtom, b box) error {
 	d, err := child(b.payload(), "data")
 	if err != nil {
 		return err
@@ -462,33 +509,21 @@ func readTagAtom(tags *Tags, b box) error {
 	}
 	flags := binary.BigEndian.Uint32(payload[0:4])
 	val := payload[8:]
-	switch {
-	case string(b.typ[:]) == "trkn" && len(val) >= 8:
-		tags.TrackNumber = int(binary.BigEndian.Uint16(val[2:4]))
-		tags.TrackTotal = int(binary.BigEndian.Uint16(val[4:6]))
-	case string(b.typ[:]) == "disk" && len(val) >= 8:
-		tags.DiscNumber = int(binary.BigEndian.Uint16(val[2:4]))
-		tags.DiscTotal = int(binary.BigEndian.Uint16(val[4:6]))
-	case string(b.typ[:]) == "covr" && (flags == dataJPEG || flags == dataPNG):
-		if tags.Cover == nil {
+	switch a.kind {
+	case atomPair:
+		// trkn carries 8 bytes; iTunes writes disk with only 6.
+		if len(val) >= 6 {
+			num, total := a.pair(tags)
+			*num = int(binary.BigEndian.Uint16(val[2:4]))
+			*total = int(binary.BigEndian.Uint16(val[4:6]))
+		}
+	case atomCover:
+		if (flags == dataJPEG || flags == dataPNG) && tags.Cover == nil {
 			tags.Cover = bytes.Clone(val)
 		}
-	case flags == dataUTF8:
-		switch string(b.typ[:]) {
-		case "\xa9nam":
-			tags.Title = string(val)
-		case "\xa9ART":
-			tags.Artist = string(val)
-		case "aART":
-			tags.AlbumArtist = string(val)
-		case "\xa9alb":
-			tags.Album = string(val)
-		case "\xa9grp":
-			tags.Grouping = string(val)
-		case "\xa9cmt":
-			tags.Comment = string(val)
-		case "\xa9day":
-			tags.Date = string(val)
+	case atomText:
+		if flags == dataUTF8 {
+			*a.text(tags) = string(val)
 		}
 	}
 	return nil
@@ -814,21 +849,37 @@ func metaPayload(m box) ([]byte, error) {
 	return p[4:], nil
 }
 
+// walkChildren calls fn with each box in payload. Like the top level, a
+// child may use a 64-bit largesize or size 0 ("to the end of its
+// container"). Fewer than 8 trailing bytes (a common 4-byte terminator in
+// udta) are ignored.
 func walkChildren(payload []byte, fn func(box) error) error {
 	pos := 0
 	for pos+8 <= len(payload) {
-		size := int(binary.BigEndian.Uint32(payload[pos : pos+4]))
-		if size < 8 || pos+size > len(payload) {
-			return fmt.Errorf("%w: child of size %d at %d", errBadBox, size, pos)
+		h, err := readHeader(payload[pos:], int64(len(payload)-pos))
+		if err != nil {
+			return fmt.Errorf("%w (child at %d)", err, pos)
 		}
-		var typ [4]byte
-		copy(typ[:], payload[pos+4:pos+8])
-		if err := fn(box{typ: typ, data: payload[pos : pos+size], off: pos, hdr: 8}); err != nil {
+		size := int(h.size)
+		if err := fn(box{typ: h.typ, data: payload[pos : pos+size], off: pos, hdr: h.hdr}); err != nil {
 			return err
 		}
 		pos += size
 	}
 	return nil
+}
+
+// raw returns the box's bytes ready to be copied into a rebuilt container:
+// a size of 0 ("to the end of the container") is replaced by the box's
+// real size, which stays true wherever the box lands.
+func (b box) raw() []byte {
+	n := len(b.data)
+	if binary.BigEndian.Uint32(b.data[0:4]) != 0 || n > math.MaxUint32 {
+		return b.data
+	}
+	out := bytes.Clone(b.data)
+	binary.BigEndian.PutUint32(out[0:4], uint32(n))
+	return out
 }
 
 // child returns the first direct child of type want, or nil.
@@ -851,7 +902,7 @@ func childrenExcept(payload []byte, skip string) ([][]byte, error) {
 	var keep [][]byte
 	err := walkChildren(payload, func(b box) error {
 		if string(b.typ[:]) != skip {
-			keep = append(keep, b.data)
+			keep = append(keep, b.raw())
 		}
 		return nil
 	})

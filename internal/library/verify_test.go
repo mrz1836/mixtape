@@ -189,7 +189,7 @@ func TestArtwork(t *testing.T) {
 		e := f.commit(c, tr, freq, CommitOptions{Artwork: true})
 		assert.Equal(t, tc.cover, f.tags(filepath.Join(c.Dir, e.File)).Cover, name)
 	}
-	assert.Len(t, f.warns, 3, "each failed download is a warning, never an error")
+	assert.Len(t, f.warnings(), 3, "each failed download is a warning, never an error")
 
 	e := f.commit(c, Track{ID: "noArtwork000000000000", Title: "off", Artist: "A", ArtworkURL: srv.URL + "/cover.jpg"},
 		999, CommitOptions{})

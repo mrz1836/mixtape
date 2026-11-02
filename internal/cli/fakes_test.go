@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -21,10 +22,12 @@ import (
 	"github.com/mrz1836/mixtape/internal/spotify"
 )
 
-// fakePlayer answers polls with a fixed snapshot and records commands.
+// fakePlayer answers polls with the scripted snapshots in polls, then with
+// snap, and records commands.
 type fakePlayer struct {
 	mu       sync.Mutex
 	snap     spotify.Snapshot
+	polls    []spotify.Snapshot
 	commands []string
 }
 
@@ -44,6 +47,11 @@ func (p *fakePlayer) Commands() []string {
 func (p *fakePlayer) Poll(context.Context) spotify.Snapshot {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if len(p.polls) > 0 {
+		s := p.polls[0]
+		p.polls = p.polls[1:]
+		return s
+	}
 	return p.snap
 }
 
@@ -88,8 +96,12 @@ func (c *fakeCatalog) Resolve(_ context.Context, ref spotify.Ref) (spotify.Colle
 	return col, nil
 }
 
-// nopSource is a capture source that never delivers audio.
-type nopSource struct{ events chan capture.Event }
+// nopSource is a capture source that never delivers audio. It counts
+// how often it is closed.
+type nopSource struct {
+	events chan capture.Event
+	closes atomic.Int32
+}
 
 func (s *nopSource) Name() string           { return "fake device" }
 func (s *nopSource) Method() capture.Method { return capture.MethodDevice }
@@ -98,7 +110,7 @@ func (s *nopSource) Start(context.Context, func(capture.Block)) error {
 	return nil
 }
 func (s *nopSource) Events() <-chan capture.Event { return s.events }
-func (s *nopSource) Close() error                 { return nil }
+func (s *nopSource) Close() error                 { s.closes.Add(1); return nil }
 
 // syntheticEncoder writes a minimal M4A whose audio is a hash of the WAV.
 type syntheticEncoder struct{}
@@ -129,6 +141,8 @@ type fakeWorld struct {
 	catalog    *fakeCatalog
 	installed  bool
 	running    bool
+	runningErr error // the process list could not be read
+	devicesErr error
 	prefs      spotify.Prefs
 	tap        capture.TapStatus
 	devices    []device.Info
@@ -189,9 +203,9 @@ func (w *fakeWorld) services(h *harness) services {
 		catalog:        func() catalog { return w.catalog },
 		openCapture:    func(captureRequest) (capture.Source, error) { return &nopSource{events: make(chan capture.Event)}, nil },
 		tapStatus:      func() capture.TapStatus { return w.tap },
-		devices:        func() ([]device.Info, error) { return w.devices, nil },
+		devices:        func() ([]device.Info, error) { return w.devices, w.devicesErr },
 		defaultOutput:  func() (device.Info, error) { return w.output, nil },
-		spotifyRunning: func() (bool, error) { return w.running, nil },
+		spotifyRunning: func() (bool, error) { return w.running, w.runningErr },
 		spotifyApp:     func(string) (string, bool) { return "/Applications/Spotify.app", w.installed },
 		prefs:          func(string) (spotify.Prefs, error) { return w.prefs, nil },
 		lockPath:       func() (string, error) { return w.lockPath, nil },

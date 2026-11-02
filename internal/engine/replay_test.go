@@ -169,12 +169,28 @@ func replay(t *testing.T, name string) ([]Event, *library.Library, *fakeEncoder)
 	require.NoError(t, Prepare(lib, plan))
 
 	controls := make(chan Control, 1)
-	go func() {
+	ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
+	defer cancel()
+	// send delivers a snapshot unless the session is over.
+	send := func(s spotify.Snapshot) bool {
+		select {
+		case p.ch <- s:
+			return true
+		case <-ctx.Done():
+			return false
+		}
+	}
+	var feeder sync.WaitGroup
+	feeder.Go(func() {
 		for src.sinkReady() == nil {
-			time.Sleep(time.Millisecond)
+			select {
+			case <-ctx.Done():
+				return // capture never started: Run reports why
+			case <-time.After(time.Millisecond):
+			}
 		}
 		for _, l := range lines {
-			for eng.working.Load() > 0 {
+			for eng.working.Load() > 0 && ctx.Err() == nil {
 				time.Sleep(200 * time.Microsecond)
 			}
 			mu.Lock()
@@ -184,7 +200,9 @@ func replay(t *testing.T, name string) ([]Event, *library.Library, *fakeEncoder)
 			case "a":
 				src.emit(l.N, l.Peak, t0.Add(time.Duration(l.T)))
 			case "s":
-				p.ch <- snap(l)
+				if !send(snap(l)) {
+					return
+				}
 			}
 		}
 		controls <- ControlStop
@@ -195,12 +213,14 @@ func replay(t *testing.T, name string) ([]Event, *library.Library, *fakeEncoder)
 			at := now
 			mu.Unlock()
 			src.emit(rate/10, 0, at)
-			p.ch <- spotify.Snapshot{At: at, State: spotify.StatePaused}
+			if !send(spotify.Snapshot{At: at, State: spotify.StatePaused}) {
+				return
+			}
 		}
-	}()
-	ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
-	defer cancel()
+	})
 	eng.Run(ctx, plan, controls)
+	cancel() // the feeder may still be offering snapshots nobody reads
+	feeder.Wait()
 	return events, lib, enc
 }
 

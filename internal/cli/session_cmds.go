@@ -18,10 +18,13 @@ import (
 )
 
 // pollEvery is how often wait, stop and status --follow look again;
-// stopTimeout bounds how long stop waits for the recorder to exit.
+// stopTimeout bounds how long stop waits for the recorder to exit, and
+// lockErrorGrace how long status --follow keeps going while the recorder
+// lock cannot be read.
 const (
-	pollEvery   = 500 * time.Millisecond
-	stopTimeout = 2 * time.Minute
+	pollEvery      = 500 * time.Millisecond
+	stopTimeout    = 2 * time.Minute
+	lockErrorGrace = 30 * time.Second
 )
 
 var errCrashed = errors.New("the session ended without finishing (killed or crashed)")
@@ -150,12 +153,31 @@ func (a *app) follow(ctx context.Context, st session.State) error {
 	if err != nil {
 		return err
 	}
+	// A lock that cannot be read says nothing about the session: keep
+	// following, and give up only when it stays unreadable.
+	var lockErr error
+	var failingSince time.Time
 	_, err = session.Follow(st.Events, 0, &eventWriter{a: a}, func() bool {
-		if _, held, _ := session.Inspect(lockPath); !held {
+		_, held, inspectErr := session.Inspect(lockPath)
+		switch {
+		case inspectErr == nil && !held:
 			return false
+		case inspectErr != nil && !held:
+			if lockErr == nil {
+				failingSince = a.deps.now()
+			}
+			lockErr = inspectErr
+			if a.deps.now().Sub(failingSince) >= lockErrorGrace {
+				return false
+			}
+		default:
+			lockErr = nil
 		}
 		return a.deps.services.sleep(ctx, pollEvery)
 	})
+	if err == nil && lockErr != nil {
+		err = fmt.Errorf("check whether session %s is still running: %w", st.ID, lockErr)
+	}
 	return err
 }
 
@@ -316,11 +338,20 @@ func (a *app) stop(ctx context.Context, noWait bool) error {
 	}
 	a.out.Println("stopping session %s…", info.SessionID)
 	deadline := a.deps.now().Add(stopTimeout)
+	var lockErr error // the last failed look at the lock: no answer, so keep looking
 	for {
-		if _, stillHeld, _ := session.Inspect(lockPath); !stillHeld {
+		_, stillHeld, inspectErr := session.Inspect(lockPath)
+		if inspectErr == nil && !stillHeld {
 			break
 		}
+		lockErr = nil
+		if !stillHeld {
+			lockErr = inspectErr
+		}
 		if a.deps.now().After(deadline) {
+			if lockErr != nil {
+				return fmt.Errorf("check whether session %s stopped: %w", info.SessionID, lockErr)
+			}
 			return fmt.Errorf("%w: session %s did not stop within %s", errTimeout, info.SessionID, stopTimeout)
 		}
 		if !a.deps.services.sleep(ctx, pollEvery) {
