@@ -20,6 +20,7 @@ import (
 	"github.com/mrz1836/mixtape/internal/config"
 	"github.com/mrz1836/mixtape/internal/engine"
 	"github.com/mrz1836/mixtape/internal/library"
+	"github.com/mrz1836/mixtape/internal/permission"
 	"github.com/mrz1836/mixtape/internal/session"
 	"github.com/mrz1836/mixtape/internal/spotify"
 )
@@ -330,7 +331,29 @@ func (a *app) openSource(ctx context.Context, cmd *cobra.Command, p player, sett
 	if f.mute && method != capture.MethodTap {
 		return nil, &usageError{cmdPath: cmd.CommandPath(), err: fmt.Errorf("%w: --mute needs --capture tap", errInvalidFlag)}
 	}
+	if err := a.requireCapturePermission(method); err != nil {
+		return nil, err
+	}
 	return a.deps.services.openCapture(captureRequest{Method: method, Device: settings.Device, Mute: f.mute})
+}
+
+// requireCapturePermission fails fast when macOS has not granted the host
+// app what the capture method needs: without it the capture is silent.
+// An undecided microphone is left alone, because opening the device shows
+// the system prompt.
+func (a *app) requireCapturePermission(m capture.Method) error {
+	k, what := permission.SystemAudio, "record system audio"
+	if m == capture.MethodDevice {
+		k, what = permission.Microphone, "open the capture device"
+	}
+	st := a.deps.services.permission(k)
+	if st == permission.Denied || (st == permission.Undecided && k == permission.SystemAudio) {
+		app := a.deps.services.hostApp()
+		return newError(ExitPermission, permission.ErrNotGranted,
+			permission.Instructions(k, app)+"; 'mixtape setup' walks you through it",
+			"%s may not %s yet, so the recording would be silent", app, what)
+	}
+	return nil
 }
 
 func closeSource(src capture.Source) {

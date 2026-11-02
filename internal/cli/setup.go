@@ -14,6 +14,7 @@ import (
 
 	"github.com/mrz1836/mixtape/internal/capture"
 	"github.com/mrz1836/mixtape/internal/config"
+	"github.com/mrz1836/mixtape/internal/permission"
 	"github.com/mrz1836/mixtape/internal/spotify"
 )
 
@@ -215,6 +216,9 @@ func (s *setupFlow) run(ctx context.Context) error {
 		s.pause("Open Spotify, then press Enter.")
 	}
 	s.say("Checking that mixtape can control Spotify (macOS may ask you to allow it)…")
+	if !s.ensure(ctx, permission.Automation) {
+		return fmt.Errorf("%w: control of Spotify (Automation)", permission.ErrNotGranted)
+	}
 	if snap := svc.player().Poll(ctx); snap.Err != nil {
 		return snap.Err
 	}
@@ -259,17 +263,20 @@ func (s *setupFlow) chooseCapture(ctx context.Context, settings config.Settings)
 	a := s.a
 	tapSt := a.deps.services.tapStatus()
 	if tapSt.Supported && s.ask("Use the process tap (records Spotify only, nothing to install)?", true) {
-		if err := s.verify(ctx, captureRequest{Method: capture.MethodTap}); err == nil {
-			return capture.MethodTap, nil
-		} else {
+		if s.ensure(ctx, permission.SystemAudio) {
+			err := s.verify(ctx, captureRequest{Method: capture.MethodTap})
+			if err == nil {
+				return capture.MethodTap, nil
+			}
+			app := a.deps.services.hostApp()
 			s.say("%s the tap test failed: %v", a.out.paint(colorRed, "✗"), err)
-			s.say("  allow your terminal app in System Settings → Privacy & Security → Screen & System Audio Recording.")
-			if s.ask("Try the tap again?", true) {
-				if err := s.verify(ctx, captureRequest{Method: capture.MethodTap}); err == nil {
-					return capture.MethodTap, nil
-				}
+			if errors.Is(err, errProbeSilent) {
+				s.say("  Make sure %s is switched on under %s.\n"+
+					"  If it is, quit and reopen %s (macOS applies the permission to new launches),\n"+
+					"  then run 'mixtape setup' again.", app, permission.Where(permission.SystemAudio), app)
 			}
 		}
+		s.say("Setting up BlackHole instead.")
 	} else if !tapSt.Supported {
 		s.say("The process tap is unavailable here (%s); using BlackHole.", tapSt.Reason)
 	}
@@ -297,10 +304,61 @@ func (s *setupFlow) setupDevice(ctx context.Context, settings config.Settings) (
 		_ = svc.runScript(ctx, "open", "-a", "Audio MIDI Setup")
 		s.pause("Press Enter when the Multi-Output Device is the sound output.")
 	}
+	if !s.ensure(ctx, permission.Microphone) {
+		return "", fmt.Errorf("%w: microphone access for the capture device", permission.ErrNotGranted)
+	}
 	if err := s.verify(ctx, captureRequest{Method: capture.MethodDevice, Device: settings.Device}); err != nil {
 		return "", fmt.Errorf("the BlackHole test failed: %w", err)
 	}
 	return capture.MethodDevice, nil
+}
+
+// permissionWait is how long setup waits for a permission to be switched on.
+const permissionWait = 3 * time.Minute
+
+// ensure makes sure the host app has permission k. Where macOS can ask, it
+// shows the system prompt. Otherwise (system audio recording has no prompt
+// for apps that do not declare it, such as Terminal and iTerm) it says
+// exactly where to switch it on, opens System Settings there, and waits for
+// the switch. No program can grant itself these permissions.
+func (s *setupFlow) ensure(ctx context.Context, k permission.Kind) bool {
+	svc := s.a.deps.services
+	st := svc.permission(k)
+	if st == permission.Undecided && k != permission.SystemAudio {
+		st = svc.requestPermission(k)
+	}
+	if st == permission.Granted || st == permission.Unknown {
+		return true
+	}
+	app := svc.hostApp()
+	s.say("%s %s needs permission: %s.", s.a.out.paint(colorYellow, "!"), app, permission.Instructions(k, app))
+	s.say("  Opening System Settings there…")
+	_ = svc.runScript(ctx, "open", permission.SettingsURL(k))
+	s.say("  Waiting for the switch (up to %s; Ctrl-C to stop)…", permissionWait)
+	deadline := s.a.deps.now().Add(permissionWait)
+	for s.a.deps.now().Before(deadline) {
+		if !svc.sleep(ctx, time.Second) {
+			return false
+		}
+		if svc.permission(k) == permission.Granted {
+			s.say("%s %s may now %s", s.a.out.paint(colorGreen, "✓"), app, permissionVerb(k))
+			return true
+		}
+	}
+	s.say("%s still not granted", s.a.out.paint(colorRed, "✗"))
+	return false
+}
+
+func permissionVerb(k permission.Kind) string {
+	switch k {
+	case permission.SystemAudio:
+		return "record system audio"
+	case permission.Microphone:
+		return "open the capture device"
+	case permission.Automation:
+		return "control Spotify"
+	}
+	return "go ahead"
 }
 
 // routingCheck is the output-routing check alone.

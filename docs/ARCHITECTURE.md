@@ -39,6 +39,7 @@ internal/engine        plan, steer, observe, segment, commit
 internal/library       folders, manifests, naming, encode/tag/hash, verify
 internal/mp4tag        pure-Go MP4 tag writer (ilst, ---- freeform, covr)
 internal/session       recorder lock, session.json, event log, detach
+internal/permission    macOS privacy permissions of the host app (C)
 internal/fileutil      atomic writes and copies
 internal/wav           the 44-byte PCM WAV header
 ```
@@ -60,7 +61,7 @@ monotonic time of its first frame.
 | Install | nothing | `brew install blackhole-2ch` + a Multi-Output Device |
 | Records | Spotify only | everything the Mac plays |
 | macOS | 14.2+ | any |
-| Permission | System Audio Recording, for the app that runs mixtape | Microphone, for that app |
+| Permission | *System Audio Recording Only*, for the app that runs mixtape | Microphone, for that app |
 | Over ssh / launchd | no (permission belongs to a GUI app) | yes |
 | Can record muted | yes (`--mute`) | no |
 
@@ -77,7 +78,23 @@ else the device. A session never switches backends midway.
 **A denied permission delivers silence, not an error.** macOS gives the tap
 (and the device) zeros when the responsible app has not been granted access.
 The permission belongs to the app running mixtape (Terminal, iTerm, an IDE),
-not to the mixtape binary. Hence the silence watchdog below.
+not to the mixtape binary.
+
+`internal/permission` reads the state up front for the app macOS holds
+responsible (`responsibility_get_pid_responsible_for_pid`):
+
+| Permission | TCC service | Read with | Prompt |
+|---|---|---|---|
+| System audio recording (tap) | `kTCCServiceAudioCapture` | `TCCAccessPreflight` (private, loaded at run time) | none for apps that do not declare `NSAudioCaptureUsageDescription`, which includes Terminal and iTerm: switched on by hand under *System Audio Recording Only* |
+| Microphone (device) | `kTCCServiceMicrophone` | `TCCAccessPreflight` | `TCCAccessRequest` |
+| Automation (Spotify) | Apple Events | `AEDeterminePermissionToAutomateTarget` (public) | the same call, with `askUserIfNeeded` |
+
+The *Screen & System Audio Recording* pane has two lists; only the bottom one,
+*System Audio Recording Only*, grants `kTCCServiceAudioCapture`. A
+screen-recording grant alone leaves the tap silent. When the private calls
+are unavailable the state is "unknown" and the silence watchdog below is the
+judge. The package is plain C, so only the tap links the Objective-C
+runtime.
 
 <br>
 

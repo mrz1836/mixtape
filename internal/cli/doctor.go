@@ -15,6 +15,7 @@ import (
 	"github.com/mrz1836/mixtape/internal/capture"
 	"github.com/mrz1836/mixtape/internal/capture/device"
 	"github.com/mrz1836/mixtape/internal/config"
+	"github.com/mrz1836/mixtape/internal/permission"
 	"github.com/mrz1836/mixtape/internal/session"
 	"github.com/mrz1836/mixtape/internal/spotify"
 )
@@ -94,10 +95,16 @@ func (a *app) diagnose(ctx context.Context) doctorDoc {
 	snap := spotify.Snapshot{Err: spotify.ErrNotRunning}
 	if running {
 		add(check{ID: "spotify_running", Name: "Spotify running", Status: checkOK, Detail: "running"})
-		pctx, cancel := context.WithTimeout(ctx, 8*time.Second)
-		snap = svc.player().Poll(pctx)
-		cancel()
-		add(automationCheck(snap))
+		// Ask macOS first: polling Spotify while Automation is undecided
+		// would put a prompt on screen, and doctor never prompts.
+		if c, ok := a.automationState(); ok {
+			add(c)
+		} else {
+			pctx, cancel := context.WithTimeout(ctx, 8*time.Second)
+			snap = svc.player().Poll(pctx)
+			cancel()
+			add(automationCheck(snap))
+		}
 	} else {
 		add(check{
 			ID: "spotify_running", Name: "Spotify running", Status: checkFail, Detail: "not running",
@@ -166,6 +173,53 @@ func (a *app) checkConfig() (config.Settings, check) {
 		s, _ = config.Resolve(config.File{}, func(string) string { return "" }, config.Overrides{}, a.deps.userHome)
 	}
 	return s, c
+}
+
+// automationState reports the Automation permission when macOS gives a
+// definite answer that rules out polling (undecided or denied); ok is false
+// when Spotify should be polled to find out.
+func (a *app) automationState() (check, bool) {
+	app := a.deps.services.hostApp()
+	c := check{ID: "automation", Name: "Automation permission", Fix: permission.Instructions(permission.Automation, app)}
+	switch a.deps.services.permission(permission.Automation) {
+	case permission.Denied:
+		c.Status, c.Detail = checkFail, app.String()+" may not control Spotify"
+		return c, true
+	case permission.Undecided:
+		c.Status = checkWarn
+		c.Detail = "macOS has not been asked yet whether " + app.String() + " may control Spotify"
+		c.Fix = "run 'mixtape setup': it shows the prompt"
+		return c, true
+	case permission.Granted, permission.Unknown:
+	}
+	return check{}, false
+}
+
+// permissionCheck reports a capture permission for the host app.
+func (a *app) permissionCheck(k permission.Kind) check {
+	app := a.deps.services.hostApp()
+	c := check{ID: string(k), Name: "Audio recording", Status: checkOK}
+	what := "record system audio (process tap)"
+	if k == permission.Microphone {
+		c.Name, what = "Microphone access", "open the capture device"
+	}
+	switch a.deps.services.permission(k) {
+	case permission.Granted:
+		c.Detail = app.String() + " may " + what
+	case permission.Undecided:
+		c.Status, c.Detail = checkFail, app.String()+" has not been allowed to "+what
+		c.Fix = permission.Instructions(k, app) + " (or run 'mixtape setup')"
+		if k == permission.Microphone {
+			c.Status, c.Fix = checkWarn, "macOS asks the first time; 'mixtape setup' shows the prompt"
+		}
+	case permission.Denied:
+		c.Status, c.Detail = checkFail, app.String()+" is not allowed to "+what
+		c.Fix = permission.Instructions(k, app)
+	case permission.Unknown:
+		c.Status, c.Detail = checkWarn, "macOS did not say whether "+app.String()+" may "+what
+		c.Fix = "'mixtape setup' checks with a short test capture"
+	}
+	return c
 }
 
 func automationCheck(snap spotify.Snapshot) check {
@@ -246,9 +300,7 @@ func (a *app) checkCapture(s config.Settings) (capture.Method, []check) {
 	}
 	checks = append(checks, methodCheck, tapCheck)
 	if method == capture.MethodTap {
-		tapCheck.Fix = "the first recording asks macOS for audio-recording permission for your terminal app"
-		checks[1] = tapCheck
-		return method, checks
+		return method, append(checks, a.permissionCheck(permission.SystemAudio))
 	}
 
 	devs, derr := svc.devices()
@@ -275,6 +327,9 @@ func (a *app) checkCapture(s config.Settings) (capture.Method, []check) {
 	default:
 		route.Status, route.Detail = checkFail, "system output is "+out.Name+", so the capture device hears nothing"
 		route.Fix = "create a Multi-Output Device (speakers + BlackHole) in Audio MIDI Setup and select it as the output"
+	}
+	if method == capture.MethodDevice {
+		checks = append(checks, a.permissionCheck(permission.Microphone))
 	}
 	return method, append(checks, route)
 }

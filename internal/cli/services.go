@@ -14,6 +14,7 @@ import (
 	"github.com/mrz1836/mixtape/internal/capture/tap"
 	"github.com/mrz1836/mixtape/internal/engine"
 	"github.com/mrz1836/mixtape/internal/library"
+	"github.com/mrz1836/mixtape/internal/permission"
 	"github.com/mrz1836/mixtape/internal/session"
 	"github.com/mrz1836/mixtape/internal/spotify"
 )
@@ -58,6 +59,11 @@ type services struct {
 	kill           func(pid int, sig syscall.Signal) error
 	sleep          func(ctx context.Context, d time.Duration) bool
 	runScript      func(ctx context.Context, name string, args ...string) error
+	// permission checks a macOS privacy permission without prompting;
+	// requestPermission shows the system prompt where macOS allows one.
+	permission        func(permission.Kind) permission.State
+	requestPermission func(permission.Kind) permission.State
+	hostApp           func() permission.HostApp
 }
 
 func newProcessServices() services {
@@ -91,6 +97,9 @@ func newProcessServices() services {
 				return true
 			}
 		},
+		permission:        permission.Check,
+		requestPermission: permission.Request,
+		hostApp:           permission.App,
 		runScript: func(ctx context.Context, name string, args ...string) error {
 			cmd := exec.CommandContext(ctx, name, args...) //nolint:gosec // G204: fixed programs (brew, open) with constant arguments
 			cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr

@@ -22,6 +22,7 @@ import (
 	"github.com/mrz1836/mixtape/internal/config"
 	"github.com/mrz1836/mixtape/internal/engine"
 	"github.com/mrz1836/mixtape/internal/library"
+	"github.com/mrz1836/mixtape/internal/permission"
 	"github.com/mrz1836/mixtape/internal/session"
 	"github.com/mrz1836/mixtape/internal/spotify"
 )
@@ -435,4 +436,66 @@ func TestSetupFallsBackToBlackHoleWhenTheTapIsSilent(t *testing.T) {
 	assert.Contains(t, out, "the tap test failed")
 	assert.Contains(t, out, "Screen & System Audio Recording")
 	assert.Contains(t, out, "saved capture = device")
+}
+
+func TestDoctorNamesTheMissingSystemAudioPermission(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	h.world.perms[permission.SystemAudio] = permission.Undecided
+	require.Equal(t, ExitNotReady, h.run("doctor"))
+	var found map[string]any
+	for _, raw := range h.json()["checks"].([]any) {
+		if c := raw.(map[string]any); c["id"] == string(permission.SystemAudio) {
+			found = c
+		}
+	}
+	require.NotNil(t, found, "the tap method reports its permission")
+	assert.Equal(t, "fail", found["status"])
+	assert.Contains(t, found["detail"], "iTerm has not been allowed")
+	assert.Contains(t, found["fix"], "add iTerm under")
+	assert.Contains(t, found["fix"], "System Audio Recording Only")
+}
+
+func TestDoctorNeverPromptsForAutomation(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	h.world.perms[permission.Automation] = permission.Undecided
+	require.Equal(t, ExitOK, h.run("doctor"), "an undecided prompt is a warning, not a failure")
+	for _, raw := range h.json()["checks"].([]any) {
+		if c := raw.(map[string]any); c["id"] == "automation" {
+			assert.Equal(t, "warn", c["status"])
+			assert.Contains(t, c["fix"], "mixtape setup")
+		}
+	}
+	assert.Empty(t, h.world.player.Commands(), "doctor did not poll Spotify, which would prompt")
+}
+
+func TestRecordStopsAtOnceWithoutTheTapPermission(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	h.world.addPlaylist("List", songs()...)
+	h.world.perms[permission.SystemAudio] = permission.Undecided
+
+	require.Equal(t, ExitPermission, h.run("record", plURL))
+	e := h.errDoc()
+	assert.Equal(t, "permission", e["code"])
+	assert.Contains(t, e["message"], "iTerm may not record system audio yet")
+	assert.Contains(t, e["hint"], "System Audio Recording Only")
+	assert.Contains(t, e["hint"], "mixtape setup")
+}
+
+func TestSetupOpensSettingsAndWaitsForTheTapPermission(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	h.deps.stdinTTY, h.deps.stdoutTTY = true, true
+	h.world.perms[permission.SystemAudio] = permission.Undecided
+	h.world.grantAfter[permission.SystemAudio] = 4 // switched on a few seconds later
+	h.deps.services.openCapture = func(captureRequest) (capture.Source, error) { return &loudSource{}, nil }
+
+	require.Equal(t, ExitOK, h.run("setup", "--yes"), h.stderr.String())
+	out := h.stdout.String()
+	assert.Contains(t, out, "iTerm needs permission: add iTerm under")
+	assert.Contains(t, out, "iTerm may now record system audio")
+	assert.Contains(t, out, "saved capture = tap")
+	assert.Contains(t, h.world.scripts, "open "+permission.SettingsURL(permission.SystemAudio))
 }

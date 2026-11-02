@@ -16,6 +16,7 @@ import (
 	"github.com/mrz1836/mixtape/internal/config"
 	"github.com/mrz1836/mixtape/internal/engine"
 	"github.com/mrz1836/mixtape/internal/library"
+	"github.com/mrz1836/mixtape/internal/permission"
 	"github.com/mrz1836/mixtape/internal/session"
 	"github.com/mrz1836/mixtape/internal/spotify"
 )
@@ -176,12 +177,14 @@ func rules() []rule {
 		},
 		{
 			engine.ErrSilentTap, ExitPermission,
-			"allow your terminal app in System Settings → Privacy & Security → Screen & System Audio Recording, or use --capture device",
+			"add your terminal app under " + permission.Where(permission.SystemAudio) +
+				" (run 'mixtape setup'), or use --capture device",
 		},
 		{
 			tap.ErrCreateTap, ExitPermission,
-			"allow your terminal app in System Settings → Privacy & Security → Screen & System Audio Recording",
+			"add your terminal app under " + permission.Where(permission.SystemAudio) + " (run 'mixtape setup')",
 		},
+		{permission.ErrNotGranted, ExitPermission, "run 'mixtape setup': it walks you through the permission"},
 
 		// Busy.
 		{session.ErrBusy, ExitBusy, "'mixtape status' shows it; 'mixtape stop' ends it"},

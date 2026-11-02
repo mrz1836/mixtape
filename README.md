@@ -289,12 +289,20 @@ The details, including the timing measurements behind every constant, are in
 `mixtape setup` picks and tests one; `--capture tap|device` overrides it per
 run, and `mixtape config set capture …` changes the default.
 
-**Process tap permission.** macOS grants audio recording to the *app* that
-runs mixtape (Terminal, iTerm, an IDE), not to mixtape itself. Grant it in
-System Settings → Privacy & Security → **Screen & System Audio Recording** →
-*System Audio Recording Only* → add your terminal app, then quit and reopen
-that app. A denied tap records silence; Mixtape notices within 10 seconds and
-exits 5 with this fix.
+**Permissions.** macOS grants audio recording, microphone access and control
+of Spotify to the *app* that runs mixtape (Terminal, iTerm, an IDE), never to
+mixtape itself, and no program can grant itself these permissions. `mixtape
+setup` handles them: it names the app macOS asks about, shows the system
+prompt where macOS has one, and otherwise opens System Settings at the right
+list and waits until you switch it on, then proves it with a test capture.
+`mixtape doctor` reports each one without prompting.
+
+The one that trips people up is the process tap's. Terminal apps cannot show
+a prompt for it, so it must be switched on by hand: System Settings → Privacy
+& Security → Screen & System Audio Recording → **System Audio Recording Only**
+(the *bottom* list; the screen-recording list above it is not enough) → add
+your terminal app. Without it the tap records silence, so `record` stops at
+once with exit 5 and this fix.
 
 **BlackHole routing.** In Audio MIDI Setup create a *Multi-Output Device* with
 your speakers and *BlackHole 2ch* (speakers first, as the clock source), and
@@ -325,7 +333,7 @@ numbers, the collection name (grouping) and the Spotify URL (comment), plus
 | Symptom | Fix |
 |---|---|
 | `crossfade appears to be on` (exit 3) | Spotify → Settings → Playback → turn off *Crossfade songs*. Spotify keeps this setting where it cannot be read directly, so Mixtape detects it from playback. |
-| `the process tap is silent` (exit 5) | Grant *System Audio Recording* to your terminal app (see above) and reopen it, or use `--capture device`. |
+| `… may not record system audio yet` or `the process tap is silent` (exit 5) | Run `mixtape setup`, or add your terminal app under *System Audio Recording Only* (see above; not the screen-recording list). If it is already there, quit and reopen the terminal app. Or use `--capture device`. |
 | `the capture device is silent` (exit 3) | Select the Multi-Output Device (with BlackHole) as the Mac's sound output. |
 | `not allowed to control Spotify` (exit 5) | System Settings → Privacy & Security → Automation → your terminal app → enable Spotify. |
 | Recordings are quiet | Set Spotify's volume slider to the maximum. |

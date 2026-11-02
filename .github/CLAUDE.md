@@ -42,6 +42,7 @@ stores it in a library with manifests, `.m3u8` playlists and audio hashes.
 | `internal/library` | folders, manifests, naming, encode/tag/hash, verify |
 | `internal/mp4tag` | pure-Go MP4 tags (`ilst`, `----` freeform, `covr`, `mdat` hash) |
 | `internal/session` | recorder lock, `session.json`, event log, detach, Spotify restore |
+| `internal/permission` | macOS privacy permissions of the host app: check, prompt, Settings deep links (C) |
 | `internal/fileutil` | atomic writes and copies |
 | `internal/wav` | PCM16 WAV header |
 

@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"testing"
@@ -16,6 +17,7 @@ import (
 	"github.com/mrz1836/mixtape/internal/capture"
 	"github.com/mrz1836/mixtape/internal/capture/device"
 	"github.com/mrz1836/mixtape/internal/library"
+	"github.com/mrz1836/mixtape/internal/permission"
 	"github.com/mrz1836/mixtape/internal/spotify"
 )
 
@@ -129,6 +131,27 @@ type fakeWorld struct {
 	lockPath  string
 	killed    []int
 	onKill    func(pid int)
+	// perms answers permission checks (missing kinds are granted); grantAfter
+	// flips a kind to granted after that many checks, like a user switching
+	// it on in System Settings.
+	perms      map[permission.Kind]permission.State
+	grantAfter map[permission.Kind]int
+	scripts    []string
+}
+
+func (w *fakeWorld) permission(k permission.Kind) permission.State {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if n, ok := w.grantAfter[k]; ok {
+		if n <= 0 {
+			w.perms[k] = permission.Granted
+		}
+		w.grantAfter[k] = n - 1
+	}
+	if st, ok := w.perms[k]; ok {
+		return st
+	}
+	return permission.Granted
 }
 
 func newFakeWorld(t *testing.T) *fakeWorld {
@@ -143,8 +166,10 @@ func newFakeWorld(t *testing.T) *fakeWorld {
 			{Name: "BlackHole 2ch", Input: true, Output: true},
 			{Name: "MacBook Pro Speakers", Output: true, DefaultOutput: true},
 		},
-		output:   device.Info{Name: "MacBook Pro Speakers", Output: true, DefaultOutput: true},
-		lockPath: filepath.Join(t.TempDir(), "recorder.lock"),
+		output:     device.Info{Name: "MacBook Pro Speakers", Output: true, DefaultOutput: true},
+		lockPath:   filepath.Join(t.TempDir(), "recorder.lock"),
+		perms:      map[permission.Kind]permission.State{},
+		grantAfter: map[permission.Kind]int{},
 	}
 }
 
@@ -180,7 +205,15 @@ func (w *fakeWorld) services(h *harness) services {
 			h.advance(d)
 			return ctx.Err() == nil
 		},
-		runScript: func(context.Context, string, ...string) error { return nil },
+		runScript: func(_ context.Context, name string, args ...string) error {
+			w.mu.Lock()
+			defer w.mu.Unlock()
+			w.scripts = append(w.scripts, strings.Join(append([]string{name}, args...), " "))
+			return nil
+		},
+		permission:        w.permission,
+		requestPermission: w.permission,
+		hostApp:           func() permission.HostApp { return permission.HostApp{Name: "iTerm"} },
 	}
 }
 

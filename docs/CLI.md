@@ -293,6 +293,15 @@ while Spotify plays, crossfade, and the library folder. Only a verified
 method is saved. Without a terminal (or with `-o json`) it prints the
 `doctor` report and the manual steps, and exits 3 when not ready.
 
+**Permissions.** macOS grants them to the app that runs mixtape, never to
+mixtape, and no program can grant itself one. For each permission the chosen
+method needs (Automation for Spotify; *System Audio Recording Only* for the
+tap; Microphone for a capture device) setup checks without prompting, shows
+the system prompt where macOS has one, and otherwise names the app, opens
+System Settings at the right list, and waits up to 3 minutes for the switch.
+Terminal apps cannot prompt for system audio recording, so the tap's
+permission is always switched on by hand.
+
 ## doctor
 
 ```
@@ -302,8 +311,10 @@ mixtape doctor
 `{"ready": bool, "capture": "tap"|"device", "checks": [{id, name, status,
 detail, fix}]}` with `status` `ok`, `warn`, `fail` or `skip`. Check IDs:
 `macos`, `config`, `spotify_installed`, `spotify_running`, `automation`,
-`crossfade`, `volume`, `capture`, `tap`, `device`, `routing`, `afconvert`,
-`library`, `session`. Exits 3 when any check fails; warnings do not block.
+`crossfade`, `volume`, `capture`, `tap`, `system_audio_recording` (tap),
+`device`, `routing`, `microphone` (device), `afconvert`, `library`,
+`session`. Exits 3 when any check fails; warnings do not block. Doctor never
+shows a permission prompt: an undecided Automation permission is a warning.
 
 ## devices
 
