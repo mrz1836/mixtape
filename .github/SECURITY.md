@@ -63,10 +63,9 @@ We follow the [OpenSSF](https://openssf.org) best practices to ensure this repos
 
 ## 🛠️ GitHub Security Workflows
 
-Every push and pull request runs the security scans in [GoFortress](workflows/fortress-security-scans.yml):
+To proactively protect this repository, we use several automated GitHub workflows:
 
-- **gitleaks** looks for secrets committed by mistake.
-- **govulncheck** checks the code paths Mixtape actually calls against the Go vulnerability database.
-- **OSV-Scanner** checks every dependency against the OSV database.
+- **[CodeQL Analysis](workflows/codeql-analysis.yml)**: Scans the codebase for security vulnerabilities and coding errors using GitHub's CodeQL engine on every push and pull request to the `main/master` branch.
+- **[OpenSSF Scorecard](workflows/scorecard.yml)**: Periodically evaluates the repository against OpenSSF Scorecard checks, providing insights and recommendations for improving supply chain security and best practices.
 
-[Dependabot](dependabot.yml) proposes dependency and GitHub Actions updates. Every third-party action is pinned to a commit SHA. For more details, see the workflow files in the [`.github/workflows/`](workflows) directory.
+These workflows help us identify, remediate, and prevent security issues as early as possible in the development lifecycle. For more details, see the workflow files in the [`.github/workflows/`](workflows) directory.

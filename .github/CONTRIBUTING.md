@@ -31,12 +31,8 @@ Tests should be:
 * Focused on one behavior
 * Fast
 
-New behavior comes with tests, and CI runs the whole suite with the race
-detector on every push and pull request. The engine is tested against a
-simulated Spotify and capture device (`internal/engine/sim_test.go`), so most
-changes can be tested without audio hardware. The code that talks to Core Audio
-has live tests that need a Mac with Spotify playing: run
-`MIXTAPE_LIVE_CAPTURE=1 magex test` (without the variable they skip).
+This project aims for >= **90% code coverage**. Every code path must be tested to
+keep the Codecov badge green and CI passing.
 
 <br/>
 
@@ -47,8 +43,7 @@ We follow [Effective Go](https://golang.org/doc/effective_go.html), plus:
 * 📖 [godoc](https://godoc.org/golang.org/x/tools/cmd/godoc)
 * 🧼 [golangci-lint](https://golangci-lint.run/)
 
-Format with `magex format:fix`, lint with `magex lint`, test with `magex test:race`
-(*Development*, under the [README's Documentation](../README.md#-documentation), lists every check), and keep your diffs minimal.
+Format your code with `gofmt`, lint with `golangci-lint`, and keep your diffs minimal.
 
 <br/>
 

@@ -3,8 +3,9 @@ project:
   binary: mixtape
   module: github.com/mrz1836/mixtape
   main: ./cmd/mixtape/main.go
+
 build:
-  # Custom ldflags with version injection (read by `mixtape version`)
+  # Custom ldflags with version injection
   ldflags:
     - "-s -w"
     - "-X main.version={{.Version}}"
@@ -13,6 +14,8 @@ build:
   flags:
     - "-trimpath"
   output: "./cmd/mixtape"
+
 test:
-  # Match CI timeout configuration (the default magex timeout is 10m)
+  # Match CI timeout configuration (TEST_TIMEOUT_RACE_COVER in .github/env/00-core.env)
+  # Default magex timeout is 10m which was killing tests prematurely
   timeout: 30m
