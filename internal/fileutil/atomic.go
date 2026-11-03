@@ -30,6 +30,16 @@ func WriteAtomic(path string, data []byte, perm os.FileMode) error {
 	})
 }
 
+// WriteAtomicFrom writes what src writes to path atomically with the
+// provided permissions (see WriteAtomic), streaming it rather than holding
+// it in memory.
+func WriteAtomicFrom(path string, src io.WriterTo, perm os.FileMode) error {
+	return writeAtomic(path, perm, func(w io.Writer) error {
+		_, err := src.WriteTo(w)
+		return err
+	})
+}
+
 // CopyFile copies src to dst atomically: the bytes stream into a temp file
 // next to dst, which is fsynced and renamed over dst. It works across
 // filesystems (a library on an external drive), unlike os.Rename.

@@ -47,6 +47,7 @@ type Problem struct {
 // audioFile is one .m4a found while scanning the library.
 type audioFile struct {
 	hash    string
+	codec   mp4tag.Codec // "" when it cannot be read
 	tags    mp4tag.Tags
 	readErr error
 }
@@ -169,8 +170,8 @@ func (v *verifier) checkNotDone(c *Collection, e *Entry, p Problem) {
 		return
 	}
 	p.Kind, p.Detail = ProblemStatusMismatch, fmt.Sprintf("file exists but status is %s", e.Status)
-	hash := f.hash
-	v.add(p, func() { e.Status, e.AudioSHA256, e.FailReason = StatusRecorded, hash, "" })
+	hash, codec := f.hash, f.codec
+	v.add(p, func() { e.Status, e.AudioSHA256, e.Codec, e.FailReason = StatusRecorded, hash, codec, "" })
 }
 
 // checkDone checks a done song's file: there, readable, tagged for it, and
@@ -209,14 +210,14 @@ func (v *verifier) notInPlace(c *Collection, e *Entry, p Problem) {
 			v.add(p, nil)
 			return
 		}
-		name := filepath.Base(to)
-		v.add(p, func() { e.File = name })
+		name, codec := filepath.Base(to), v.files[to].codec
+		v.add(p, func() { e.File, e.Codec = name, codec })
 		return
 	}
 	v.missing++ // a song found elsewhere proves the drive is mounted: only lost ones count
 	p.Kind, p.Detail = ProblemMissing, "file not found; the next run records it again"
 	v.add(p, func() {
-		e.Status, e.File, e.AudioSHA256, e.Partial = StatusPending, "", "", false
+		e.Status, e.File, e.AudioSHA256, e.Codec, e.Partial = StatusPending, "", "", "", false
 		e.FailReason = "file missing (verify)"
 	})
 }
@@ -228,10 +229,10 @@ func (v *verifier) notInPlace(c *Collection, e *Entry, p Problem) {
 // recorded, and the song goes back to pending.
 func (v *verifier) hashMismatch(e *Entry, f audioFile, p Problem) {
 	p.Kind = ProblemHashMismatch
-	hash := f.hash
+	hash, codec := f.hash, f.codec
 	if e.AudioSHA256 == "" || f.tags.Freeform[TagAudioSHA256] == f.hash {
 		p.Detail = "manifest hash is stale"
-		v.add(p, func() { e.AudioSHA256 = hash })
+		v.add(p, func() { e.AudioSHA256, e.Codec = hash, codec })
 		return
 	}
 	p.Detail = "audio changed since it was recorded; the next run records it again"
@@ -316,6 +317,9 @@ func (l *Library) scanAudio(ctx context.Context) (map[string]audioFile, error) {
 		f.tags, f.readErr = mp4tag.ReadFile(path)
 		if f.readErr == nil {
 			f.hash, f.readErr = mp4tag.HashFile(path)
+		}
+		if f.readErr == nil {
+			f.codec, _ = mp4tag.ReadCodec(path) // a file another tool made may not say
 		}
 		files[path] = f
 		return nil

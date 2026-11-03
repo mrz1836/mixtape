@@ -82,11 +82,12 @@ type anchor struct {
 	at    time.Time
 }
 
-// Open creates a spool in dir for audio in format f. Chunk files left in
-// dir by an earlier, crashed session are removed.
+// Open creates a spool in dir for audio in format f, which it keeps as it
+// is (Format returns it unchanged). Chunk files left in dir by an earlier,
+// crashed session are removed.
 func Open(dir string, f capture.Format) (*Spool, error) {
-	if f.Rate <= 0 || f.Channels <= 0 {
-		return nil, fmt.Errorf("%w: %d Hz, %d channels", ErrFormat, f.Rate, f.Channels)
+	if !f.Valid() {
+		return nil, fmt.Errorf("%w: %d Hz, %d channels, %d bits", ErrFormat, f.Rate, f.Channels, f.Bits)
 	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, fmt.Errorf("spool: %w", err)

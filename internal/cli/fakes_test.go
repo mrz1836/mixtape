@@ -3,8 +3,11 @@ package cli
 import (
 	"context"
 	"encoding/binary"
+	"maps"
 	"os"
 	"path/filepath"
+	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -14,6 +17,7 @@ import (
 
 	"github.com/mrz1836/mixtape/internal/capture"
 	"github.com/mrz1836/mixtape/internal/capture/device"
+	"github.com/mrz1836/mixtape/internal/library"
 	"github.com/mrz1836/mixtape/internal/permission"
 	"github.com/mrz1836/mixtape/internal/spotify"
 	"github.com/mrz1836/mixtape/internal/testutil"
@@ -134,6 +138,70 @@ type fakeWorld struct {
 	perms      map[permission.Kind]permission.State
 	grantAfter map[permission.Kind]int
 	scripts    []string
+	// encoders are the afconvert stand-ins made so far, and encodedAs
+	// the encoder each one stood in for.
+	encoders  []*testutil.Encoder
+	encodedAs []library.AFConvert
+	// out is the machine's output devices.
+	out *fakeOutput
+}
+
+// fakeOutput is a machine's output devices, by UID: the default output,
+// each one's rate and the rates it offers, and every rate set.
+type fakeOutput struct {
+	mu      sync.Mutex
+	def     string
+	names   map[string]string
+	rates   map[string]int
+	offers  map[string][]capture.RateRange
+	sets    []string
+	readErr error
+}
+
+func newFakeOutput() *fakeOutput {
+	return &fakeOutput{
+		def:    "spk",
+		names:  map[string]string{"spk": "MacBook Pro Speakers"},
+		rates:  map[string]int{"spk": 48000},
+		offers: map[string][]capture.RateRange{"spk": {{Min: 44100, Max: 44100}, {Min: 48000, Max: 48000}}},
+	}
+}
+
+func (f *fakeOutput) DefaultOutput() (capture.OutputDevice, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.readErr != nil {
+		return capture.OutputDevice{}, f.readErr
+	}
+	return capture.OutputDevice{UID: f.def, Name: f.names[f.def], Rate: f.rates[f.def], Rates: f.offers[f.def]}, nil
+}
+
+func (f *fakeOutput) OutputRate(uid string) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	r, ok := f.rates[uid]
+	if !ok {
+		return 0, capture.ErrOutputGone
+	}
+	return r, nil
+}
+
+func (f *fakeOutput) SetOutputRate(_ context.Context, uid string, rate int) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.sets = append(f.sets, uid+"="+strconv.Itoa(rate))
+	if _, ok := f.rates[uid]; !ok {
+		return capture.ErrOutputGone
+	}
+	f.rates[uid] = rate
+	return nil
+}
+
+// state returns every device's rate and the sets made so far.
+func (f *fakeOutput) state() (map[string]int, []string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return maps.Clone(f.rates), slices.Clone(f.sets)
 }
 
 func (w *fakeWorld) permission(k permission.Kind) permission.State {
@@ -167,7 +235,20 @@ func newFakeWorld(t *testing.T) *fakeWorld {
 		lockPath:   filepath.Join(t.TempDir(), "recorder.lock"),
 		perms:      map[permission.Kind]permission.State{},
 		grantAfter: map[permission.Kind]int{},
+		out:        newFakeOutput(),
 	}
+}
+
+// encoder is the stand-in for afconvert: a testutil.Encoder in the codec
+// the settings ask for. Every one made is kept, so tests can see what was
+// encoded.
+func (w *fakeWorld) encoder(a library.AFConvert) library.Encoder {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	enc := &testutil.Encoder{Codec: string(a.Codec)}
+	w.encoders = append(w.encoders, enc)
+	w.encodedAs = append(w.encodedAs, a)
+	return enc
 }
 
 // services wires the fake world into the CLI.
@@ -179,6 +260,7 @@ func (w *fakeWorld) services(h *harness) services {
 			return &nopSource{events: make(chan capture.Event)}, nil
 		},
 		tapStatus:      func() capture.TapStatus { return w.tap },
+		output:         func() capture.OutputControl { return w.out },
 		devices:        func() ([]device.Info, error) { return w.devices, w.devicesErr },
 		defaultOutput:  func() (device.Info, error) { return w.output, nil },
 		spotifyRunning: func() (bool, error) { return w.running, w.runningErr },
@@ -187,9 +269,12 @@ func (w *fakeWorld) services(h *harness) services {
 		lockPath:       func() (string, error) { return w.lockPath, nil },
 		executable:     os.Executable,
 		lookPath:       func(string) (string, error) { return "/usr/bin/afconvert", nil },
-		encoder:        &testutil.Encoder{},
-		signals:        func() (<-chan os.Signal, func()) { return make(chan os.Signal), func() {} },
-		spawn:          func(string, []string, []string, string) (*os.Process, error) { return nil, os.ErrInvalid },
+		encoder:        w.encoder,
+		afconvertHelp: func(context.Context) string {
+			return "    'm4af' = Apple MPEG-4 Audio (.m4a, .m4r)\n               data_formats: 'aac ' 'alac' \n"
+		},
+		signals: func() (<-chan os.Signal, func()) { return make(chan os.Signal), func() {} },
+		spawn:   func(string, []string, []string, string) (*os.Process, error) { return nil, os.ErrInvalid },
 		keepAwake: func() func() {
 			w.mu.Lock()
 			w.awake++

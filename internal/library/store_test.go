@@ -62,7 +62,7 @@ func TestCheckOutput(t *testing.T) {
 // TestAFConvert runs the real encoder: macOS only, outside a sandbox.
 func TestAFConvert(t *testing.T) {
 	t.Parallel()
-	testutil.RequireAAC(t)
+	testutil.RequireEncoder(t, "aac")
 	out := filepath.Join(t.TempDir(), "out.m4a")
 	require.NoError(t, AFConvert{}.Encode(t.Context(), testutil.SineWAV(t, 440), out))
 	hash, err := mp4tag.HashFile(out)
@@ -78,7 +78,7 @@ func TestAFConvert(t *testing.T) {
 // must leave afconvert's audio, and so its hash, untouched.
 func TestCommitWithAFConvert(t *testing.T) {
 	t.Parallel()
-	testutil.RequireAAC(t)
+	testutil.RequireEncoder(t, "aac")
 	f := newFixture(t, AFConvert{})
 	c := f.collection(playlistSpec())
 	e := f.commit(c, trackTime(), 440, CommitOptions{})

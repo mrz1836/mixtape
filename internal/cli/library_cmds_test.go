@@ -18,7 +18,7 @@ import (
 // for spec.
 func (h *harness) songFile(spec library.Spec, id string) string {
 	h.t.Helper()
-	lib, err := library.Open(h.env["MIXTAPE_LIBRARY"], library.Options{Encoder: &testutil.Encoder{}, WorkDir: h.t.TempDir()})
+	lib, err := library.Open(h.env["MIXTAPE_LIBRARY"], library.Options{Encoder: seedEncoder(), WorkDir: h.t.TempDir()})
 	require.NoError(h.t, err)
 	c, ok := lib.Lookup(spec)
 	require.True(h.t, ok, "no collection %v", spec)
@@ -88,6 +88,7 @@ func TestListLinkTextShowsEachSongsStatus(t *testing.T) {
 	a := trackRow(t, doc, trkA)
 	assert.Equal(t, "partial", a["status"], "a partial take is not a recording")
 	assert.Equal(t, "record", a["next_action"])
+	assert.Equal(t, "alac", a["codec"], "the file in the folder")
 	b := trackRow(t, doc, trkB)
 	assert.Equal(t, "failed", b["status"])
 	assert.Equal(t, "spotify skipped it", b["fail_reason"])
@@ -97,7 +98,7 @@ func TestListLinkTextShowsEachSongsStatus(t *testing.T) {
 	require.Equal(t, ExitOK, h.run("list", plURL, "-o", "text"))
 	out := h.stdout.String()
 	assert.Regexp(t, `^Mix\n`, out)
-	assert.Regexp(t, `\n\s+1  partial\s+Rick Astley — Never Gonna Give You Up\n`, out)
+	assert.Regexp(t, `\n\s+1  partial\s+Rick Astley — Never Gonna Give You Up  \[ALAC\]\n`, out)
 	assert.Regexp(t, `\n\s+2  failed\s+Someone — Second  \(spotify skipped it\)\n`, out)
 }
 
@@ -256,7 +257,7 @@ func TestVerifyFixWaitsForNoOtherLibraryWriter(t *testing.T) {
 	t.Parallel()
 	h := newHarness(t)
 	h.seedLibrary(playlistSpec("Mix"), songs()[0])
-	lib, err := library.Open(h.env["MIXTAPE_LIBRARY"], library.Options{Encoder: &testutil.Encoder{}, WorkDir: t.TempDir()})
+	lib, err := library.Open(h.env["MIXTAPE_LIBRARY"], library.Options{Encoder: seedEncoder(), WorkDir: t.TempDir()})
 	require.NoError(t, err)
 	unlock, err := lib.Lock()
 	require.NoError(t, err)

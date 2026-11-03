@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -89,9 +90,11 @@ func (p *replayPlayer) SetShuffle(context.Context, bool) error          { return
 func (p *replayPlayer) SetRepeat(context.Context, bool) error           { return p.log("repeat") }
 func (p *replayPlayer) SetVolume(context.Context, int) error            { return p.log("volume") }
 
-// replay runs the engine in live mode over a golden trace and returns the
-// events, the encoder that saw every cut, and the trace's sample rate.
-func replay(t *testing.T, name string) ([]Event, *fakeEncoder, int) {
+// replay runs the engine in live mode over a golden trace, captured at
+// bits bits a sample, and returns the events, the encoder that saw every
+// cut, and the trace's sample rate. The trace's peaks are on the 16-bit
+// scale capture.Peak reports at any depth, so one trace serves both.
+func replay(t *testing.T, name string, bits int) ([]Event, *fakeEncoder, int) {
 	t.Helper()
 	rate, lines := loadFixture(t, name)
 	t0 := time.Date(2026, 11, 2, 12, 0, 0, 0, time.UTC)
@@ -119,7 +122,7 @@ func replay(t *testing.T, name string) ([]Event, *fakeEncoder, int) {
 			break
 		}
 	}
-	src := &fakeSource{rate: rate, events: make(chan capture.Event)}
+	src := &fakeSource{rate: rate, bits: bits, events: make(chan capture.Event)}
 	enc := newFakeEncoder()
 	home := t.TempDir()
 	lib, err := library.Open(t.TempDir(), library.Options{Encoder: enc, WorkDir: filepath.Join(home, "work"), Now: clock})
@@ -194,9 +197,19 @@ func replay(t *testing.T, name string) ([]Event, *fakeEncoder, int) {
 // TestGoldenTraceCompleteSongWithPause replays a real Spotify session:
 // "Speak to Me" (1:04) played from the top, paused for 4 s at 0:20,
 // resumed, played out gaplessly into "Breathe", which was paused 7 s in.
+// Captured at 16 or 24 bits, it is cut the same.
 func TestGoldenTraceCompleteSongWithPause(t *testing.T) {
 	t.Parallel()
-	events, enc, rate := replay(t, "trace-complete.ndjson")
+	for _, bits := range []int{16, 24} {
+		t.Run(strconv.Itoa(bits)+"-bit", func(t *testing.T) {
+			t.Parallel()
+			goldenCompleteSongWithPause(t, bits)
+		})
+	}
+}
+
+func goldenCompleteSongWithPause(t *testing.T, bits int) {
+	events, enc, rate := replay(t, "trace-complete.ndjson", bits)
 
 	var saved, discarded []Event
 	for _, ev := range events {
@@ -219,4 +232,7 @@ func TestGoldenTraceCompleteSongWithPause(t *testing.T) {
 	require.Len(t, frames, 1)
 	want := float64(64333)/1000 + 2*DefaultTuning().Margin.Seconds()
 	assert.InDelta(t, want, float64(frames[0])/float64(rate), 0.05)
+	calls := enc.Calls()
+	require.Len(t, calls, 1)
+	assert.Equal(t, bits, calls[0].Bits, "the WAV is at the capture's depth")
 }

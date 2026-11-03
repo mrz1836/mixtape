@@ -15,6 +15,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strconv"
 	"strings"
@@ -22,6 +23,8 @@ import (
 
 	"github.com/mrz1836/mixtape/internal/capture"
 	"github.com/mrz1836/mixtape/internal/fileutil"
+	"github.com/mrz1836/mixtape/internal/library"
+	"github.com/mrz1836/mixtape/internal/mp4tag"
 )
 
 // Setting names, as written in config.json and accepted by `config set`.
@@ -32,6 +35,11 @@ const (
 	KeyArtwork     = "artwork"
 	KeyIdleTimeout = "idle_timeout"
 	KeyMaxFailures = "max_failures"
+	KeyCodec       = "codec"
+	KeyAACBitrate  = "aac_bitrate"
+	KeyBitDepth    = "bit_depth"
+	KeyCopyCodec   = "copy_codec"
+	KeyOutputRate  = "output_rate"
 )
 
 // Environment variables.
@@ -43,6 +51,11 @@ const (
 	EnvArtwork     = "MIXTAPE_ARTWORK"
 	EnvIdleTimeout = "MIXTAPE_IDLE_TIMEOUT"
 	EnvMaxFailures = "MIXTAPE_MAX_FAILURES"
+	EnvCodec       = "MIXTAPE_CODEC"
+	EnvAACBitrate  = "MIXTAPE_AAC_BITRATE"
+	EnvBitDepth    = "MIXTAPE_BIT_DEPTH"
+	EnvCopyCodec   = "MIXTAPE_COPY_CODEC"
+	EnvOutputRate  = "MIXTAPE_OUTPUT_RATE"
 )
 
 // Defaults.
@@ -52,7 +65,24 @@ const (
 	DefaultDevice      = "BlackHole"
 	DefaultIdleTimeout = 10 * time.Minute
 	DefaultMaxFailures = 3
+	DefaultCodec       = mp4tag.CodecALAC
+	DefaultAACBitrate  = 256 // kb/s
+	DefaultCopyCodec   = library.CopySame
 	fileName           = "config.json"
+)
+
+// The words bit_depth and output_rate take besides numbers.
+const (
+	BitDepthAuto   = "auto" // 24-bit for ALAC, 16-bit for AAC
+	OutputRateKeep = "keep" // leave the output device's rate alone
+)
+
+// Limits of the numeric settings.
+const (
+	MinAACBitrate = 64  // kb/s; afconvert drops AAC below 96 kb/s to 32 kHz
+	MaxAACBitrate = 320 // kb/s
+	MinOutputRate = 8000
+	MaxOutputRate = 768000
 )
 
 var (
@@ -84,6 +114,48 @@ type File struct {
 	Artwork     *bool   `json:"artwork,omitempty"`
 	IdleTimeout *string `json:"idle_timeout,omitempty"`
 	MaxFailures *int    `json:"max_failures,omitempty"`
+	Codec       *string `json:"codec,omitempty"`
+	AACBitrate  *int    `json:"aac_bitrate,omitempty"`
+	BitDepth    *Text   `json:"bit_depth,omitempty"`
+	CopyCodec   *string `json:"copy_codec,omitempty"`
+	OutputRate  *Text   `json:"output_rate,omitempty"`
+}
+
+// Text is a setting that takes a word or a number, such as bit_depth
+// ("auto" or 24) and output_rate ("keep" or 44100). config.json may hold
+// it as a JSON string or a JSON number.
+type Text string
+
+// UnmarshalJSON accepts a JSON string or number.
+func (t *Text) UnmarshalJSON(b []byte) error {
+	var s string
+	if err := json.Unmarshal(b, &s); err == nil {
+		*t = Text(s)
+		return nil
+	}
+	var n json.Number
+	if err := json.Unmarshal(b, &n); err != nil {
+		// What encoding/json reports for any other value of the wrong type.
+		return &json.UnmarshalTypeError{Value: jsonKind(b), Type: reflect.TypeFor[Text]()}
+	}
+	*t = Text(n.String())
+	return nil
+}
+
+// jsonKind names the kind of a JSON value by its first byte, as the
+// "value" of a type error.
+func jsonKind(b []byte) string {
+	switch b = bytes.TrimSpace(b); {
+	case len(b) == 0:
+		return "nothing"
+	case b[0] == '{':
+		return "object"
+	case b[0] == '[':
+		return "array"
+	case b[0] == 't' || b[0] == 'f':
+		return "bool"
+	}
+	return "value"
 }
 
 // Overrides carries the values of command-line flags that were set. A nil
@@ -95,6 +167,11 @@ type Overrides struct {
 	Artwork     *bool
 	IdleTimeout *time.Duration
 	MaxFailures *int
+	Codec       *string
+	AACBitrate  *int
+	BitDepth    *string
+	CopyCodec   *string
+	OutputRate  *string
 }
 
 // Settings is the resolved configuration.
@@ -105,8 +182,33 @@ type Settings struct {
 	Artwork     bool
 	IdleTimeout time.Duration
 	MaxFailures int
+	// Codec is what new recordings are encoded to.
+	Codec mp4tag.Codec
+	// AACBitrate is the AAC bit rate in kb/s (Codec aac only).
+	AACBitrate int
+	// BitDepth is the capture depth asked for: 16, 24, or 0 for auto
+	// (see Bits).
+	BitDepth int
+	// CopyCodec decides which songs elsewhere in the library are copied.
+	CopyCodec library.CopyPolicy
+	// OutputRate is the rate in Hz to run the output device at while the
+	// process tap records; 0 keeps it as it is.
+	OutputRate int
 	// Sources maps each setting name to the layer that supplied it.
 	Sources map[string]Source
+}
+
+// Bits is the capture depth to record at: BitDepth, or for auto 24 bits
+// when encoding lossless ALAC and 16 when encoding AAC, whose encoder
+// gains nothing from more.
+func (s Settings) Bits() int {
+	switch {
+	case s.BitDepth != 0:
+		return s.BitDepth
+	case s.Codec.Lossless():
+		return 24
+	}
+	return 16
 }
 
 // Key describes one setting for `config show`, `config set` and the docs.
@@ -238,6 +340,125 @@ func table() []setting {
 			inFile: func(f *File) any { return &f.MaxFailures },
 			inFlag: func(o *Overrides) any { return &o.MaxFailures },
 		},
+		{
+			Key: Key{
+				KeyCodec, EnvCodec, string(DefaultCodec),
+				"Format of new recordings: alac (lossless, 2 to 5 times the size of AAC) or aac",
+			},
+			apply: func(s *Settings, value, _ string) error {
+				c, err := mp4tag.ParseCodec(value)
+				if err != nil {
+					return fmt.Errorf("%w: codec %q (want alac or aac)", ErrInvalidValue, value)
+				}
+				s.Codec = c
+				return nil
+			},
+			show:   func(s Settings) string { return string(s.Codec) },
+			encode: func(_ string, s Settings) any { return string(s.Codec) },
+			inFile: func(f *File) any { return &f.Codec },
+			inFlag: func(o *Overrides) any { return &o.Codec },
+		},
+		{
+			Key: Key{
+				KeyAACBitrate, EnvAACBitrate, strconv.Itoa(DefaultAACBitrate),
+				fmt.Sprintf("AAC bit rate in kb/s, %d to %d (codec aac only)", MinAACBitrate, MaxAACBitrate),
+			},
+			apply: func(s *Settings, value, _ string) error {
+				n, err := strconv.Atoi(strings.TrimSpace(value))
+				if err != nil || n < MinAACBitrate || n > MaxAACBitrate {
+					return fmt.Errorf("%w: aac_bitrate %q (want kb/s from %d to %d, such as 256)",
+						ErrInvalidValue, value, MinAACBitrate, MaxAACBitrate)
+				}
+				s.AACBitrate = n
+				return nil
+			},
+			show:   func(s Settings) string { return strconv.Itoa(s.AACBitrate) },
+			encode: func(_ string, s Settings) any { return s.AACBitrate },
+			inFile: func(f *File) any { return &f.AACBitrate },
+			inFlag: func(o *Overrides) any { return &o.AACBitrate },
+		},
+		{
+			Key: Key{
+				KeyBitDepth, EnvBitDepth, BitDepthAuto,
+				"Capture depth: auto (24-bit for alac, 16-bit for aac), 16 or 24",
+			},
+			apply: func(s *Settings, value, _ string) error {
+				switch v := strings.ToLower(strings.TrimSpace(value)); v {
+				case BitDepthAuto:
+					s.BitDepth = 0
+				case "16", "24":
+					s.BitDepth, _ = strconv.Atoi(v)
+				default:
+					return fmt.Errorf("%w: bit_depth %q (want auto, 16 or 24)", ErrInvalidValue, value)
+				}
+				return nil
+			},
+			show: func(s Settings) string {
+				if s.BitDepth == 0 {
+					return BitDepthAuto
+				}
+				return strconv.Itoa(s.BitDepth)
+			},
+			encode: func(_ string, s Settings) any {
+				if s.BitDepth == 0 {
+					return BitDepthAuto
+				}
+				return s.BitDepth
+			},
+			inFile: func(f *File) any { return &f.BitDepth },
+			inFlag: func(o *Overrides) any { return &o.BitDepth },
+		},
+		{
+			Key: Key{
+				KeyCopyCodec, EnvCopyCodec, string(DefaultCopyCodec),
+				"Copy a song found elsewhere in the library only in the codec of new recordings (same), or in any (any)",
+			},
+			apply: func(s *Settings, value, _ string) error {
+				p, err := library.ParseCopyPolicy(value)
+				if err != nil {
+					return fmt.Errorf("%w: copy_codec %q (want same or any)", ErrInvalidValue, value)
+				}
+				s.CopyCodec = p
+				return nil
+			},
+			show:   func(s Settings) string { return string(s.CopyCodec) },
+			encode: func(_ string, s Settings) any { return string(s.CopyCodec) },
+			inFile: func(f *File) any { return &f.CopyCodec },
+			inFlag: func(o *Overrides) any { return &o.CopyCodec },
+		},
+		{
+			Key: Key{
+				KeyOutputRate, EnvOutputRate, OutputRateKeep,
+				"Process tap: run the output device at this rate in Hz while recording (such as 44100), or keep",
+			},
+			apply: func(s *Settings, value, _ string) error {
+				v := strings.ToLower(strings.TrimSpace(value))
+				if v == OutputRateKeep {
+					s.OutputRate = 0
+					return nil
+				}
+				n, err := strconv.Atoi(v)
+				if err != nil || n < MinOutputRate || n > MaxOutputRate {
+					return fmt.Errorf("%w: output_rate %q (want keep, or a rate in Hz such as 44100)", ErrInvalidValue, value)
+				}
+				s.OutputRate = n
+				return nil
+			},
+			show: func(s Settings) string {
+				if s.OutputRate == 0 {
+					return OutputRateKeep
+				}
+				return strconv.Itoa(s.OutputRate)
+			},
+			encode: func(_ string, s Settings) any {
+				if s.OutputRate == 0 {
+					return OutputRateKeep
+				}
+				return s.OutputRate
+			},
+			inFile: func(f *File) any { return &f.OutputRate },
+			inFlag: func(o *Overrides) any { return &o.OutputRate },
+		},
 	}
 }
 
@@ -310,6 +531,9 @@ func Resolve(f File, getenv func(string) string, o Overrides, userHome string) (
 		Device:      DefaultDevice,
 		IdleTimeout: DefaultIdleTimeout,
 		MaxFailures: DefaultMaxFailures,
+		Codec:       DefaultCodec,
+		AACBitrate:  DefaultAACBitrate,
+		CopyCodec:   DefaultCopyCodec,
 		Sources:     map[string]Source{},
 	}
 	layers := []struct {
@@ -361,6 +585,10 @@ func fieldText(field any) (string, bool) {
 	case **time.Duration:
 		if *p != nil {
 			return (**p).String(), true
+		}
+	case **Text:
+		if *p != nil {
+			return string(**p), true
 		}
 	}
 	return "", false

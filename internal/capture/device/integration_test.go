@@ -13,7 +13,6 @@ package device
 
 import (
 	"context"
-	"encoding/binary"
 	"os"
 	"sync"
 	"testing"
@@ -33,7 +32,7 @@ func TestIntegrationDeviceRecords(t *testing.T) {
 	if name == "" {
 		name = "BlackHole"
 	}
-	src, err := Open(name)
+	src, err := Open(name, 24)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = src.Close() })
 	f := src.Format()
@@ -55,14 +54,13 @@ func TestIntegrationDeviceRecords(t *testing.T) {
 		}
 		lastAt = b.At
 		frames += b.Frames
-		for i := 0; i+1 < len(b.PCM); i += 2 {
-			v := int(int16(binary.LittleEndian.Uint16(b.PCM[i:])))
-			peak = max(peak, v, -v)
-		}
+		assert.Len(t, b.PCM, b.Frames*f.BytesPerFrame())
+		peak = max(peak, capture.Peak(b.PCM, f))
 	}))
 	<-ctx.Done()
 	mu.Lock()
 	defer mu.Unlock()
-	t.Logf("%d frames (%.2fs), peak %d, largest block gap %v", frames, float64(frames)/float64(f.Rate), peak, maxGap)
+	t.Logf("%d frames (%.2fs), peak %d (16-bit scale), largest block gap %v", frames, float64(frames)/float64(f.Rate), peak, maxGap)
+	assert.Equal(t, 24, f.SampleBits())
 	assert.Positive(t, frames)
 }

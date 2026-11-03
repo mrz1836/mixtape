@@ -334,7 +334,11 @@ and its settings are restored, and the session's summary is printed.
 
 The recorder is found through its lock, so stop never signals a process
 that is not a mixtape recorder. --no-wait returns as soon as the request
-is sent.`,
+is sent.
+
+With no session running, stop puts back what an interrupted session left
+changed (the output device's sample rate, Spotify's shuffle, repeat and
+volume) and exits 0; with nothing to put back either, it exits 4.`,
 		Example: `  mixtape stop
   mixtape stop --no-wait -o json`,
 		GroupID: groupRecording,
@@ -353,13 +357,20 @@ type stopDoc struct {
 	PID       int    `json:"pid"`
 }
 
+// restoredDoc is the JSON shape of `stop` with no session running that put
+// back what an interrupted one left changed.
+type restoredDoc struct {
+	Stopping bool     `json:"stopping"`
+	Restored []string `json:"restored"`
+}
+
 func (a *app) stop(ctx context.Context, noWait bool) error {
 	info, held, err := a.inspectSession()
 	if err != nil {
 		return err
 	}
 	if !held || info.PID <= 0 {
-		return errNotRunning
+		return a.restoreLeftovers(ctx)
 	}
 	if killErr := a.deps.services.kill(info.PID, syscall.SIGTERM); killErr != nil {
 		if !errors.Is(killErr, syscall.ESRCH) {
@@ -396,6 +407,43 @@ func (a *app) stop(ctx context.Context, noWait bool) error {
 		return err
 	}
 	return a.out.Result(a.statusText(st, false), statusDoc{Session: &st})
+}
+
+// restoreLeftovers is stop with no session running: it takes the recorder
+// lock (so no session starts meanwhile) and puts back the output rate and
+// Spotify settings an interrupted session left changed. Nothing to put
+// back is errNotRunning.
+func (a *app) restoreLeftovers(ctx context.Context) error {
+	lockPath, err := a.deps.services.lockPath()
+	if err != nil {
+		return err
+	}
+	lock, err := session.Acquire(lockPath, session.LockInfo{PID: os.Getpid(), Home: a.home, StartedAt: a.deps.now()})
+	if errors.Is(err, session.ErrBusy) {
+		return errNotRunning // a session started since: it restores what is left itself
+	}
+	if err != nil {
+		return err
+	}
+	defer func() { _ = lock.Release() }()
+
+	var restored []string
+	if r, path := a.pendingOutput(); r.Pending() {
+		if done := a.restoreOutput(ctx, path, r); done != "" {
+			restored = append(restored, "output "+done)
+		}
+	}
+	if st, err := session.ReadState(a.home); err == nil && st.Spotify.NeedsRestore() {
+		_, names := a.recoverSpotify(ctx, a.deps.services.player(), false) // the result names them
+		for _, n := range names {
+			restored = append(restored, "Spotify "+n)
+		}
+	}
+	if len(restored) == 0 {
+		return errNotRunning
+	}
+	return a.out.Result("no session was running; restored "+strings.Join(restored, ", "),
+		restoredDoc{Restored: restored})
 }
 
 var _ io.Writer = (*eventWriter)(nil)

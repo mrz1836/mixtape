@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -195,7 +196,11 @@ func eventLine(ev engine.Event, o *Output) string {
 	t := ev.Track
 	switch ev.Type {
 	case engine.EventSessionStarted:
-		return o.paint(colorDim, fmt.Sprintf("mixtape: %s session, capture %s, library %s", ev.Mode, ev.Capture, ev.Library))
+		line := fmt.Sprintf("mixtape: %s session, capture %s, library %s", ev.Mode, ev.Capture, ev.Library)
+		if ev.Codec != "" {
+			line += ", saving " + formatLabel(ev.Codec, ev.BitDepth, ev.SampleRate)
+		}
+		return o.paint(colorDim, line)
 	case engine.EventPlan:
 		return planLine(ev.Items)
 	case engine.EventTrackStarted:
@@ -205,9 +210,9 @@ func eventLine(ev engine.Event, o *Output) string {
 		if t.Partial {
 			mark, note = o.paint(colorYellow, "◐ partial"), o.paint(colorDim, " (kept with --keep-partial)")
 		}
-		return fmt.Sprintf("%s %s → %s%s", mark, songLabel(t.Artist, t.Title), t.File, note)
+		return fmt.Sprintf("%s %s → %s%s%s", mark, songLabel(t.Artist, t.Title), t.File, codecNote(t, o), note)
 	case engine.EventTrackCopied:
-		return fmt.Sprintf("%s %s → %s", o.paint(colorGreen, "⧉ copied"), songLabel(t.Artist, t.Title), t.File)
+		return fmt.Sprintf("%s %s → %s%s", o.paint(colorGreen, "⧉ copied"), songLabel(t.Artist, t.Title), t.File, codecNote(t, o))
 	case engine.EventTrackSkipped:
 		return o.paint(colorDim, "· skipped "+songLabel(t.Artist, t.Title)+" ("+ev.Reason+")")
 	case engine.EventTrackDiscarded:
@@ -224,6 +229,28 @@ func eventLine(ev engine.Event, o *Output) string {
 			t.Title, *ev.OffsetSeconds, deref(ev.DriftSeconds), ev.Runs, ev.Reason))
 	}
 	return ""
+}
+
+// codecNote names the codec of a stored song, dimmed: " (ALAC)".
+func codecNote(t *engine.EventTrack, o *Output) string {
+	if t.Codec == "" {
+		return ""
+	}
+	return o.paint(colorDim, " ("+codecLabel(t.Codec)+")")
+}
+
+// formatLabel describes what a session records: "ALAC, 24-bit 48 kHz".
+func formatLabel(codec string, bits, rate int) string {
+	s := codecLabel(codec)
+	if bits > 0 && rate > 0 {
+		s += fmt.Sprintf(", %d-bit %s", bits, kHz(rate))
+	}
+	return s
+}
+
+// kHz renders a sample rate: 48 kHz, 44.1 kHz.
+func kHz(rate int) string {
+	return strconv.FormatFloat(float64(rate)/1000, 'f', -1, 64) + " kHz"
 }
 
 func planLine(items []engine.PlanItem) string {

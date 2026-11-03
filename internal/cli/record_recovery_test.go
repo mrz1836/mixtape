@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 
@@ -17,7 +18,6 @@ import (
 	"github.com/mrz1836/mixtape/internal/library"
 	"github.com/mrz1836/mixtape/internal/session"
 	"github.com/mrz1836/mixtape/internal/spotify"
-	"github.com/mrz1836/mixtape/internal/testutil"
 )
 
 // interruptedWithShuffleAndRepeat leaves session.json as a session killed
@@ -64,7 +64,9 @@ func TestRecoveredSettingsAreMarkedRestored(t *testing.T) {
 	h.world.player.snap = spotify.Snapshot{Shuffle: false, Repeat: true}
 	a := &app{deps: h.deps, out: plainOutput(t, false), home: h.env["MIXTAPE_HOME"]}
 
-	assert.Nil(t, a.recoverSpotify(t.Context(), h.world.player), "nothing is pending")
+	pending, restored := a.recoverSpotify(t.Context(), h.world.player, true)
+	assert.Nil(t, pending, "nothing is pending")
+	assert.Equal(t, []string{"shuffle", "repeat"}, restored, "what was put back is named")
 	st, err := session.ReadState(a.home)
 	require.NoError(t, err)
 	assert.Equal(t, "old", st.ID)
@@ -182,8 +184,15 @@ func TestRecordUsesTheCaptureDeviceChosenForThisRun(t *testing.T) {
 
 	require.Equal(t, ExitNotReady, h.run("record", plURL, "--capture", "device", "--device", "Loopback"))
 	require.Len(t, got, 1)
-	assert.Equal(t, captureRequest{Method: capture.MethodDevice, Device: "Loopback"}, got[0],
-		"the flags beat the config for this run")
+	assert.Equal(t, captureRequest{Method: capture.MethodDevice, Device: "Loopback", Bits: 24}, got[0],
+		"the flags beat the config for this run; ALAC records 24 bits")
+
+	for args, bits := range map[string]int{"--bit-depth=16": 16, "--codec=aac": 16, "--codec=aac --bit-depth=24": 24} {
+		got = nil
+		require.Equal(t, ExitNotReady, h.run(append([]string{"record", plURL}, strings.Fields(args)...)...))
+		require.Len(t, got, 1, args)
+		assert.Equal(t, bits, got[0].Bits, args)
+	}
 }
 
 func TestRecordWarnsAboutALowSpotifyVolume(t *testing.T) {
@@ -212,7 +221,7 @@ func TestRecordWaitsForNoOtherLibraryWriter(t *testing.T) {
 	t.Parallel()
 	h := newHarness(t)
 	h.copyOnlyRun()
-	lib, err := library.Open(h.env["MIXTAPE_LIBRARY"], library.Options{Encoder: &testutil.Encoder{}, WorkDir: t.TempDir()})
+	lib, err := library.Open(h.env["MIXTAPE_LIBRARY"], library.Options{Encoder: seedEncoder(), WorkDir: t.TempDir()})
 	require.NoError(t, err)
 	unlock, err := lib.Lock()
 	require.NoError(t, err)

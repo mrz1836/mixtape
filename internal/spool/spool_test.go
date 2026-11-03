@@ -34,11 +34,16 @@ func newSpool(t *testing.T, dir string, f capture.Format) *Spool {
 }
 
 // frames returns n frames whose samples encode their own frame index, so
-// any read can be checked for exactly which frames it returned.
+// any read can be checked for exactly which frames it returned. 24-bit
+// samples hold the index in all three bytes.
 func frames(f capture.Format, start, n int64) []byte {
 	out := make([]byte, 0, n*int64(f.BytesPerFrame()))
 	for i := start; i < start+n; i++ {
 		for range f.Channels {
+			if f.SampleBits() == capture.Bits24 {
+				out = append(out, byte(i), byte(i>>8), byte(i>>16))
+				continue
+			}
 			out = binary.LittleEndian.AppendUint16(out, uint16(i%65536))
 		}
 	}
@@ -50,6 +55,10 @@ func frameIndexes(f capture.Format, pcm []byte) []int64 {
 	bpf := f.BytesPerFrame()
 	out := make([]int64, 0, len(pcm)/bpf)
 	for off := 0; off+bpf <= len(pcm); off += bpf {
+		if f.SampleBits() == capture.Bits24 {
+			out = append(out, int64(pcm[off])|int64(pcm[off+1])<<8|int64(pcm[off+2])<<16)
+			continue
+		}
 		out = append(out, int64(binary.LittleEndian.Uint16(pcm[off:])))
 	}
 	return out
@@ -87,6 +96,48 @@ func TestOpenValidates(t *testing.T) {
 	require.ErrorIs(t, err, ErrFormat)
 	_, err = Open(t.TempDir(), capture.Format{Rate: 48000})
 	require.ErrorIs(t, err, ErrFormat)
+}
+
+// 24-bit frames are three bytes a sample: they split across chunks and
+// read back by frame like 16-bit ones, and the spool keeps the format as
+// it was given.
+func TestTwentyFourBitFrames(t *testing.T) {
+	t.Parallel()
+	f := capture.Format{Rate: smallRate, Channels: 2, Bits: 24}
+	s := newSpool(t, t.TempDir(), f)
+	assert.Equal(t, f, s.Format())
+	start := time.Now()
+	total := int64(0)
+	for _, n := range []int64{7, 2999, 1, 3000, 513} { // splits land mid-chunk and on its edge
+		require.NoError(t, s.Append(capture.Block{PCM: frames(f, total, n), Frames: int(n), At: start}))
+		total += n
+	}
+	require.Equal(t, total, s.Frames())
+	var b bytes.Buffer
+	got, err := s.ReadRange(2990, 6010, &b)
+	require.NoError(t, err)
+	assert.Equal(t, int64(3020), got)
+	assert.Equal(t, 3020*6, b.Len())
+	want := make([]int64, 0, 3020)
+	for i := int64(2990); i < 6010; i++ {
+		want = append(want, i)
+	}
+	assert.Equal(t, want, frameIndexes(f, b.Bytes()))
+
+	err = s.Append(capture.Block{PCM: frames(f, 0, 2)[:11], Frames: 2})
+	require.ErrorIs(t, err, ErrShortBlock, "two 24-bit stereo frames take 12 bytes")
+}
+
+func TestOpenKeepsTheFormatAsGiven(t *testing.T) {
+	t.Parallel()
+	for _, bits := range []int{0, 16, 24} {
+		f := capture.Format{Rate: 48000, Channels: 2, Bits: bits}
+		assert.Equal(t, f, newSpool(t, t.TempDir(), f).Format(), "bits %d", bits)
+	}
+	for _, bits := range []int{8, 20, 32} {
+		_, err := Open(t.TempDir(), capture.Format{Rate: 48000, Channels: 2, Bits: bits})
+		require.ErrorIs(t, err, ErrFormat, "bits %d", bits)
+	}
 }
 
 func TestOpenRemovesStaleChunks(t *testing.T) {

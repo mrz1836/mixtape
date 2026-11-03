@@ -87,6 +87,10 @@ type M4AOptions struct {
 	NoUdta bool
 	// Items are existing ilst atoms (see [TextItem], [FreeformItem]).
 	Items [][]byte
+	// Codec names the sample entry of the sound track: "aac" writes an
+	// `mp4a` entry, "alac" an `alac` one, any other four characters an
+	// entry of that type, and "" none at all (an empty sample table).
+	Codec string
 }
 
 // M4A returns a minimal, structurally valid M4A file: ftyp; moov with
@@ -151,7 +155,7 @@ func moovBox(o M4AOptions, offsets []int64) []byte {
 	if o.CO64 {
 		typ = "co64"
 	}
-	stbl := Box("stbl", FullBox("stsd", make([]byte, 4)), FullBox(typ, table))
+	stbl := Box("stbl", sampleDescription(o.Codec), FullBox(typ, table))
 	trak := Box("trak",
 		FullBox("tkhd", make([]byte, 80)),
 		Box("mdia",
@@ -166,6 +170,33 @@ func moovBox(o M4AOptions, offsets []int64) []byte {
 		parts = append(parts, Box("udta", FullBox("meta", hdlr, Box("ilst", o.Items...))))
 	}
 	return Box("moov", parts...)
+}
+
+// sampleDescription builds the stsd box for codec (see M4AOptions.Codec).
+func sampleDescription(codec string) []byte {
+	if codec == "" {
+		return FullBox("stsd", make([]byte, 4)) // no entries
+	}
+	return FullBox("stsd", binary.BigEndian.AppendUint32(nil, 1), SampleEntry(codec))
+}
+
+// SampleEntry builds an audio sample entry for codec ("aac", "alac" or a
+// four-character type): the AudioSampleEntry fields of a 16-bit stereo
+// 44.1 kHz stream, then the codec's configuration box, enough for a reader
+// that looks at the entry's type.
+func SampleEntry(codec string) []byte {
+	fields := make([]byte, 28)
+	binary.BigEndian.PutUint16(fields[6:8], 1)           // data reference index
+	binary.BigEndian.PutUint16(fields[16:18], 2)         // channels
+	binary.BigEndian.PutUint16(fields[18:20], 16)        // sample size
+	binary.BigEndian.PutUint32(fields[24:28], 44100<<16) // sample rate, 16.16 fixed point
+	switch codec {
+	case "aac":
+		return Box("mp4a", fields, FullBox("esds", make([]byte, 27)))
+	case "alac":
+		return Box("alac", fields, FullBox("alac", make([]byte, 24)))
+	}
+	return Box(codec, fields)
 }
 
 // box is one box found by the test reader.

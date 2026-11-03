@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 
 	"github.com/mrz1836/mixtape/internal/config"
 	"github.com/mrz1836/mixtape/internal/engine"
@@ -22,8 +23,9 @@ import (
 type recordFlags struct {
 	detach, dryRun, redo, keepPartial, keepWAV, mute, allowCrossfade bool
 	artwork                                                          bool
-	limit, maxFailures                                               int
+	limit, maxFailures, aacBitrate                                   int
 	match, into, capture, device                                     string
+	codec, bitDepth, copyCodec, outputRate                           string
 	idleTimeout                                                      time.Duration
 }
 
@@ -60,6 +62,13 @@ Spotify must be running, and crossfade and automix must be off (Settings →
 Playback): blended songs overlap and cannot be cut. Shuffle is turned off for the
 session and restored afterwards.
 
+Songs are saved as lossless ALAC, captured at 24 bits (--codec aac saves AAC,
+at --aac-bitrate). A song already in the folder is never redone because the
+codec changed (--redo does); one found elsewhere in another codec is recorded
+again unless --copy-codec any. --codec is the audio format of the files;
+-o/--output is how mixtape reports (text or json). With the process tap,
+--output-rate 44100 runs the speakers at Spotify's own 44.1 kHz for the session.
+
 On a terminal: [space] pause/resume, [n] skip the song, [q] quit (Ctrl-C
 twice forces it). With -o json (or when piped) the session streams NDJSON
 events on stdout: session_started, plan, track_started, track_saved,
@@ -82,7 +91,12 @@ Exit codes: 0 complete or stopped, 2 usage, 3 not ready, 4 link not found,
 			return a.runRecord(cmd, args, f)
 		},
 	}
-	fl := cmd.Flags()
+	f.bind(cmd.Flags())
+	return cmd
+}
+
+// bind registers the flags on fl.
+func (f *recordFlags) bind(fl *pflag.FlagSet) {
 	fl.BoolVar(&f.detach, "detach", false, "Run in the background; print the session ID and return")
 	fl.BoolVar(&f.dryRun, "dry-run", false, "Print the plan (record, copy, skip) and change nothing")
 	fl.BoolVar(&f.redo, "redo", false, "Record again songs that are already done")
@@ -99,7 +113,14 @@ Exit codes: 0 complete or stopped, 2 usage, 3 not ready, 4 link not found,
 	fl.IntVar(&f.maxFailures, "max-failures", config.DefaultMaxFailures,
 		"End after this many failed attempts in a row (a song is tried twice); 0 = never (config: max_failures)")
 	fl.BoolVar(&f.allowCrossfade, "allow-crossfade", false, "Record even though Spotify's crossfade or automix is on")
-	return cmd
+	fl.StringVar(&f.codec, "codec", "", "Audio format of new songs: alac (lossless) or aac (config: codec)")
+	fl.IntVar(&f.aacBitrate, "aac-bitrate", config.DefaultAACBitrate,
+		fmt.Sprintf("AAC bit rate in kb/s, %d to %d (config: aac_bitrate)", config.MinAACBitrate, config.MaxAACBitrate))
+	fl.StringVar(&f.bitDepth, "bit-depth", "", "Capture depth: auto (24 for alac, 16 for aac), 16 or 24 (config: bit_depth)")
+	fl.StringVar(&f.copyCodec, "copy-codec", "",
+		"Copy songs found elsewhere only in --codec (same) or in any codec (any) (config: copy_codec)")
+	fl.StringVar(&f.outputRate, "output-rate", "",
+		"Tap only: run the output device at this rate in Hz while recording, or keep (config: output_rate)")
 }
 
 // overrides turns the flags that were set into config overrides.
@@ -120,6 +141,21 @@ func (f *recordFlags) overrides(cmd *cobra.Command) config.Overrides {
 	}
 	if fl.Changed("max-failures") {
 		o.MaxFailures = &f.maxFailures
+	}
+	if fl.Changed("codec") {
+		o.Codec = &f.codec
+	}
+	if fl.Changed("aac-bitrate") {
+		o.AACBitrate = &f.aacBitrate
+	}
+	if fl.Changed("bit-depth") {
+		o.BitDepth = &f.bitDepth
+	}
+	if fl.Changed("copy-codec") {
+		o.CopyCodec = &f.copyCodec
+	}
+	if fl.Changed("output-rate") {
+		o.OutputRate = &f.outputRate
 	}
 	return o
 }
@@ -209,19 +245,29 @@ func (a *app) openLibrary(o config.Overrides) (*library.Library, config.Settings
 	if err != nil {
 		return nil, config.Settings{}, err
 	}
-	lib, err := library.Open(s.Library, a.libraryOptions())
+	lib, err := library.Open(s.Library, a.libraryOptions(s))
 	if err != nil {
 		return nil, config.Settings{}, err
 	}
 	return lib, s, nil
 }
 
-func (a *app) libraryOptions() library.Options {
+// libraryOptions configures the library for settings s: what it encodes
+// to, and which songs found elsewhere it copies.
+func (a *app) libraryOptions(s config.Settings) library.Options {
+	warn := func(msg string) { a.out.Warn("%s", msg) }
+	af := library.AFConvert{Codec: s.Codec, Bitrate: s.AACBitrate * 1000, Warn: warn}
+	var enc library.Encoder = af
+	if stand := a.deps.services.encoder; stand != nil {
+		enc = stand(af)
+	}
 	return library.Options{
-		Encoder:     a.deps.services.encoder,
+		Encoder:     enc,
+		Codec:       s.Codec,
+		CopyPolicy:  s.CopyCodec,
 		WorkDir:     filepath.Join(a.home, "work"),
 		Now:         a.deps.now,
-		Warn:        func(msg string) { a.out.Warn("%s", msg) },
+		Warn:        warn,
 		ReleaseDate: a.catalog().ReleaseDate,
 	}
 }
@@ -278,6 +324,9 @@ func (a *app) planText(doc planDoc, plan *engine.Plan) string {
 		}
 		if it.Hint != "" {
 			line += a.out.paint(colorYellow, "  ["+it.Hint+"]")
+		}
+		if it.Reason == engine.ReasonOtherCodec {
+			line += a.out.paint(colorDim, "  (in the library in another codec)")
 		}
 		b.WriteString(line)
 	}

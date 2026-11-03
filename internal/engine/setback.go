@@ -59,9 +59,9 @@ func (e *Engine) tooLong(d time.Duration) string {
 		return ""
 	}
 	f := e.cfg.Source.Format()
-	if limit := wav.MaxDuration(f.Rate, f.Channels); limit > 0 && d > limit {
-		return fmt.Sprintf("too long to record: %s, and a recording can hold at most %s at %d Hz",
-			d.Round(time.Minute), limit.Round(time.Minute), f.Rate)
+	if limit := wav.MaxDuration(f.Rate, f.Channels, f.SampleBits()); limit > 0 && d > limit {
+		return fmt.Sprintf("too long to record: %s, and a recording can hold at most %s at %d Hz, %d-bit",
+			d.Round(time.Minute), limit.Round(time.Minute), f.Rate, f.SampleBits())
 	}
 	return ""
 }

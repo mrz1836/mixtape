@@ -49,8 +49,9 @@ func newDoctorCmd(a *app) *cobra.Command {
 		Long: `Check every prerequisite for recording and say how to fix what is missing:
 macOS version, the Spotify app (installed, running, Automation permission),
 crossfade and automix (must be off), volume, the capture method (process
-tap, or BlackHole with the output routed through it), afconvert, the library
-folder, the config file, and any running or interrupted session.
+tap, or BlackHole with the output routed through it), afconvert and the
+encoder for the configured codec, the library folder, the config file, and
+any running or interrupted session.
 
 Exits 0 when ready and 3 when a check fails. Warnings do not block.`,
 		Example: `  mixtape doctor
@@ -81,6 +82,7 @@ func (a *app) diagnose(ctx context.Context) doctorDoc {
 
 	method, capChecks := a.checkCapture(settings)
 	checks = append(checks, capChecks...)
+	checks = append(checks, a.outputCheck(settings, method))
 
 	if a.afconvertFound() {
 		checks = append(checks, check{ID: checkIDAfconvert, Name: "afconvert", Status: checkOK, Detail: "found"})
@@ -89,6 +91,7 @@ func (a *app) diagnose(ctx context.Context) doctorDoc {
 			ID: checkIDAfconvert, Name: "afconvert", Status: checkFail, Detail: "not found", Fix: fixAfconvert,
 		})
 	}
+	checks = append(checks, a.encoderCheck(ctx, settings))
 	checks = append(checks, checkLibrary(settings.Library), a.checkSession())
 	return doctorDoc{Ready: failed(checks) == 0, Capture: string(method), Checks: checks}
 }
@@ -381,11 +384,56 @@ func (a *app) checkSession() check {
 	case running:
 		c.Status, c.Detail = checkWarn, fmt.Sprintf("session %s is recording (pid %d)", st.ID, st.PID)
 		c.Fix = "'mixtape stop' ends it; a new session cannot start meanwhile"
+		return c // what it changed, it puts back itself
 	case err == nil && !st.Finished():
 		c.Status, c.Detail = checkWarn, "session "+st.ID+" was interrupted"
-		if st.Spotify.NeedsRestore() {
-			c.Detail += "; Spotify settings it changed are restored by the next 'mixtape record'"
+	}
+	// What a session left changed is pending whatever way it ended (a
+	// restore can fail at the end of a finished one, too).
+	var pending []string
+	if err == nil && st.Spotify.NeedsRestore() {
+		pending = append(pending, "Spotify settings")
+	}
+	if r, _ := a.pendingOutput(); r.Pending() {
+		pending = append(pending, fmt.Sprintf("%s at %d Hz (was %d Hz)", outputName(r), r.Set, r.Original))
+	}
+	if len(pending) > 0 {
+		c.Status = checkWarn
+		c.Detail += "; left changed by a session: " + strings.Join(pending, ", ")
+		c.Fix = "'mixtape stop' puts them back now (the next 'mixtape record' does too)"
+	}
+	return c
+}
+
+// outputCheck reports the default output device and its rate, and whether
+// output_rate can apply: only the process tap switches it, and only to a
+// rate the device offers.
+func (a *app) outputCheck(s config.Settings, method capture.Method) check {
+	c := check{ID: checkIDOutput, Name: "Output device", Status: checkOK}
+	dev, err := a.deps.services.output().DefaultOutput()
+	if err != nil {
+		c.Status, c.Detail = checkWarn, "could not read the default output: "+err.Error()
+		return c
+	}
+	c.Detail = dev.Name + " at " + kHz(dev.Rate)
+	want := s.OutputRate
+	switch {
+	case want <= 0:
+		if dev.Rate != 44100 && dev.Supports(44100) && method == capture.MethodTap {
+			c.Detail += " (Spotify's 44.1 kHz streams are resampled to it; output_rate 44100 avoids that)"
 		}
+	case method != capture.MethodTap:
+		c.Status = checkWarn
+		c.Detail += fmt.Sprintf("; output_rate %d applies to the process tap only, so it is left alone", want)
+		c.Fix = "mixtape config set output_rate keep (or capture tap)"
+	case dev.Rate == want:
+		c.Detail += "; already at output_rate"
+	case !dev.Supports(want):
+		c.Status = checkWarn
+		c.Detail += fmt.Sprintf("; it does not offer output_rate %d (it offers %s), so it is left alone", want, dev.RateList())
+		c.Fix = "mixtape config set output_rate keep, or a rate it offers"
+	default:
+		c.Detail += "; switched to " + kHz(want) + " while recording (output_rate)"
 	}
 	return c
 }

@@ -63,7 +63,8 @@ func clipRanges(ranges []Range, oldest, newest int64) []Range {
 	return out
 }
 
-// writeWAV writes the frames of ranges, read from src, as one WAV at path.
+// writeWAV writes the frames of ranges, read from src, as one WAV at path,
+// in format f: the spool's, so the header always matches the samples.
 func writeWAV(path string, src rangeReader, f capture.Format, ranges []Range) error {
 	var total int64
 	for _, r := range ranges {
@@ -74,7 +75,7 @@ func writeWAV(path string, src rangeReader, f capture.Format, ranges []Range) er
 		return err
 	}
 	w := bufio.NewWriterSize(file, renderBuffer)
-	err = wav.WriteHeader(w, total*int64(f.BytesPerFrame()), f.Rate, f.Channels)
+	err = wav.WriteHeader(w, total*int64(f.BytesPerFrame()), f.Rate, f.Channels, f.SampleBits())
 	for _, r := range ranges {
 		if err != nil {
 			break

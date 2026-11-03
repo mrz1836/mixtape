@@ -16,7 +16,6 @@ import (
 	"github.com/mrz1836/mixtape/internal/library"
 	"github.com/mrz1836/mixtape/internal/session"
 	"github.com/mrz1836/mixtape/internal/spotify"
-	"github.com/mrz1836/mixtape/internal/testutil"
 )
 
 func TestRecordClosesTheCaptureWhenTheSessionFailsBeforeCapturing(t *testing.T) {
@@ -43,7 +42,7 @@ func TestRecorderThatCannotStartTheEngineRecordsTheFailure(t *testing.T) {
 	t.Parallel()
 	h := newHarness(t)
 	a := &app{deps: h.deps, out: plainOutput(t, false), home: t.TempDir()}
-	lib, err := library.Open(t.TempDir(), library.Options{Encoder: &testutil.Encoder{}, WorkDir: t.TempDir()})
+	lib, err := library.Open(t.TempDir(), library.Options{Encoder: seedEncoder(), WorkDir: t.TempDir()})
 	require.NoError(t, err)
 	run := &recordRun{flags: &recordFlags{}, lib: lib, plan: engine.BuildPlan(lib, nil, engine.PlanOptions{})}
 	rec, err := a.newRecorder("s1", run, nil)

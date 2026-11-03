@@ -217,7 +217,8 @@ func TestDoctorChecks(t *testing.T) {
 				})
 			},
 			id: "session", status: checkWarn,
-			detail: "session old was interrupted; Spotify settings it changed are restored by the next 'mixtape record'",
+			detail: "session old was interrupted; left changed by a session: Spotify settings",
+			fix:    "'mixtape stop' puts them back now",
 			exit:   ExitOK,
 		},
 	}

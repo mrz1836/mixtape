@@ -131,6 +131,78 @@ func TestFilesAndEncoder(t *testing.T) {
 	enc.Fail(nil)
 	require.Error(t, enc.Encode(t.Context(), filepath.Join(t.TempDir(), "missing.wav"), out))
 	assert.Equal(t, 4, enc.Runs())
+
+	calls := enc.Calls()
+	require.Len(t, calls, 4)
+	assert.Equal(t, EncodeCall{WAV: path, Codec: "aac", Rate: 44100, Channels: 2, Bits: 16}, calls[0])
+	assert.Equal(t, EncodeCall{WAV: calls[3].WAV, Codec: "aac"}, calls[3], "a missing WAV has no header to report")
+}
+
+func TestEncoderCodec(t *testing.T) {
+	t.Parallel()
+	path := SineWAV(t, 440)
+	dir := t.TempDir()
+	encode := func(codec string) []byte {
+		t.Helper()
+		out := filepath.Join(dir, codec+".m4a")
+		require.NoError(t, (&Encoder{Codec: codec}).Encode(t.Context(), path, out))
+		b, err := os.ReadFile(out)
+		require.NoError(t, err)
+		return b
+	}
+	aac, alac := encode(""), encode("alac")
+	entry := func(file []byte) string {
+		t.Helper()
+		stsd, err := find(file, "moov", "trak", "mdia", "minf", "stbl", "stsd")
+		require.NoError(t, err)
+		require.Len(t, stsd, 1)
+		entries, err := boxes(stsd[0].payload[8:], stsd[0].off+8)
+		require.NoError(t, err)
+		require.Len(t, entries, 1)
+		return entries[0].typ
+	}
+	assert.Equal(t, "mp4a", entry(aac), "the zero value encodes AAC")
+	assert.Equal(t, "alac", entry(alac))
+	a, _, err := MdatPayload(aac)
+	require.NoError(t, err)
+	b, _, err := MdatPayload(alac)
+	require.NoError(t, err)
+	assert.NotEqual(t, a, b, "one recording in two codecs is two different audio payloads")
+}
+
+func TestSampleEntries(t *testing.T) {
+	t.Parallel()
+	for codec, typ := range map[string]string{"aac": "mp4a", "alac": "alac", "ac-3": "ac-3"} {
+		got, err := boxes(SampleEntry(codec), 0)
+		require.NoError(t, err)
+		require.Len(t, got, 1)
+		assert.Equal(t, typ, got[0].typ)
+	}
+	stsd, err := find(M4A(M4AOptions{}), "moov", "trak", "mdia", "minf", "stbl", "stsd")
+	require.NoError(t, err)
+	require.Len(t, stsd, 1)
+	assert.Equal(t, make([]byte, 8), stsd[0].payload, "no codec: an empty sample description")
+}
+
+func TestM4AFFormats(t *testing.T) {
+	t.Parallel()
+	help := "Audio file and data formats:\n" +
+		"    'adts' = AAC ADTS (.aac, .adts)\n" +
+		"               data_formats: 'aac ' 'aach' 'aacp' \n" +
+		"    'm4af' = Apple MPEG-4 Audio (.m4a, .m4r)\n" +
+		"               data_formats: '.mp1' 'aac ' 'aace' \n" +
+		"                             'aacg' 'alac' \n" +
+		"    'm4bf' = Apple MPEG-4 AudioBooks (.m4b)\n" +
+		"               data_formats: 'flac' \n"
+	got := m4afFormats(help)
+	assert.Contains(t, got, "'alac'")
+	assert.Contains(t, got, "'aac '")
+	assert.NotContains(t, got, "'flac'", "another file type's list")
+	sandboxed := m4afFormats("    'm4af' = Apple MPEG-4 Audio (.m4a, .m4r)\n               data_formats: \n" +
+		"    'caff' = CAF (.caf, .caff)\n               data_formats: 'alaw' LEI16 \n")
+	assert.NotContains(t, sandboxed, "'", "a sandbox lists no data format for M4A")
+	assert.Equal(t, "aac ", fourCC("aac"))
+	assert.Equal(t, "alac", fourCC("alac"))
 }
 
 func TestPtrAndMagic(t *testing.T) {
@@ -158,11 +230,16 @@ func TestRequireLiveSkipsUnlessAskedFor(t *testing.T) {
 
 func TestRealM4AIsTaggable(t *testing.T) {
 	t.Parallel()
-	file := RealM4A(t) // skips where AAC cannot be encoded
-	payload, _, err := MdatPayload(file)
-	require.NoError(t, err)
-	assert.NotEmpty(t, payload)
-	offsets, err := ChunkOffsets(file)
-	require.NoError(t, err)
-	assert.NotEmpty(t, offsets)
+	for _, codec := range []string{"aac", "alac"} {
+		t.Run(codec, func(t *testing.T) {
+			t.Parallel()
+			file := RealM4A(t, codec) // skips where the codec cannot be encoded
+			payload, _, err := MdatPayload(file)
+			require.NoError(t, err)
+			assert.NotEmpty(t, payload)
+			offsets, err := ChunkOffsets(file)
+			require.NoError(t, err)
+			assert.NotEmpty(t, offsets)
+		})
+	}
 }

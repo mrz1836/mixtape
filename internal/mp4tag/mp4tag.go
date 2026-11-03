@@ -144,37 +144,51 @@ func Parse(data []byte) (Tags, error) {
 // ReadFile reads the tags of the M4A file at path. Only the moov box is
 // loaded, so the audio is never read.
 func ReadFile(path string) (Tags, error) {
-	f, err := os.Open(filepath.Clean(path))
+	moov, err := loadMoov(path)
 	if err != nil {
 		return Tags{}, err
 	}
+	return parseMoov(moov)
+}
+
+// loadMoov reads the first top-level moov box of the file at path.
+func loadMoov(path string) (box, error) {
+	f, err := os.Open(filepath.Clean(path))
+	if err != nil {
+		return box{}, err
+	}
 	defer func() { _ = f.Close() }()
 
-	var tags Tags
+	var moov box
 	found := false
 	err = scanFile(f, func(h header, off int64) (bool, error) {
 		if h.typ != [4]byte{'m', 'o', 'o', 'v'} {
 			return true, nil
 		}
-		if h.size > maxMoovSize {
-			return false, fmt.Errorf("%w: moov of %d bytes", errTooLarge, h.size)
-		}
-		buf := make([]byte, h.size)
-		if _, readErr := f.ReadAt(buf, off); readErr != nil {
-			return false, readErr
-		}
-		var parseErr error
-		tags, parseErr = parseMoov(box{typ: h.typ, data: buf, hdr: h.hdr})
-		found = true
-		return false, parseErr
+		buf, readErr := readMoov(f, h, off)
+		moov, found = box{typ: h.typ, data: buf, hdr: h.hdr}, readErr == nil
+		return false, readErr
 	})
 	if err != nil {
-		return Tags{}, err
+		return box{}, err
 	}
 	if !found {
-		return Tags{}, errNoMoov
+		return box{}, errNoMoov
 	}
-	return tags, nil
+	return moov, nil
+}
+
+// readMoov loads the moov box with header h at off, refusing one larger
+// than maxMoovSize.
+func readMoov(f *os.File, h header, off int64) ([]byte, error) {
+	if h.size > maxMoovSize {
+		return nil, fmt.Errorf("%w: moov of %d bytes", errTooLarge, h.size)
+	}
+	buf := make([]byte, h.size)
+	if _, err := f.ReadAt(buf, off); err != nil {
+		return nil, err
+	}
+	return buf, nil
 }
 
 // AudioSHA256 returns the lowercase hex SHA-256 of the top-level mdat

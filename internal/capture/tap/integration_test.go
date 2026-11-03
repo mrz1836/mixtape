@@ -13,7 +13,7 @@ package tap
 
 import (
 	"context"
-	"encoding/binary"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -38,19 +38,30 @@ func TestIntegrationSpotifyProcesses(t *testing.T) {
 func TestIntegrationTapRecords(t *testing.T) {
 	t.Parallel()
 	testutil.RequireLive(t)
-	src, err := Open(t.Context(), Options{Wait: 5 * time.Second})
+	for _, bits := range []int{16, 24} {
+		t.Run(strconv.Itoa(bits)+"-bit", func(t *testing.T) { tapRecords(t, bits) })
+	}
+}
+
+// tapRecords taps Spotify for three seconds at bits bits a sample. At 24
+// bits it also counts samples whose low byte is busy: the detail a 16-bit
+// capture drops.
+func tapRecords(t *testing.T, bits int) {
+	src, err := Open(t.Context(), Options{Wait: 5 * time.Second, Bits: bits})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = src.Close() })
 	f := src.Format()
 	t.Logf("format %+v", f)
 	require.Positive(t, f.Rate)
+	require.Equal(t, bits, f.SampleBits())
 
 	var (
-		mu     sync.Mutex
-		frames int
-		peak   int
-		first  time.Time
-		blocks int
+		mu       sync.Mutex
+		frames   int
+		peak     int
+		lowBytes int
+		first    time.Time
+		blocks   int
 	)
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
@@ -62,9 +73,14 @@ func TestIntegrationTapRecords(t *testing.T) {
 		}
 		blocks++
 		frames += b.Frames
-		for i := 0; i+1 < len(b.PCM); i += 2 {
-			v := int(int16(binary.LittleEndian.Uint16(b.PCM[i:])))
-			peak = max(peak, v, -v)
+		require.Len(t, b.PCM, b.Frames*f.BytesPerFrame())
+		peak = max(peak, capture.Peak(b.PCM, f))
+		if bits == 24 {
+			for i := 0; i+2 < len(b.PCM); i += 3 {
+				if b.PCM[i] != 0 {
+					lowBytes++
+				}
+			}
 		}
 	}))
 	go func() {
@@ -75,8 +91,8 @@ func TestIntegrationTapRecords(t *testing.T) {
 	<-ctx.Done()
 	mu.Lock()
 	defer mu.Unlock()
-	t.Logf("%d blocks, %d frames (%.2fs), peak %d, first block %v ago", blocks, frames,
-		float64(frames)/float64(f.Rate), peak, time.Since(first))
+	t.Logf("%d blocks, %d frames (%.2fs), peak %d (16-bit scale), %d samples with a busy low byte, first block %v ago",
+		blocks, frames, float64(frames)/float64(f.Rate), peak, lowBytes, time.Since(first))
 	assert.Positive(t, frames, "the tap delivers audio callbacks")
 	if peak == 0 {
 		t.Log("all zeros: Spotify paused, or the host app lacks the System Audio Recording permission")

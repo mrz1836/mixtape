@@ -39,16 +39,27 @@ type captureRequest struct {
 	Method capture.Method // tap or device (already selected)
 	Device string         // device name substring
 	Mute   bool           // tap only
+	Bits   int            // bits a sample: 16 or 24 (config.Settings.Bits)
+
+	// The output rate to run the default output at while the tap records
+	// (0 leaves it alone), and what the switch needs (see tap.Options).
+	OutputRate  int
+	Pending     *capture.OutputRestore
+	SaveRestore func(capture.OutputRestore) error
+	Warn        func(msg string)
+	SessionID   string
 }
 
 // services are the heavyweight collaborators commands reach through the
 // app, so tests can substitute fakes. Production values come from
 // newProcessServices.
 type services struct {
-	player         func() player
-	catalog        func() catalog
-	openCapture    func(context.Context, captureRequest) (capture.Source, error)
-	tapStatus      func() capture.TapStatus
+	player      func() player
+	catalog     func() catalog
+	openCapture func(context.Context, captureRequest) (capture.Source, error)
+	tapStatus   func() capture.TapStatus
+	// output reads and sets output device rates (doctor, crash recovery).
+	output         func() capture.OutputControl
 	devices        func() ([]device.Info, error)
 	defaultOutput  func() (device.Info, error)
 	spotifyRunning func() (bool, error)
@@ -57,7 +68,11 @@ type services struct {
 	lockPath       func() (string, error)
 	executable     func() (string, error)
 	lookPath       func(name string) (string, error)
-	encoder        library.Encoder // nil: afconvert
+	// encoder stands in for afconvert: given the encoder the settings call
+	// for, it returns the one to use. nil encodes with afconvert itself.
+	encoder func(library.AFConvert) library.Encoder
+	// afconvertHelp is afconvert's -hf listing of the formats it writes.
+	afconvertHelp func(ctx context.Context) string
 	// signals delivers SIGINT and SIGTERM until its stop func is called,
 	// and makes the process ignore SIGHUP and SIGPIPE.
 	signals   func() (<-chan os.Signal, func())
@@ -81,6 +96,7 @@ func newProcessServices() services {
 		catalog:        func() catalog { return spotify.NewCatalog() },
 		openCapture:    openCapture,
 		tapStatus:      tap.Available,
+		output:         tap.OutputControl,
 		devices:        device.List,
 		defaultOutput:  device.DefaultOutput,
 		spotifyRunning: spotify.IsRunning,
@@ -89,6 +105,7 @@ func newProcessServices() services {
 		lockPath:       session.DefaultLockPath,
 		executable:     os.Executable,
 		lookPath:       exec.LookPath,
+		afconvertHelp:  afconvertHelp,
 		signals: func() (<-chan os.Signal, func()) {
 			// A closed terminal or pipe must not kill a session mid-song.
 			signal.Ignore(syscall.SIGHUP, syscall.SIGPIPE)
@@ -124,12 +141,24 @@ func newProcessServices() services {
 func openCapture(ctx context.Context, r captureRequest) (capture.Source, error) {
 	switch r.Method {
 	case capture.MethodTap:
-		return tap.Open(ctx, tap.Options{Mute: r.Mute, Wait: 10 * time.Second})
+		return tap.Open(ctx, tap.Options{
+			Mute: r.Mute, Wait: 10 * time.Second, Bits: r.Bits,
+			OutputRate: r.OutputRate, Pending: r.Pending, SaveRestore: r.SaveRestore, Warn: r.Warn, SessionID: r.SessionID,
+		})
 	case capture.MethodDevice:
-		return device.Open(r.Device)
+		return device.Open(r.Device, r.Bits)
 	case capture.MethodAuto:
 	}
 	return nil, fmt.Errorf("%w: %q", capture.ErrUnknownMethod, r.Method)
+}
+
+// afconvertHelp runs afconvert -hf. It exits non-zero even when it lists
+// everything, so only its output counts.
+func afconvertHelp(ctx context.Context) string {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	out, _ := exec.CommandContext(ctx, "afconvert", "-hf").CombinedOutput()
+	return string(out)
 }
 
 // caffeinate holds macOS's idle-sleep assertion for this process with the

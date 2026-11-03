@@ -5,7 +5,10 @@
 //
 // It records at the device's native sample rate, so nothing is resampled,
 // and its real-time callback only copies into a lock-free ring; a drain
-// goroutine hands the audio on.
+// goroutine hands the audio on. miniaudio delivers Float32, the format of
+// the device itself, and the drain converts it to 16- or 24-bit PCM with
+// capture.ConvertF32: exactly, where miniaudio's own conversion to integers
+// scales by 2^(n−1)−1 and truncates, which moves 24-bit samples.
 package device
 
 // #include <stdlib.h>
@@ -13,6 +16,7 @@ import "C"
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"math"
@@ -32,6 +36,8 @@ const (
 	ringSeconds = 4
 	// ringStamps is the number of callback timestamps buffered.
 	ringStamps = 4096
+	// ringSampleBytes is the size of one sample in the ring: Float32.
+	ringSampleBytes = 4
 )
 
 var (
@@ -119,6 +125,8 @@ func DefaultOutput() (Info, error) {
 type Source struct {
 	name   string
 	format capture.Format
+	// ringFrame is the size of one frame in the ring: Float32 samples.
+	ringFrame int
 
 	mctx *malgo.AllocatedContext
 	dev  *malgo.Device
@@ -132,14 +140,15 @@ type Source struct {
 var _ capture.Source = (*Source)(nil)
 
 // Open prepares capture from the first input device whose name contains
-// match (case-insensitive). It records 16-bit stereo at the device's
-// native rate. Capture begins with Start.
-func Open(match string) (*Source, error) {
+// match (case-insensitive). It records stereo at the device's native rate,
+// bits bits a sample (16 or 24; 0 means 16, and Format reports it as
+// given). Capture begins with Start.
+func Open(match string, bits int) (*Source, error) {
 	mctx, err := malgo.InitContext([]malgo.Backend{malgo.BackendCoreaudio}, malgo.ContextConfig{}, nil)
 	if err != nil {
 		return nil, fmt.Errorf("init audio context: %w", err)
 	}
-	s, err := open(mctx, match)
+	s, err := open(mctx, match, bits)
 	if err != nil {
 		_ = mctx.Uninit()
 		mctx.Free()
@@ -148,7 +157,7 @@ func Open(match string) (*Source, error) {
 	return s, nil
 }
 
-func open(mctx *malgo.AllocatedContext, match string) (*Source, error) {
+func open(mctx *malgo.AllocatedContext, match string, bits int) (*Source, error) {
 	infos, err := mctx.Devices(malgo.Capture)
 	if err != nil {
 		return nil, fmt.Errorf("enumerate capture devices: %w", err)
@@ -175,8 +184,8 @@ func open(mctx *malgo.AllocatedContext, match string) (*Source, error) {
 	s := &Source{name: found.Name(), mctx: mctx, events: capture.NewEmitter()}
 
 	cfg := malgo.DefaultDeviceConfig(malgo.Capture)
-	cfg.SampleRate = 0 // the device's native rate: no resampling
-	cfg.Capture.Format = malgo.FormatS16
+	cfg.SampleRate = 0                   // the device's native rate: no resampling
+	cfg.Capture.Format = malgo.FormatF32 // converted exactly in the drain
 	cfg.Capture.Channels = channels
 	// The device ID must live in C memory (cgo pointer rules); miniaudio
 	// copies what it needs during init.
@@ -189,13 +198,15 @@ func open(mctx *malgo.AllocatedContext, match string) (*Source, error) {
 	}
 
 	rate, ch := dev.SampleRate(), dev.CaptureChannels()
-	if rate == 0 || rate > math.MaxInt32 || ch == 0 || ch > math.MaxInt16 {
+	if rate == 0 || rate > math.MaxInt32 || ch == 0 || ch > math.MaxInt16 || dev.CaptureFormat() != malgo.FormatF32 {
 		dev.Uninit()
-		return nil, fmt.Errorf("open capture device %q: %w: %d Hz, %d channels", s.name, errFormat, rate, ch)
+		return nil, fmt.Errorf("open capture device %q: %w: %d Hz, %d channels, format %d",
+			s.name, errFormat, rate, ch, dev.CaptureFormat())
 	}
 	s.dev = dev
-	s.format = capture.Format{Rate: int(rate), Channels: int(ch)}
-	s.ring = newRing(s.format.Rate*s.format.BytesPerFrame()*ringSeconds, ringStamps)
+	s.format = capture.Format{Rate: int(rate), Channels: int(ch), Bits: bits}
+	s.ringFrame = int(ch) * ringSampleBytes
+	s.ring = newRing(s.format.Rate*s.ringFrame*ringSeconds, ringStamps)
 	return s, nil
 }
 
@@ -235,10 +246,12 @@ func (s *Source) onStop() {
 	}
 }
 
-// drain empties the ring every drainInterval and hands blocks to sink.
+// drain empties the ring every drainInterval and hands blocks to sink,
+// converted from Float32 to the format's depth.
 func (s *Source) drain(ctx context.Context, sink func(capture.Block)) {
-	bpf := s.format.BytesPerFrame()
 	buf := make([]byte, len(s.ring.buf))
+	samples := make([]float32, len(buf)/ringSampleBytes)
+	pcm := make([]byte, 0, len(samples)*s.format.BytesPerSample())
 	tick := time.NewTicker(capture.DrainInterval)
 	defer tick.Stop()
 	for {
@@ -247,7 +260,9 @@ func (s *Source) drain(ctx context.Context, sink func(capture.Block)) {
 			if n == 0 {
 				break
 			}
-			sink(capture.Block{PCM: buf[:n], Frames: n / bpf, At: o.capturedAt(s.format)})
+			got := floats(samples, buf[:n])
+			pcm = capture.ConvertF32(pcm[:0], got, s.format.SampleBits())
+			sink(capture.Block{PCM: pcm, Frames: n / s.ringFrame, At: o.capturedAt(s.format, s.ringFrame)})
 		}
 		if dropped := s.ring.takeOverflows(); dropped > 0 {
 			s.events.Emit(capture.EventOverflow, fmt.Sprintf("%d audio callbacks dropped: the reader fell behind", dropped))
@@ -258,6 +273,16 @@ func (s *Source) drain(ctx context.Context, sink func(capture.Block)) {
 		case <-tick.C:
 		}
 	}
+}
+
+// floats decodes the little-endian Float32 samples of b into dst, which
+// must have room for them, and returns them.
+func floats(dst []float32, b []byte) []float32 {
+	n := len(b) / ringSampleBytes
+	for i := range n {
+		dst[i] = math.Float32frombits(binary.LittleEndian.Uint32(b[i*ringSampleBytes:]))
+	}
+	return dst[:n]
 }
 
 // Close stops capture and frees the device and the audio context. It is

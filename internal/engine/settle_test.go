@@ -173,7 +173,7 @@ func TestStreakErrorNamesWhatTheSetbacksShare(t *testing.T) {
 
 func TestTooLongIsJudgedAtTheCaptureFormat(t *testing.T) {
 	t.Parallel()
-	limit := wav.MaxDuration(testRate, 2)
+	limit := wav.MaxDuration(testRate, 2, 16)
 	require.Positive(t, limit)
 	e, err := New(Config{Player: &fakeSpotify{}, Library: &library.Library{}, Source: newFakeSource()})
 	require.NoError(t, err)
@@ -181,7 +181,16 @@ func TestTooLongIsJudgedAtTheCaptureFormat(t *testing.T) {
 	assert.Empty(t, e.tooLong(0), "an unknown duration is no reason to refuse")
 	reason := e.tooLong(limit + time.Hour)
 	assert.Contains(t, reason, "too long to record")
-	assert.Contains(t, reason, "at 8000 Hz")
+	assert.Contains(t, reason, "at 8000 Hz, 16-bit")
+
+	src := newFakeSource()
+	src.bits = 24
+	deep, err := New(Config{Player: &fakeSpotify{}, Library: &library.Library{}, Source: src})
+	require.NoError(t, err)
+	limit24 := wav.MaxDuration(testRate, 2, 24)
+	assert.Less(t, limit24, limit, "24-bit samples fill the WAV a third faster")
+	assert.Empty(t, deep.tooLong(limit24))
+	assert.Contains(t, deep.tooLong(limit24+time.Minute), "at 8000 Hz, 24-bit")
 
 	noSource, err := New(Config{Player: &fakeSpotify{}, Library: &library.Library{}})
 	require.NoError(t, err)

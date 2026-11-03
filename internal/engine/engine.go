@@ -153,7 +153,7 @@ const (
 	defaultStartTimeout = 15 * time.Second
 	maxTakes            = 2 // a song is tried at most this often
 	silenceWindow       = 10 * time.Second
-	silenceFloor        = 64 // |sample| at or below this counts as silence
+	silenceFloor        = 64 // |sample| at or below this, in 16-bit units at any depth (capture.Peak), counts as silence
 	spotifyGoneAfter    = time.Minute
 	audioWait           = 3 * time.Second // how long a finished song waits for its trailing audio
 	tickEvery           = 500 * time.Millisecond

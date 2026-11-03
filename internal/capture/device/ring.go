@@ -76,13 +76,13 @@ type origin struct {
 }
 
 // capturedAt is when the first byte read was captured: its stamp's time
-// plus the frames between the stamp and that byte; zero when no stamp
-// covers it.
-func (o origin) capturedAt(f capture.Format) time.Time {
-	if !o.ok {
+// plus the frames between the stamp and that byte, frames of frameBytes
+// bytes in the ring at f's rate; zero when no stamp covers it.
+func (o origin) capturedAt(f capture.Format, frameBytes int) time.Time {
+	if !o.ok || frameBytes <= 0 {
 		return time.Time{}
 	}
-	return o.at.Add(f.Duration(o.offset / int64(f.BytesPerFrame())))
+	return o.at.Add(f.Duration(o.offset / int64(frameBytes)))
 }
 
 // readInto moves up to len(dst) buffered bytes into dst and returns the

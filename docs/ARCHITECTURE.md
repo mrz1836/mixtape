@@ -40,10 +40,11 @@ internal/engine        plan, steer, observe, segment, commit
 internal/library       folders, manifests, naming, encode/tag/hash, verify
 internal/mp4tag        pure-Go MP4 tags: read and write ilst, ---- freeform and
                        covr atoms, fix chunk offsets, hash the audio
-internal/session       recorder lock, session.json, event log, detach
+internal/session       recorder lock, session.json, event log, detach, the
+                       output rate to put back
 internal/permission    macOS privacy permissions of the host app (C)
 internal/fileutil      atomic writes and copies
-internal/wav           the 44-byte PCM WAV header
+internal/wav           the 44-byte PCM WAV header (16 or 24 bits)
 internal/testutil      test-only: synthetic M4A and WAV files, a stand-in encoder
 ```
 
@@ -55,9 +56,20 @@ tested with fakes and with replays of real Spotify traces.
 
 ## Capture
 
-Both backends implement `capture.Source` and deliver interleaved 16-bit PCM
-at the device's native rate (no resampling), each block stamped with the
-monotonic time of its first frame.
+Both backends implement `capture.Source` and deliver interleaved PCM, 16 or
+24 bits a sample (`bit_depth`; `auto` is 24 for ALAC, 16 for AAC), at the
+device's native rate (no resampling), each block stamped with the monotonic
+time of its first frame. 24-bit samples are packed in three bytes, and
+`capture.Format.SampleBits` sizes everything (a `Bits` of 0 reads as 16).
+
+Both receive Core Audio's Float32 samples and convert them in Go with one
+function, `capture.ConvertF32`: scale by exactly 2^(n−1), round half to even,
+clamp. A sample a decoder made from an n-bit integer, n/2^(n−1), comes back as
+that integer. Converters that scale by 2^(n−1)−1 move such a sample by up to
+one step; miniaudio's f32→s24 also truncates, which is why the device backend
+asks it for Float32. Loudness (`capture.Peak`) is measured in 16-bit units at
+any depth, so the silence floor (64), setup's test threshold and the trace's
+onset levels hold for every capture.
 
 | | Process tap | BlackHole device |
 |---|---|---|
@@ -70,10 +82,24 @@ monotonic time of its first frame.
 
 The tap builds a private aggregate device around a `CATapDescription` of
 every `com.spotify.client*` audio process. Its IO block runs on Core Audio's
-real-time thread and touches no Go code: it converts Float32 to int16 into a
-lock-free C ring and publishes the host time of its latest write under a
-seqlock. A Go goroutine drains the ring every 10 ms. Listeners rebuild the
-tap when Spotify's processes, the default output, or the rate change.
+real-time thread and touches no Go code: it copies the Float32 samples (mono
+duplicated, extra channels dropped) into a lock-free C ring and publishes the
+host time of its latest write under a seqlock. A Go goroutine drains the ring
+every 10 ms and converts. Listeners rebuild the tap when Spotify's processes,
+the default output, or the rate change.
+
+**The output rate.** Spotify plays at 44.1 kHz and resamples to whatever the
+output device runs at (48 kHz on most Macs) before the tap hears it.
+`output_rate` switches the default output to a rate it offers for the
+session (`capture.OutputSwitch`, run by the tap's `Open` and `Close`): the
+record of what to undo is saved first (per user, next to the recorder lock),
+the rate is set, the device must announce it, read it back, and hold it
+through a 500 ms settle, and the tap is rebuilt once if it comes up at the
+old rate. `Close` puts the original back by UID, but only where the device
+still runs at the rate set: a change made since wins. A crash leaves the
+record; the next `record` undoes it (or takes it over, when it wants the same
+rate on the same device), and so does `stop` with no session running. The
+BlackHole route has no such switch: its Multi-Output Device sets the rate.
 
 `auto` uses whatever `setup` verified, else the tap when the Mac supports it,
 else the device. A session never switches backends midway.
@@ -154,6 +180,18 @@ fixture `internal/engine/testdata/trace-complete.ndjson`.
 | Prefs | `audio.crossfade_v2` in `prefs` is stale once `audio.crossfade_migrated_to_ps=true` | it is a warning, not a verdict |
 | Settings writes | `set shuffling`/`set repeating` take effect, but a read in the same script still returns the old value | settings are read back on the next observation, never right after a write |
 | Process tap | delivers callbacks (512 frames at 48 kHz, every 10.7 ms) of pure zeros until the host app has *System Audio Recording* permission | the silence watchdog, exit 5 |
+
+Measured on a MacBook Pro (M1 Max, macOS 15.8), for the output rate and the
+lossless path:
+
+| Behavior | Measurement | Consequence |
+|---|---|---|
+| Rate switch | setting the speakers' nominal rate returns at once; it reads back after ~55 ms, the device announces it after ~100 ms; they offer 44.1, 48, 88.2 and 96 kHz | wait for the announcement and the read-back (2 s each at most) |
+| A call app on the speakers | with Microsoft Teams holding the speakers, the rate went back to 48 kHz ~220 ms after a switch to 44.1 kHz | a 500 ms settle and a second read catch it: warn, record at the device's rate, never fight it |
+| Tap transparency | through the built-in speakers' tap, a test signal comes back flat (±0.01 dB) to 18 kHz, −2.5 dB at 20 kHz, −18 dB at 21 kHz, at 48 kHz, with drift compensation on or off; the same floats played into BlackHole read back bit for bit | the tap is transparent below the top octave's last few kHz; BlackHole is bit-exact |
+| ALAC | `afconvert -f m4af -d alac` from a plain 44-byte PCM header takes the WAV's depth ("from 24-bit source") and decodes bit-exact at 16 and 24 bits, 44.1 and 48 kHz; tagging leaves the `mdat` hash alone. A 24-bit capture of Spotify came to 9.5 MB a minute (99.6 % of samples with a busy low byte), a 16-bit one to 4.9 MB | no `WAVE_FORMAT_EXTENSIBLE`, no explicit depth flag |
+| AAC bit rate | `-b` lands on target for noise (128 → 127 kb/s, 320 → 326 kb/s); below 96 kb/s the encoder drops to 32 kHz | `aac_bitrate` 64–320, documented |
+| Encoder listing | `afconvert -hf` exits 2 even when it lists everything; inside a sandbox it lists no data formats for `m4af` | doctor parses the listing, ignores the exit code, and warns rather than fails |
 
 Re-measure after Spotify updates with `mixtape debug trace --duration 2m`
 while playing, pausing and skipping; the summary prints the onset offset for
@@ -241,8 +279,8 @@ For each song to record, in order:
   start is seeked to 0, and a jump to another song before the requested one
   really began is a false start, requested again without counting as an
   attempt.
-- A song too long for a WAV (the 4 GiB RIFF limit: about 6 h at 48 kHz) is
-  failed before it is played.
+- A song too long for a WAV (the 4 GiB RIFF limit: about 6.2 h of 16-bit and
+  4.1 h of 24-bit 48 kHz stereo) is failed before it is played.
 - A relinked track (another ID with the same normalized title and lead
   artist, duration within 2 s) is accepted and its played ID recorded.
 - If Spotify jumps past the requested song to a later one, the requested
@@ -323,18 +361,25 @@ leaving: it is neither recorded again nor skipped a second time.
 - A folder is found by its collection's Spotify ID, so a renamed playlist
   keeps its folder.
 - Each file carries freeform tags `SPOTIFY_ID`, `SPOTIFY_REQUESTED_ID` (when
-  relinked) and `MIXTAPE_AUDIO_SHA256`: the SHA-256 of the AAC `mdat`
-  payload, which retagging never changes. A song done in one folder is
-  copied, not recorded, into another.
+  relinked) and `MIXTAPE_AUDIO_SHA256`: the SHA-256 of the encoded `mdat`
+  payload (ALAC or AAC), which retagging never changes. A song done in one
+  folder is copied, not recorded, into another, from a file in the codec the
+  session records (`copy_codec same`, read from the file's sound track
+  sample entry, `alac` or `mp4a`; the manifest's `codec` only caches it), or
+  from any (`copy_codec any`). A song already done in its own folder is never
+  recorded again because the codec changed.
 - The release date goes into `©day` (Music apps show its year) and the
   manifest's `release_date`. Track pages carry it; album and playlist pages
   do not date their songs, so a song recorded without one has its own track
   page read when it is saved (one small request, 10 s at most; without an
   answer the file has no year).
 
-**Commit pipeline.** Render the ranges to a WAV in `~/.mixtape/work` →
-`afconvert -f m4af -d aac -b 256000` → hash `mdat` → tag → write into the
-folder (temp file, fsync, rename) → manifest (atomic) → `.m3u8`. If encoding
+**Commit pipeline.** Render the ranges to a WAV in `~/.mixtape/work`, at the
+spool's depth → `afconvert -f m4af -d alac` (or `-d aac -b <aac_bitrate>`,
+retried once at afconvert's default bit rate, with a warning) → hash `mdat`
+and read the codec → tag → stream into the folder (temp file, fsync, rename):
+`mp4tag.TagFile` rebuilds only moov in memory and copies the audio, so a 40 MB
+song costs a moov's worth of memory → manifest (atomic) → `.m3u8`. If encoding
 or tagging fails, the WAV moves to `work/failed/`, the song is
 `encode_failed`, and the next run encodes it again without recording; a
 retry that cannot write the file (an unplugged drive) keeps the WAV for the
@@ -361,6 +406,11 @@ unmounted (missing, or more than half of its files missing) unless `--force`.
 |---|---|---|---|
 | Recorder | `~/Library/Caches/mixtape/recorder.lock` | `record` | one Spotify, one recorder, whatever `--home` |
 | Library | `<library>/.mixtape.lock` | `record`, `verify --fix` | one writer per library |
+
+Next to the recorder lock, `output-restore.json` records an output rate a
+session switched and has not put back; `stop` with no session running takes
+the recorder lock to undo it (and Spotify's settings) without racing a new
+session.
 
 Both are `flock`s; contention exits 6. The recorder lock file names the
 holder's PID, session ID and home, so `status`, `wait` and `stop` find the

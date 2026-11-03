@@ -21,6 +21,7 @@ import (
 // setup and the session need, gathered as they are opened.
 type recordRun struct {
 	cmdPath  string // for usage errors
+	id       string // the session ID
 	flags    *recordFlags
 	settings config.Settings
 	lib      *library.Library
@@ -28,6 +29,9 @@ type recordRun struct {
 	args     []string // the links, as given
 	player   player
 	source   capture.Source // nil when nothing plays
+	// pendingOutput is an interrupted session's output rate switch this
+	// session's tap takes over (see recoverOutput).
+	pendingOutput *capture.OutputRestore
 }
 
 // record runs a session. When every song is already done (or only needs
@@ -56,6 +60,7 @@ func (a *app) record(ctx context.Context, run *recordRun) error {
 		return err
 	}
 	defer func() { _ = lock.Release() }()
+	run.id = id
 
 	// From here a stop request (Ctrl-C, `mixtape stop`) ends the setup
 	// gracefully instead of killing the process mid-way.
@@ -63,7 +68,8 @@ func (a *app) record(ctx context.Context, run *recordRun) error {
 	defer stopGuard()
 
 	run.player = svc.player()
-	pending := a.recoverSpotify(setupCtx, run.player) // even when nothing plays: a copy-only run must not lose it
+	pending, _ := a.recoverSpotify(setupCtx, run.player, true) // even when nothing plays: a copy-only run must not lose it
+	run.pendingOutput = a.recoverOutput(setupCtx, a.plannedCapture(run, playback), run.settings.OutputRate)
 	unlock, err := run.lib.Lock()
 	if err != nil {
 		return err
@@ -161,7 +167,22 @@ func (a *app) openSource(ctx context.Context, run *recordRun) (capture.Source, e
 	if err := a.requireCapturePermission(method); err != nil {
 		return nil, err
 	}
-	return a.deps.services.openCapture(ctx, captureRequest{Method: method, Device: run.settings.Device, Mute: f.mute})
+	req := captureRequest{Method: method, Device: run.settings.Device, Mute: f.mute, Bits: run.settings.Bits()}
+	a.outputRequest(&req, run, method, run.pendingOutput)
+	return a.deps.services.openCapture(ctx, req)
+}
+
+// plannedCapture is the capture method the session will open, or "" when
+// nothing plays or none can be selected (openSource reports why).
+func (a *app) plannedCapture(run *recordRun, playback bool) capture.Method {
+	if !playback {
+		return ""
+	}
+	m, err := a.selectCapture(run.settings)
+	if err != nil {
+		return ""
+	}
+	return m
 }
 
 // capturePermission is the permission capture method m needs.
@@ -201,28 +222,30 @@ func (a *app) selectCapture(s config.Settings) (capture.Method, error) {
 }
 
 // recoverSpotify puts back Spotify settings an interrupted session left
-// changed. The recorder lock is held, so that session is gone. What it
-// cannot put back yet (Spotify is closed, or did not answer) is returned:
-// the new session keeps it and restores it when it ends.
-func (a *app) recoverSpotify(ctx context.Context, p player) *session.SpotifyState {
+// changed, and returns the names of those it put back (and, with announce,
+// says so in a warning). The recorder lock is held, so that session is
+// gone. What it cannot put back yet (Spotify is closed, or did not answer)
+// is returned as pending: the new session keeps it and restores it when it
+// ends.
+func (a *app) recoverSpotify(ctx context.Context, p player, announce bool) (pending *session.SpotifyState, restored []string) {
 	st, err := session.ReadState(a.home)
 	if err != nil || !st.Spotify.NeedsRestore() {
-		return nil
+		return nil, nil
 	}
-	restored, err := session.Restore(ctx, p, *st.Spotify)
+	restored, err = session.Restore(ctx, p, *st.Spotify)
 	if err != nil {
 		if !errors.Is(err, spotify.ErrNotRunning) {
 			a.out.Warn("could not restore Spotify settings from session %s yet: %v", st.ID, err)
 		}
-		return st.Spotify
+		return st.Spotify, nil
 	}
 	st.Spotify.Restored = true
 	// Best effort: should this write be lost, the next session finds the
 	// settings still pending, sees Spotify no longer holds what was set,
 	// and leaves them alone.
 	_ = session.WriteState(a.home, st)
-	if len(restored) > 0 {
+	if announce && len(restored) > 0 {
 		a.out.Warn("restored Spotify %s changed by interrupted session %s", strings.Join(restored, ", "), st.ID)
 	}
-	return nil
+	return nil, restored
 }
