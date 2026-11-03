@@ -20,6 +20,7 @@ import (
 	"github.com/mrz1836/mixtape/internal/capture"
 	"github.com/mrz1836/mixtape/internal/capture/device"
 	"github.com/mrz1836/mixtape/internal/capture/tap"
+	"github.com/mrz1836/mixtape/internal/config"
 	"github.com/mrz1836/mixtape/internal/spotify"
 )
 
@@ -28,11 +29,20 @@ var errOsascriptTimeout = errors.New("osascript: timed out")
 // traceBlockFrames is one 100 ms block at the fake sources' 8 kHz.
 const traceBlockFrames = 800
 
-// pcmBlock is frames of 16-bit stereo PCM whose every sample is level.
-func pcmBlock(frames, level int) []byte {
-	pcm := make([]byte, frames*4)
-	for i := 0; i < len(pcm); i += 2 {
-		binary.LittleEndian.PutUint16(pcm[i:], uint16(level))
+// pcmBlock returns frames of stereo PCM at bits bits a sample whose every
+// sample is level, in 16-bit units: at 24 bits with a busy low byte below.
+func pcmBlock(frames, level, bits int) []byte {
+	if bits != 24 {
+		pcm := make([]byte, frames*4)
+		for i := 0; i < len(pcm); i += 2 {
+			binary.LittleEndian.PutUint16(pcm[i:], uint16(level))
+		}
+		return pcm
+	}
+	pcm := make([]byte, 0, frames*6)
+	v := level<<8 | 0x33
+	for range frames * 2 {
+		pcm = append(pcm, byte(v), byte(v>>8), byte(v>>16))
 	}
 	return pcm
 }
@@ -43,10 +53,15 @@ func pcmBlock(frames, level int) []byte {
 type traceSource struct {
 	nopSource
 
+	bits     int // as Format reports it
 	loud     []bool
 	startErr error
 	mu       sync.Mutex
 	started  time.Time
+}
+
+func (s *traceSource) Format() capture.Format {
+	return capture.Format{Rate: 8000, Channels: 2, Bits: s.bits}
 }
 
 func (s *traceSource) Start(_ context.Context, sink func(capture.Block)) error {
@@ -63,7 +78,7 @@ func (s *traceSource) Start(_ context.Context, sink func(capture.Block)) error {
 			level = 4000
 		}
 		sink(capture.Block{
-			PCM: pcmBlock(traceBlockFrames, level), Frames: traceBlockFrames,
+			PCM: pcmBlock(traceBlockFrames, level, s.bits), Frames: traceBlockFrames,
 			At: start.Add(time.Duration(i) * 100 * time.Millisecond),
 		})
 	}
@@ -144,6 +159,7 @@ func traceHarness(t *testing.T) (*harness, *traceSource) {
 	src, snaps := traceScript()
 	h.deps.services.openCapture = func(_ context.Context, r captureRequest) (capture.Source, error) {
 		assert.Equal(t, capture.MethodTap, r.Method, "the tap is this Mac's default method")
+		src.bits = r.Bits
 		return src, nil
 	}
 	h.deps.services.player = func() player { return &tracePlayer{fakePlayer: h.world.player, src: src, snaps: snaps} }
@@ -182,14 +198,31 @@ func writeTraceFile(t *testing.T, lines ...traceLine) string {
 	return path
 }
 
+// A trace finds the same onsets at any capture depth: its peaks are on the
+// 16-bit scale whatever the samples hold.
 func TestDebugTraceRecordsSnapshotsAndAudioOnOneClock(t *testing.T) {
 	t.Parallel()
+	for name, depth := range map[string]string{"24-bit by default": "", "16-bit": "16"} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			debugTraceOnOneClock(t, depth)
+		})
+	}
+}
+
+func debugTraceOnOneClock(t *testing.T, depth string) {
 	h, src := traceHarness(t)
+	bits := 24
+	if depth != "" {
+		h.env[config.EnvBitDepth] = depth
+		bits = 16
+	}
 	out := filepath.Join(t.TempDir(), "traces", "run.ndjson")
 
 	require.Equal(t, ExitOK, h.run("debug", "trace", "--out", out, "--poll", "50ms", "-o", "text"), h.stderr.String())
+	require.Equal(t, bits, src.bits, "the trace captures at the configured depth")
 	text := h.stdout.String()
-	assert.Contains(t, text, "tracing for 1m0s with fake device at 8000 Hz into "+out)
+	assert.Contains(t, text, fmt.Sprintf("tracing for 1m0s with fake device at %d-bit 8 kHz into %s", bits, out))
 	assert.Contains(t, text, "trace "+out+": 6 snapshots, 30 audio blocks at 8000 Hz")
 	assert.Regexp(t, `1\.00s change Queen Anne's Lace\s+stale=1  onset−estimate = -0\.050s`, text,
 		"the stale position is set aside and the onset leads the positions by 50 ms")
@@ -198,7 +231,7 @@ func TestDebugTraceRecordsSnapshotsAndAudioOnOneClock(t *testing.T) {
 
 	lines := readTraceFile(t, out)
 	require.Len(t, lines, 1+30+6)
-	assert.Equal(t, traceLine{K: "meta", Rate: 8000, Chans: 2, Src: "fake device", PollM: 50}, lines[0])
+	assert.Equal(t, traceLine{K: "meta", Rate: 8000, Chans: 2, Bits: bits, Src: "fake device", PollM: 50}, lines[0])
 	for i, l := range lines[1:31] {
 		assert.Equal(t, "audio", l.K)
 		assert.Equal(t, int64(i*traceBlockFrames), l.Frame, "frames count on from the first block")

@@ -111,6 +111,9 @@ type Options struct {
 	BundlePrefix string
 	// Wait is how long Open waits for the processes to appear.
 	Wait time.Duration
+	// Bits is the depth of the PCM delivered: 16 or 24 (0 means 16, and
+	// Format reports it as given).
+	Bits int
 }
 
 // Source records the tapped processes. It implements capture.Source.
@@ -212,7 +215,7 @@ func (s *Source) build(procs []uint32) error {
 	}
 	s.mu.Lock()
 	s.tap, s.procs = t, procs
-	s.format = capture.Format{Rate: int(math.Round(rate)), Channels: channels}
+	s.format = capture.Format{Rate: int(math.Round(rate)), Channels: channels, Bits: s.opts.Bits}
 	s.mu.Unlock()
 	return nil
 }
@@ -251,7 +254,7 @@ func (s *Source) drain(ctx context.Context, sink func(capture.Block)) {
 	clock := sampleClock()
 	tick := time.NewTicker(capture.DrainInterval)
 	defer tick.Stop()
-	var buf []byte
+	var buf drainBuffers
 	var nextRetry time.Time
 	for {
 		s.mu.Lock()
@@ -265,7 +268,7 @@ func (s *Source) drain(ctx context.Context, sink func(capture.Block)) {
 				s.rebuild(capture.EventProcessChanged, "Spotify's audio process came back")
 			}
 		} else {
-			buf = s.read(t, format, clock, buf, sink)
+			s.read(t, format, clock, &buf, sink)
 			s.handleEvents(t)
 		}
 
@@ -277,32 +280,38 @@ func (s *Source) drain(ctx context.Context, sink func(capture.Block)) {
 	}
 }
 
-// read drains the ring of tap t into sink.
-func (s *Source) read(t unsafe.Pointer, f capture.Format, clock clockPair, buf []byte, sink func(capture.Block)) []byte {
+// drainBuffers are the drain's reusable buffers: the Float32 samples read
+// from the ring, and the PCM they convert to.
+type drainBuffers struct {
+	samples []float32
+	pcm     []byte
+}
+
+// read drains the ring of tap t into sink, converting the Float32 samples
+// to f's depth.
+func (s *Source) read(t unsafe.Pointer, f capture.Format, clock clockPair, buf *drainBuffers, sink func(capture.Block)) {
 	ring := C.mt_tap_ring(t)
 	maxFrames := uint64(ring.capacity)
-	need := int(maxFrames) * f.BytesPerFrame()
-	if cap(buf) < need {
-		buf = make([]byte, need)
+	if need := int(maxFrames) * f.Channels; cap(buf.samples) < need {
+		buf.samples = make([]float32, need)
+		buf.pcm = make([]byte, 0, need*f.BytesPerSample())
 	}
-	buf = buf[:need]
 	for {
-		var first C.uint64_t
-		n := uint64(C.mt_ring_read(ring, (*C.int16_t)(unsafe.Pointer(&buf[0])), C.uint64_t(maxFrames), &first))
+		n, first := readRing(ring, buf.samples, maxFrames)
 		if n == 0 {
 			break
 		}
 		var at time.Time
 		var af, ah C.uint64_t
 		if C.mt_ring_anchor(ring, &af, &ah) == 1 {
-			at = clock.at(uint64(ah)).Add(-f.Duration(int64(uint64(af)) - int64(uint64(first))))
+			at = clock.at(uint64(ah)).Add(-f.Duration(int64(uint64(af)) - int64(first)))
 		}
-		sink(capture.Block{PCM: buf[:int(n)*f.BytesPerFrame()], Frames: int(n), At: at})
+		buf.pcm = capture.ConvertF32(buf.pcm[:0], buf.samples[:int(n)*f.Channels], f.SampleBits())
+		sink(capture.Block{PCM: buf.pcm, Frames: int(n), At: at})
 	}
 	if n := uint64(C.mt_ring_take_overflows(ring)); n > 0 {
 		s.events.Emit(capture.EventOverflow, fmt.Sprintf("%d tap IO cycles dropped: the reader fell behind", n))
 	}
-	return buf
 }
 
 // handleEvents answers the listeners' change bits.

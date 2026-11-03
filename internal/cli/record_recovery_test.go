@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 
@@ -181,8 +182,15 @@ func TestRecordUsesTheCaptureDeviceChosenForThisRun(t *testing.T) {
 
 	require.Equal(t, ExitNotReady, h.run("record", plURL, "--capture", "device", "--device", "Loopback"))
 	require.Len(t, got, 1)
-	assert.Equal(t, captureRequest{Method: capture.MethodDevice, Device: "Loopback"}, got[0],
-		"the flags beat the config for this run")
+	assert.Equal(t, captureRequest{Method: capture.MethodDevice, Device: "Loopback", Bits: 24}, got[0],
+		"the flags beat the config for this run; ALAC records 24 bits")
+
+	for args, bits := range map[string]int{"--bit-depth=16": 16, "--codec=aac": 16, "--codec=aac --bit-depth=24": 24} {
+		got = nil
+		require.Equal(t, ExitNotReady, h.run(append([]string{"record", plURL}, strings.Fields(args)...)...))
+		require.Len(t, got, 1, args)
+		assert.Equal(t, bits, got[0].Bits, args)
+	}
 }
 
 func TestRecordWarnsAboutALowSpotifyVolume(t *testing.T) {

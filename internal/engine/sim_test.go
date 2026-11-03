@@ -458,6 +458,7 @@ type fakeSource struct {
 	events chan capture.Event
 	silent bool
 	rate   int // capture rate; 0 is testRate
+	bits   int // capture depth, as Format reports it: 0 (16), 16 or 24
 	// method is the backend it poses as ("" is a capture device).
 	method capture.Method
 	// startErr makes Start fail.
@@ -474,7 +475,7 @@ func (s *fakeSource) Method() capture.Method { return cmp.Or(s.method, capture.M
 func (s *fakeSource) Format() capture.Format {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return capture.Format{Rate: cmp.Or(s.rate, testRate), Channels: 2}
+	return capture.Format{Rate: cmp.Or(s.rate, testRate), Channels: 2, Bits: s.bits}
 }
 func (s *fakeSource) Events() <-chan capture.Event { return s.events }
 func (s *fakeSource) Close() error                 { return nil }
@@ -507,11 +508,21 @@ func (s *fakeSource) emitLevel(frames, level int, t time.Time) {
 	if sink == nil {
 		return
 	}
-	pcm := make([]byte, frames*s.Format().BytesPerFrame())
+	f := s.Format()
+	pcm := make([]byte, frames*f.BytesPerFrame())
 	if level > 0 && !silent {
-		v := uint16(min(level, math.MaxInt16))
-		for i := 0; i+1 < len(pcm); i += 2 {
-			binary.LittleEndian.PutUint16(pcm[i:], v)
+		v := min(level, math.MaxInt16)
+		if f.SampleBits() == capture.Bits24 {
+			// level in 16-bit units, with detail below them that only a
+			// 24-bit capture holds.
+			v24 := v<<8 | 0x5A
+			for i := 0; i+2 < len(pcm); i += 3 {
+				pcm[i], pcm[i+1], pcm[i+2] = byte(v24), byte(v24>>8), byte(v24>>16)
+			}
+		} else {
+			for i := 0; i+1 < len(pcm); i += 2 {
+				binary.LittleEndian.PutUint16(pcm[i:], uint16(v))
+			}
 		}
 	}
 	sink(capture.Block{PCM: pcm, Frames: frames, At: t})
@@ -523,9 +534,6 @@ func (s *fakeSource) started() bool {
 	defer s.mu.Unlock()
 	return s.sink != nil
 }
-
-// stereoBytesPerFrame is the frame size of every WAV the tests render.
-const stereoBytesPerFrame = 4
 
 // fakeEncoder stands in for afconvert (see testutil.Encoder) and records
 // how many frames each WAV held.
@@ -546,9 +554,11 @@ func (e *fakeEncoder) Encode(ctx context.Context, wavPath, m4aPath string) error
 	if err := e.Encoder.Encode(ctx, wavPath, m4aPath); err != nil {
 		return err
 	}
+	calls := e.Calls()
+	bpf := max(int64(2*calls[len(calls)-1].Bits/8), 1) // stereo, at the WAV's own depth
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	e.frames[filepath.Base(m4aPath)] = (info.Size() - wav.HeaderSize) / stereoBytesPerFrame
+	e.frames[filepath.Base(m4aPath)] = (info.Size() - wav.HeaderSize) / bpf
 	return nil
 }
 

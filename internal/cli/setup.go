@@ -273,7 +273,7 @@ func (s *setupFlow) chooseCapture(ctx context.Context, settings config.Settings)
 	tapSt := a.deps.services.tapStatus()
 	if tapSt.Supported && s.ask("Use the process tap (records Spotify only, nothing to install)?", true) {
 		if s.ensure(ctx, permission.SystemAudio) {
-			err := s.verify(ctx, captureRequest{Method: capture.MethodTap})
+			err := s.verify(ctx, captureRequest{Method: capture.MethodTap, Bits: settings.Bits()})
 			if err == nil {
 				return capture.MethodTap, nil
 			}
@@ -322,7 +322,7 @@ func (s *setupFlow) setupDevice(ctx context.Context, settings config.Settings) (
 	if !s.ensure(ctx, permission.Microphone) {
 		return "", fmt.Errorf("%w: microphone access for the capture device", permission.ErrNotGranted)
 	}
-	if err := s.verify(ctx, captureRequest{Method: capture.MethodDevice, Device: settings.Device}); err != nil {
+	if err := s.verify(ctx, captureRequest{Method: capture.MethodDevice, Device: settings.Device, Bits: settings.Bits()}); err != nil {
 		return "", fmt.Errorf("the BlackHole test failed: %w", err)
 	}
 	return capture.MethodDevice, nil
@@ -444,12 +444,14 @@ func (s *setupFlow) verify(ctx context.Context, r captureRequest) error {
 	return nil
 }
 
-// probe captures for d and returns the loudest sample seen.
+// probe captures for d and returns the loudest sample seen, in 16-bit
+// units at any depth (capture.Peak).
 func probe(ctx context.Context, src capture.Source, d time.Duration, sleep func(context.Context, time.Duration) bool) (int, error) {
 	var mu sync.Mutex
 	loudest := 0
 	err := src.Start(ctx, func(b capture.Block) {
-		p := pcmPeak(b.PCM[:min(len(b.PCM), b.Frames*src.Format().BytesPerFrame())])
+		f := src.Format()
+		p := capture.Peak(b.PCM[:min(len(b.PCM), b.Frames*f.BytesPerFrame())], f)
 		mu.Lock()
 		loudest = max(loudest, p)
 		mu.Unlock()
@@ -461,17 +463,4 @@ func probe(ctx context.Context, src capture.Source, d time.Duration, sleep func(
 	mu.Lock()
 	defer mu.Unlock()
 	return loudest, nil
-}
-
-// pcmPeak is the largest sample magnitude in PCM16LE data.
-func pcmPeak(pcm []byte) int {
-	m := 0
-	for i := 0; i+1 < len(pcm); i += 2 {
-		v := int(pcm[i]) | int(pcm[i+1])<<8
-		if v >= 1<<15 {
-			v = 1<<16 - v
-		}
-		m = max(m, v)
-	}
-	return m
 }

@@ -4,6 +4,8 @@ package device
 
 import (
 	"bytes"
+	"encoding/binary"
+	"math"
 	"sync"
 	"testing"
 	"time"
@@ -141,10 +143,35 @@ func TestRingConcurrent(t *testing.T) {
 
 func TestOriginCapturedAt(t *testing.T) {
 	t.Parallel()
-	f := capture.Format{Rate: 48000, Channels: 2}
+	f := capture.Format{Rate: 48000, Channels: 2, Bits: 24}
 	at := time.Date(2026, 11, 2, 12, 0, 0, 0, time.UTC)
-	o := origin{at: at, offset: 480 * 4, ok: true} // 480 frames past the stamp
-	assert.Equal(t, at.Add(10*time.Millisecond), o.capturedAt(f))
-	assert.Equal(t, at, origin{at: at, ok: true}.capturedAt(f), "the stamped byte itself")
-	assert.True(t, origin{at: at}.capturedAt(f).IsZero(), "no stamp, no time")
+	const frame = 2 * 4                                // stereo Float32 in the ring
+	o := origin{at: at, offset: 480 * frame, ok: true} // 480 frames past the stamp
+	assert.Equal(t, at.Add(10*time.Millisecond), o.capturedAt(f, frame), "frames are counted in the ring's own size")
+	assert.Equal(t, at, origin{at: at, ok: true}.capturedAt(f, frame), "the stamped byte itself")
+	assert.True(t, origin{at: at}.capturedAt(f, frame).IsZero(), "no stamp, no time")
+	assert.True(t, o.capturedAt(f, 0).IsZero(), "no frame size, no time")
+}
+
+// What the drain hands on is exactly what the device produced: Float32
+// through the ring, decoded, then converted at the session's depth.
+func TestRingCarriesFloatsToExactPCM(t *testing.T) {
+	t.Parallel()
+	in := []float32{0, 0.5, -0.5, float32(8388607) / (1 << 23), -1, 1.5, float32(1234567) / (1 << 23), float32(-42) / (1 << 23)}
+	raw := make([]byte, 0, len(in)*ringSampleBytes)
+	for _, x := range in {
+		raw = binary.LittleEndian.AppendUint32(raw, math.Float32bits(x))
+	}
+	r := newRing(len(raw)*2, 8)
+	require.True(t, r.write(raw, time.Now()))
+	buf := make([]byte, len(raw)*2)
+	n, _ := r.readInto(buf)
+	require.Equal(t, len(raw), n)
+	got := floats(make([]float32, len(in)), buf[:n])
+	assert.Equal(t, in, got)
+	pcm := capture.ConvertF32(nil, got, 24)
+	want := []int32{0, 1 << 22, -(1 << 22), 1<<23 - 1, -(1 << 23), 1<<23 - 1, 1234567, -42}
+	for i, w := range want {
+		assert.Equal(t, w, capture.Sample24(pcm[i*3:]), "sample %d", i)
+	}
 }

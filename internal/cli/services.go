@@ -39,6 +39,7 @@ type captureRequest struct {
 	Method capture.Method // tap or device (already selected)
 	Device string         // device name substring
 	Mute   bool           // tap only
+	Bits   int            // bits a sample: 16 or 24 (config.Settings.Bits)
 }
 
 // services are the heavyweight collaborators commands reach through the
@@ -129,9 +130,9 @@ func newProcessServices() services {
 func openCapture(ctx context.Context, r captureRequest) (capture.Source, error) {
 	switch r.Method {
 	case capture.MethodTap:
-		return tap.Open(ctx, tap.Options{Mute: r.Mute, Wait: 10 * time.Second})
+		return tap.Open(ctx, tap.Options{Mute: r.Mute, Wait: 10 * time.Second, Bits: r.Bits})
 	case capture.MethodDevice:
-		return device.Open(r.Device)
+		return device.Open(r.Device, r.Bits)
 	case capture.MethodAuto:
 	}
 	return nil, fmt.Errorf("%w: %q", capture.ErrUnknownMethod, r.Method)

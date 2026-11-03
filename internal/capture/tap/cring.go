@@ -13,7 +13,7 @@ import (
 )
 
 // cRing wraps a C mt_ring allocated in C memory (it holds C11 atomics that
-// Go must never copy or move). It exists so the real-time conversion and
+// Go must never copy or move). It exists so the real-time copying and
 // queueing code can be unit-tested from Go; the tap itself drives the ring
 // from Objective-C.
 type cRing struct{ r *C.mt_ring }
@@ -70,15 +70,14 @@ func (c *cRing) writePlanar(planes [][]float32, hostNS uint64) bool {
 }
 
 // read returns up to maxFrames frames and the stream position of the first.
-func (c *cRing) read(maxFrames uint64) ([]int16, uint64) {
+func (c *cRing) read(maxFrames uint64) ([]float32, uint64) {
 	channels := uint64(c.r.channels)
 	if maxFrames == 0 || channels == 0 {
 		return nil, 0
 	}
-	out := make([]int16, maxFrames*channels)
-	var first C.uint64_t
-	n := C.mt_ring_read(c.r, (*C.int16_t)(unsafe.Pointer(&out[0])), C.uint64_t(maxFrames), &first)
-	return out[:uint64(n)*channels], uint64(first)
+	out := make([]float32, maxFrames*channels)
+	n, first := readRing(c.r, out, maxFrames)
+	return out[:n*channels], first
 }
 
 // anchor returns the latest (frame, host ns) anchor.
@@ -92,11 +91,16 @@ func (c *cRing) anchor() (frame, hostNS uint64, ok bool) {
 
 func (c *cRing) takeOverflows() uint64 { return uint64(C.mt_ring_take_overflows(c.r)) }
 
-// f32ToS16 is the IO block's sample conversion.
-func f32ToS16(x float32) int16 { return int16(C.mt_f32_to_s16(C.float(x))) }
-
 // hostNowNS is the host clock in nanoseconds (CLOCK_UPTIME_RAW).
 func hostNowNS() uint64 { return uint64(C.mt_host_now_ns()) }
+
+// readRing moves up to maxFrames frames of r into dst, which must hold that
+// many, and returns the count and the stream position of the first.
+func readRing(r *C.mt_ring, dst []float32, maxFrames uint64) (n, first uint64) {
+	var f C.uint64_t
+	got := C.mt_ring_read(r, (*C.float)(unsafe.Pointer(&dst[0])), C.uint64_t(maxFrames), &f)
+	return uint64(got), uint64(f)
+}
 
 // cFloats copies s into newly C-allocated memory; the caller frees it.
 func cFloats(s []float32) *C.float {

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"time"
 
@@ -59,7 +60,17 @@ func (a *app) newRecorder(id string, run *recordRun, pending *session.SpotifySta
 	return r, nil
 }
 
-func captureLabel(src capture.Source) string { return string(src.Method()) + " (" + src.Name() + ")" }
+// captureLabel describes a capture source: its method, its name, and the
+// depth and rate it records at, such as "tap (process tap (Spotify),
+// 24-bit 48 kHz)".
+func captureLabel(src capture.Source) string {
+	return string(src.Method()) + " (" + src.Name() + ", " + depthRate(src.Format()) + ")"
+}
+
+// depthRate describes a capture format for people: "24-bit 44.1 kHz".
+func depthRate(f capture.Format) string {
+	return strconv.Itoa(f.SampleBits()) + "-bit " + kHz(f.Rate)
+}
 
 // setCapture records the capture backend once it is open.
 func (r *recorder) setCapture(src capture.Source) {
@@ -141,7 +152,7 @@ func (r *recorder) run(ctx context.Context, run *recordRun) error {
 	}
 	if run.source != nil {
 		f := run.source.Format()
-		started.BitDepth, started.SampleRate = s.Bits(), f.Rate
+		started.BitDepth, started.SampleRate = f.SampleBits(), f.Rate
 	}
 	r.emit(started)
 	r.emit(engine.Event{Type: engine.EventPlan, Items: plan.Summary()})

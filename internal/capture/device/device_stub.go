@@ -40,7 +40,7 @@ type Source struct{}
 var _ capture.Source = (*Source)(nil)
 
 // Open is unsupported in this build.
-func Open(string) (*Source, error) { return nil, errNoCoreAudio }
+func Open(string, int) (*Source, error) { return nil, errNoCoreAudio }
 
 // Name is empty in this build.
 func (*Source) Name() string { return "" }

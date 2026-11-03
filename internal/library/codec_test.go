@@ -369,10 +369,13 @@ func noise(rate int, seconds float64) []byte {
 }
 
 // decodePCM decodes the M4A at path back to 16-bit PCM with afconvert.
-func decodePCM(t *testing.T, path string) []byte {
+func decodePCM(t *testing.T, path string) []byte { return decodePCMAt(t, path, 16) }
+
+// decodePCMAt decodes the M4A at path back to PCM of bits bits.
+func decodePCMAt(t *testing.T, path string, bits int) []byte {
 	t.Helper()
 	out := filepath.Join(t.TempDir(), "decoded.wav")
-	cmd := exec.CommandContext(t.Context(), "afconvert", path, out, "-f", "WAVE", "-d", "LEI16")
+	cmd := exec.CommandContext(t.Context(), "afconvert", path, out, "-f", "WAVE", "-d", "LEI"+strconv.Itoa(bits))
 	b, err := cmd.CombinedOutput()
 	require.NoError(t, err, string(b))
 	data, err := os.ReadFile(filepath.Clean(out))
@@ -419,6 +422,29 @@ func TestALACIsLossless(t *testing.T) {
 	require.NoError(t, err, string(info))
 	assert.Contains(t, string(info), "from 16-bit source")
 	assert.Len(t, data, wav.HeaderSize+len(pcm))
+}
+
+// TestALAC24IsLossless stores a 24-bit recording: ALAC keeps its depth,
+// and every sample, low byte included, decodes back exactly.
+func TestALAC24IsLossless(t *testing.T) {
+	t.Parallel()
+	testutil.RequireEncoder(t, "alac")
+	f := newFixture(t, AFConvert{Codec: mp4tag.CodecALAC})
+	c := f.collection(playlistSpec())
+	pcm := testutil.Noise24(48000, 0.5)
+	data, err := testutil.WAVBits(pcm, 48000, 2, 24)
+	require.NoError(t, err)
+	e, err := f.lib.Commit(t.Context(), c, trackTime(), testutil.WriteFile(t, "rec.wav", data), CommitOptions{})
+	require.NoError(t, err)
+	assert.Equal(t, mp4tag.CodecALAC, e.Codec)
+	info, err := exec.CommandContext(t.Context(), "afinfo", c.Path(&e)).CombinedOutput()
+	require.NoError(t, err, string(info))
+	assert.Contains(t, string(info), "from 24-bit source", "ALAC takes the depth from the WAV")
+	assert.Contains(t, string(info), "48000 Hz")
+	assert.Equal(t, pcm, decodePCMAt(t, c.Path(&e), 24), "every 24-bit sample survives encoding and tagging")
+	hash, err := mp4tag.HashFile(c.Path(&e))
+	require.NoError(t, err)
+	assert.Equal(t, e.AudioSHA256, hash, "the hash ignores the tags")
 }
 
 // TestAFConvertAACBitrate checks that the bit rate reaches the encoder.

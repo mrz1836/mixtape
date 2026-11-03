@@ -117,11 +117,16 @@ func TestPermissionVerbs(t *testing.T) {
 	assert.Equal(t, "go ahead", permissionVerb(permission.Kind("bluetooth")), "a kind without its own words")
 }
 
-func TestPCMPeakCountsNegativeSwings(t *testing.T) {
+// Setup's test capture reads its level on the 16-bit scale at any depth,
+// so one threshold (64) tells silence from sound.
+func TestProbeReadsTheLevelAtAnyDepth(t *testing.T) {
 	t.Parallel()
-	assert.Equal(t, 4000, pcmPeak(pcmBlock(4, -4000&0xffff)), "a negative sample is as loud as a positive one")
-	assert.Equal(t, 1<<15, pcmPeak([]byte{0x00, 0x80}), "the most negative sample")
-	assert.Zero(t, pcmPeak([]byte{0x7f}), "a torn sample is ignored")
+	for _, bits := range []int{16, 24} {
+		src := &traceSource{bits: bits, loud: []bool{false, true, false}}
+		peak, err := probe(t.Context(), src, time.Millisecond, func(context.Context, time.Duration) bool { return true })
+		require.NoError(t, err)
+		assert.Equal(t, 4000, peak, "%d-bit", bits)
+	}
 }
 
 func TestUsageErrorReadsAsItsCause(t *testing.T) {

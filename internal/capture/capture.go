@@ -9,8 +9,10 @@
 //   - capture/device: a capture device such as BlackHole 2ch, fed by a
 //     Multi-Output Device. Works on any macOS and over ssh.
 //
-// Audio is always interleaved signed 16-bit little-endian PCM at the
-// backend's native rate: nothing is resampled.
+// Audio is always interleaved signed little-endian PCM, 16 or 24 bits per
+// sample (24-bit samples packed in three bytes), at the backend's native
+// rate: nothing is resampled. Both backends receive Float32 from Core
+// Audio and convert it with ConvertF32.
 package capture
 
 import (
@@ -29,14 +31,41 @@ const (
 	MethodDevice Method = "device"
 )
 
-// Format describes captured PCM: interleaved signed 16-bit little-endian.
+// Format describes captured PCM: interleaved, signed, little-endian.
+// Formats compare as they are: a Bits of 0 reads as 16 (SampleBits), but is
+// not the same Format as 16.
 type Format struct {
 	Rate     int // frames per second
 	Channels int
+	Bits     int // bits per sample: 16 or 24; 0 means 16
 }
 
+// Sample widths a Format may have.
+const (
+	Bits16 = 16
+	Bits24 = 24
+)
+
+// SampleBits is the bits per sample: Bits, or 16 when it is 0. Everything
+// that sizes or reads samples goes through it.
+func (f Format) SampleBits() int {
+	if f.Bits == 0 {
+		return Bits16
+	}
+	return f.Bits
+}
+
+// BytesPerSample is the size of one sample: 2 or 3 bytes.
+func (f Format) BytesPerSample() int { return f.SampleBits() / 8 }
+
 // BytesPerFrame is the size of one frame (one sample per channel).
-func (f Format) BytesPerFrame() int { return f.Channels * 2 }
+func (f Format) BytesPerFrame() int { return f.Channels * f.BytesPerSample() }
+
+// Valid reports a usable format: a positive rate and channel count, and
+// 0, 16 or 24 bits.
+func (f Format) Valid() bool {
+	return f.Rate > 0 && f.Channels > 0 && (f.Bits == 0 || f.Bits == Bits16 || f.Bits == Bits24)
+}
 
 // Duration converts a frame count to a duration at this rate.
 func (f Format) Duration(frames int64) time.Duration {

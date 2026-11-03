@@ -41,6 +41,7 @@ type Options struct {
 	Mute         bool
 	BundlePrefix string
 	Wait         time.Duration
+	Bits         int
 }
 
 // Source is unavailable in this build.

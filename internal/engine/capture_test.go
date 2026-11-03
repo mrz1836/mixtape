@@ -131,9 +131,10 @@ func TestPeakCountsNegativeSamplesByTheirMagnitude(t *testing.T) {
 	}
 	// Audio swings both ways: a quiet positive half must not hide a loud
 	// negative one from the silence check.
-	assert.Equal(t, 3000, peak(pcm(100, -3000, 20)))
-	assert.Equal(t, 1<<15, peak(pcm(math.MinInt16)))
-	assert.Equal(t, math.MaxInt16, peak(pcm(math.MaxInt16, -5)))
-	assert.Zero(t, peak(pcm()))
-	assert.Zero(t, peak([]byte{0xff}), "a trailing odd byte is not a sample")
+	f := capture.Format{Rate: testRate, Channels: 2}
+	assert.Equal(t, 3000, capture.Peak(pcm(100, -3000, 20), f))
+	assert.Equal(t, 1<<15, capture.Peak(pcm(math.MinInt16), f))
+	assert.Equal(t, math.MaxInt16, capture.Peak(pcm(math.MaxInt16, -5), f))
+	assert.Zero(t, capture.Peak(pcm(), f))
+	assert.Zero(t, capture.Peak([]byte{0xff}, f), "a trailing odd byte is not a sample")
 }

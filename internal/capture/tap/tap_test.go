@@ -12,25 +12,20 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestF32ToS16(t *testing.T) {
+// The ring copies samples as they are: every float, the extremes and NaN
+// included, comes out bit for bit as it went in. Clipping and conversion
+// are capture.ConvertF32's job, in Go.
+func TestCRingCopiesSamplesExactly(t *testing.T) {
 	t.Parallel()
-	tests := map[float32]int16{
-		0:       0,
-		1:       32767,
-		-1:      -32768,
-		2.5:     32767,
-		-7:      -32768,
-		0.5:     16384, // lrintf(16383.5) rounds to even
-		-0.5:    -16384,
-		1e-6:    0,
-		0.99999: 32767,
+	r := newTestRing(t, 8)
+	nan := float32(math.NaN())
+	in := []float32{0.1234567, -1, 1.5, float32(math.Inf(-1)), nan, 1e-30, float32(8388607) / (1 << 23), -0}
+	require.True(t, r.writeInterleaved(in, 2, 1))
+	got, _ := r.read(8)
+	require.Len(t, got, len(in))
+	for i := range in {
+		assert.Equal(t, math.Float32bits(in[i]), math.Float32bits(got[i]), "sample %d", i)
 	}
-	for in, want := range tests {
-		assert.Equal(t, want, f32ToS16(in), "f32ToS16(%v)", in)
-	}
-	assert.Equal(t, int16(0), f32ToS16(float32(math.NaN())))
-	assert.Equal(t, int16(32767), f32ToS16(float32(math.Inf(1))))
-	assert.Equal(t, int16(-32768), f32ToS16(float32(math.Inf(-1))))
 }
 
 // newTestRing returns a stereo ring of capacity frames.
@@ -62,7 +57,7 @@ func TestCRingInterleaved(t *testing.T) {
 
 	got, first := r.read(10)
 	assert.Equal(t, uint64(0), first)
-	assert.Equal(t, []int16{16384, -16384, 32767, -32768, 0, 8192}, got)
+	assert.Equal(t, []float32{0.5, -0.5, 1, -1, 0, 0.25}, got)
 }
 
 func TestCRingChannelMapping(t *testing.T) {
@@ -70,12 +65,12 @@ func TestCRingChannelMapping(t *testing.T) {
 	mono := newTestRing(t, 8)
 	require.True(t, mono.writeInterleaved([]float32{0.5, -0.5}, 1, 1))
 	got, _ := mono.read(8)
-	assert.Equal(t, []int16{16384, 16384, -16384, -16384}, got, "mono is duplicated to both channels")
+	assert.Equal(t, []float32{0.5, 0.5, -0.5, -0.5}, got, "mono is duplicated to both channels")
 
 	surround := newTestRing(t, 8)
 	require.True(t, surround.writeInterleaved([]float32{0.5, -0.5, 1, 1, 0, 0.25, 1, 1}, 4, 1))
 	got, _ = surround.read(8)
-	assert.Equal(t, []int16{16384, -16384, 0, 8192}, got, "extra channels are dropped")
+	assert.Equal(t, []float32{0.5, -0.5, 0, 0.25}, got, "extra channels are dropped")
 }
 
 func TestCRingPlanar(t *testing.T) {
@@ -84,7 +79,7 @@ func TestCRingPlanar(t *testing.T) {
 	require.True(t, r.writePlanar([][]float32{{0.5, 0}, {-0.5, 1}}, 42))
 	got, first := r.read(8)
 	assert.Equal(t, uint64(0), first)
-	assert.Equal(t, []int16{16384, -16384, 0, 32767}, got)
+	assert.Equal(t, []float32{0.5, -0.5, 0, 1}, got)
 	_, host, ok := r.anchor()
 	require.True(t, ok)
 	assert.Equal(t, uint64(42), host)
@@ -104,7 +99,7 @@ func TestCRingOverflowAndWrap(t *testing.T) {
 	require.True(t, r.writeInterleaved([]float32{0.5, 0.5, -0.5, -0.5, 1, 1}, 2, 3))
 	got, first := r.read(8)
 	assert.Equal(t, uint64(2), first)
-	assert.Equal(t, []int16{0, 0, 16384, 16384, -16384, -16384, 32767, 32767}, got)
+	assert.Equal(t, []float32{0, 0, 0.5, 0.5, -0.5, -0.5, 1, 1}, got)
 
 	assert.True(t, r.writeInterleaved(nil, 2, 4), "an empty write is a no-op")
 }
@@ -122,7 +117,7 @@ func TestCRingConcurrent(t *testing.T) {
 			}
 		}
 	})
-	var got []int16
+	var got []float32
 	for len(got) < writes*4 {
 		frames, _ := r.read(64)
 		got = append(got, frames...)
@@ -130,8 +125,8 @@ func TestCRingConcurrent(t *testing.T) {
 	}
 	wg.Wait()
 	for i := range writes {
-		want := f32ToS16(float32(i%100) / 100)
-		require.Equal(t, []int16{want, -want, want, -want}, got[i*4:i*4+4], "write %d", i)
+		want := float32(i%100) / 100
+		require.Equal(t, []float32{want, -want, want, -want}, got[i*4:i*4+4], "write %d", i)
 	}
 }
 

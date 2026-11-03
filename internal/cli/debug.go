@@ -35,6 +35,7 @@ type traceLine struct {
 	Peak  int     `json:"peak,omitempty"`  // audio: loudest sample
 	Rate  int     `json:"rate,omitempty"`  // meta
 	Chans int     `json:"chans,omitempty"` // meta
+	Bits  int     `json:"bits,omitempty"`  // meta: bits a sample (peaks are on the 16-bit scale at any depth)
 	Src   string  `json:"src,omitempty"`   // meta
 	PollM int64   `json:"poll_ms,omitempty"`
 }
@@ -94,7 +95,7 @@ func (a *app) trace(ctx context.Context, duration, poll time.Duration, method, o
 	if err != nil {
 		return err
 	}
-	src, err := a.deps.services.openCapture(ctx, captureRequest{Method: m, Device: s.Device})
+	src, err := a.deps.services.openCapture(ctx, captureRequest{Method: m, Device: s.Device, Bits: s.Bits()})
 	if err != nil {
 		return err
 	}
@@ -110,12 +111,14 @@ func (a *app) trace(ctx context.Context, duration, poll time.Duration, method, o
 
 	start := time.Now()
 	format := src.Format()
-	tw.write(traceLine{K: "meta", Rate: format.Rate, Chans: format.Channels, Src: src.Name(), PollM: poll.Milliseconds()})
+	tw.write(traceLine{
+		K: "meta", Rate: format.Rate, Chans: format.Channels, Bits: format.SampleBits(), Src: src.Name(), PollM: poll.Milliseconds(),
+	})
 	if err := src.Start(ctx, tw.audioSink(start, format)); err != nil {
 		return err
 	}
-	a.out.Println("tracing for %s with %s at %d Hz into %s — play, skip, pause and seek in Spotify now (Ctrl-C ends early)",
-		duration, src.Name(), format.Rate, out)
+	a.out.Println("tracing for %s with %s at %s into %s — play, skip, pause and seek in Spotify now (Ctrl-C ends early)",
+		duration, src.Name(), depthRate(format), out)
 	a.traceSnapshots(ctx, tw, start, duration, poll)
 	_ = src.Close() // no audio may arrive while the trace is flushed
 	if err := tw.flush(); err != nil {
@@ -176,10 +179,11 @@ func (tw *traceWriter) write(l traceLine) {
 }
 
 // audioSink traces each captured block: its time, first frame, length and
-// loudest sample.
+// loudest sample (on the 16-bit scale at any depth, so the onset
+// thresholds hold for every trace).
 func (tw *traceWriter) audioSink(start time.Time, f capture.Format) func(capture.Block) {
 	return func(b capture.Block) {
-		peak := pcmPeak(b.PCM[:min(len(b.PCM), b.Frames*f.BytesPerFrame())])
+		peak := capture.Peak(b.PCM[:min(len(b.PCM), b.Frames*f.BytesPerFrame())], f)
 		tw.mu.Lock()
 		at := tw.frame
 		tw.frame += int64(b.Frames)

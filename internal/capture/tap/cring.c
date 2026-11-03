@@ -3,7 +3,6 @@
 #include "cring.h"
 
 #include <mach/mach_time.h>
-#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -13,7 +12,7 @@ int mt_ring_init(mt_ring *r, uint64_t capacity, uint32_t channels) {
     if (capacity == 0 || channels == 0) {
         return -1;
     }
-    r->buf = calloc((size_t)(capacity * channels), sizeof(int16_t));
+    r->buf = calloc((size_t)(capacity * channels), sizeof(float));
     if (r->buf == NULL) {
         return -1;
     }
@@ -26,25 +25,6 @@ void mt_ring_free(mt_ring *r) {
     free(r->buf);
     r->buf = NULL;
     r->capacity = 0;
-}
-
-int16_t mt_f32_to_s16(float x) {
-    if (!(x == x)) { // NaN
-        return 0;
-    }
-    if (x >= 1.0f) {
-        return 32767;
-    }
-    if (x <= -1.0f) {
-        return -32768;
-    }
-    long v = lrintf(x * 32767.0f);
-    if (v > 32767) {
-        v = 32767;
-    } else if (v < -32768) {
-        v = -32768;
-    }
-    return (int16_t)v;
 }
 
 // reserve returns the stream position for frames, or UINT64_MAX on overflow.
@@ -68,8 +48,8 @@ static void publish(mt_ring *r, uint64_t w, uint32_t frames, uint64_t host_ns) {
     atomic_store_explicit(&r->written, w + frames, memory_order_release);
 }
 
-// sample returns channel c of a frame, mapping the source layout onto the
-// ring's channel count: mono is duplicated, extra channels are dropped.
+// source_channel is the source channel that ring channel c takes: mono is
+// duplicated, extra channels are dropped.
 static inline uint32_t source_channel(uint32_t c, uint32_t src_channels) {
     return c < src_channels ? c : src_channels - 1;
 }
@@ -84,10 +64,10 @@ int mt_ring_write_interleaved(mt_ring *r, const float *src, uint32_t frames,
         return 0;
     }
     for (uint32_t f = 0; f < frames; f++) {
-        int16_t *dst = r->buf + ((w + f) % r->capacity) * r->channels;
+        float *dst = r->buf + ((w + f) % r->capacity) * r->channels;
         const float *frame = src + (size_t)f * src_channels;
         for (uint32_t c = 0; c < r->channels; c++) {
-            dst[c] = mt_f32_to_s16(frame[source_channel(c, src_channels)]);
+            dst[c] = frame[source_channel(c, src_channels)];
         }
     }
     publish(r, w, frames, host_ns);
@@ -104,16 +84,16 @@ int mt_ring_write_planar(mt_ring *r, const float *const *planes, uint32_t frames
         return 0;
     }
     for (uint32_t f = 0; f < frames; f++) {
-        int16_t *dst = r->buf + ((w + f) % r->capacity) * r->channels;
+        float *dst = r->buf + ((w + f) % r->capacity) * r->channels;
         for (uint32_t c = 0; c < r->channels; c++) {
-            dst[c] = mt_f32_to_s16(planes[source_channel(c, src_channels)][f]);
+            dst[c] = planes[source_channel(c, src_channels)][f];
         }
     }
     publish(r, w, frames, host_ns);
     return 1;
 }
 
-uint64_t mt_ring_read(mt_ring *r, int16_t *dst, uint64_t max_frames, uint64_t *first_frame) {
+uint64_t mt_ring_read(mt_ring *r, float *dst, uint64_t max_frames, uint64_t *first_frame) {
     uint64_t w = atomic_load_explicit(&r->written, memory_order_acquire);
     uint64_t rd = atomic_load_explicit(&r->read, memory_order_relaxed);
     uint64_t n = w - rd;
@@ -128,7 +108,7 @@ uint64_t mt_ring_read(mt_ring *r, int16_t *dst, uint64_t max_frames, uint64_t *f
             run = n - done;
         }
         memcpy(dst + done * r->channels, r->buf + off * r->channels,
-               (size_t)(run * r->channels) * sizeof(int16_t));
+               (size_t)(run * r->channels) * sizeof(float));
         done += run;
     }
     atomic_store_explicit(&r->read, rd + n, memory_order_release);

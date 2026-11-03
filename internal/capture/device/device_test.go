@@ -35,7 +35,7 @@ func TestOpenUnknownDeviceListsAvailable(t *testing.T) {
 	if _, err := List(); err != nil {
 		t.Skipf("Core Audio enumeration unavailable here: %v", err)
 	}
-	_, err := Open("no-such-device-ever-7f3a")
+	_, err := Open("no-such-device-ever-7f3a", 24)
 	require.ErrorIs(t, err, ErrNoDevice)
 	assert.Contains(t, err.Error(), "available capture devices")
 }

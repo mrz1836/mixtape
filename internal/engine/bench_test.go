@@ -4,20 +4,6 @@ import (
 	"testing"
 )
 
-// BenchmarkPeak measures the loudness check every captured block passes
-// through on the capture goroutine (10 ms of 48 kHz stereo).
-func BenchmarkPeak(b *testing.B) {
-	pcm := make([]byte, 480*4)
-	for i := range pcm {
-		pcm[i] = byte(i)
-	}
-	b.SetBytes(int64(len(pcm)))
-	b.ReportAllocs()
-	for b.Loop() {
-		_ = peak(pcm)
-	}
-}
-
 // BenchmarkSegmentize measures cutting a 10-minute song observed every
 // 150 ms with a pause in the middle: about 4 000 observations, the most a
 // take normally holds.

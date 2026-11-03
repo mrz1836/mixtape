@@ -161,7 +161,9 @@ func (a *app) openSource(ctx context.Context, run *recordRun) (capture.Source, e
 	if err := a.requireCapturePermission(method); err != nil {
 		return nil, err
 	}
-	return a.deps.services.openCapture(ctx, captureRequest{Method: method, Device: run.settings.Device, Mute: f.mute})
+	return a.deps.services.openCapture(ctx, captureRequest{
+		Method: method, Device: run.settings.Device, Mute: f.mute, Bits: run.settings.Bits(),
+	})
 }
 
 // capturePermission is the permission capture method m needs.

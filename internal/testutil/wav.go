@@ -19,13 +19,34 @@ import (
 
 // WAV returns a complete PCM16 WAV file holding pcm (interleaved 16-bit
 // little-endian samples).
-func WAV(pcm []byte, rate, channels int) ([]byte, error) {
+func WAV(pcm []byte, rate, channels int) ([]byte, error) { return WAVBits(pcm, rate, channels, 16) }
+
+// WAVBits returns a complete WAV file holding pcm: interleaved
+// little-endian samples of bits bits (16, or 24 packed in three bytes).
+func WAVBits(pcm []byte, rate, channels, bits int) ([]byte, error) {
 	var b bytes.Buffer
-	if err := wav.WriteHeader(&b, int64(len(pcm)), rate, channels); err != nil {
+	if err := wav.WriteHeader(&b, int64(len(pcm)), rate, channels, bits); err != nil {
 		return nil, err
 	}
 	b.Write(pcm)
 	return b.Bytes(), nil
+}
+
+// Noise24 returns seconds of deterministic pseudo-random 24-bit stereo
+// PCM at rate Hz, about 12 dB below full scale: audio whose low byte is
+// busy, which a 16-bit path or a lossy encoder cannot keep exactly.
+func Noise24(rate int, seconds float64) []byte {
+	n := int(seconds*float64(rate)) * 2
+	pcm := make([]byte, 0, n*3)
+	x := uint32(2463534242)
+	for range n {
+		x ^= x << 13
+		x ^= x >> 17
+		x ^= x << 5
+		v := int32(x) >> 10                                 //nolint:gosec // G115: any bits make a sample
+		pcm = append(pcm, byte(v), byte(v>>8), byte(v>>16)) //nolint:gosec // G115: the three low bytes of a 24-bit sample
+	}
+	return pcm
 }
 
 // Sine returns d of a stereo sine wave at freq Hz as PCM16 samples.

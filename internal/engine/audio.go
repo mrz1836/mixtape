@@ -2,7 +2,6 @@ package engine
 
 import (
 	"context"
-	"encoding/binary"
 	"fmt"
 	"time"
 
@@ -48,7 +47,8 @@ func (e *Engine) stopCapture() {
 // sink receives captured blocks on the capture goroutine: it spools them
 // and tracks when audio was last above the silence floor.
 func (e *Engine) sink(b capture.Block) {
-	if peak(b.PCM[:min(len(b.PCM), b.Frames*e.cfg.Source.Format().BytesPerFrame())]) > silenceFloor {
+	f := e.cfg.Source.Format()
+	if capture.Peak(b.PCM[:min(len(b.PCM), b.Frames*f.BytesPerFrame())], f) > silenceFloor {
 		e.loudAt.Store(int64(b.At.Sub(e.capStart)))
 	}
 	e.spoolMu.Lock()
@@ -70,19 +70,6 @@ func (e *Engine) checkSpool() {
 	if err != nil && e.fatal == nil {
 		e.fail(fmt.Errorf("%w: %w", ErrSpoolWrite, err))
 	}
-}
-
-// peak returns the largest absolute sample in interleaved PCM16LE data.
-func peak(pcm []byte) int {
-	m := 0
-	for i := 0; i+1 < len(pcm); i += 2 {
-		v := int(binary.LittleEndian.Uint16(pcm[i:]))
-		if v >= 1<<15 {
-			v = 1<<16 - v // two's complement: the magnitude of a negative sample
-		}
-		m = max(m, v)
-	}
-	return m
 }
 
 // spoolFrames is the number of frames captured so far.
