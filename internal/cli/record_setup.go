@@ -68,7 +68,7 @@ func (a *app) record(ctx context.Context, run *recordRun) error {
 	defer stopGuard()
 
 	run.player = svc.player()
-	pending, _ := a.recoverSpotify(setupCtx, run.player) // even when nothing plays: a copy-only run must not lose it
+	pending, _ := a.recoverSpotify(setupCtx, run.player, true) // even when nothing plays: a copy-only run must not lose it
 	run.pendingOutput = a.recoverOutput(setupCtx, a.plannedCapture(run, playback), run.settings.OutputRate)
 	unlock, err := run.lib.Lock()
 	if err != nil {
@@ -222,11 +222,12 @@ func (a *app) selectCapture(s config.Settings) (capture.Method, error) {
 }
 
 // recoverSpotify puts back Spotify settings an interrupted session left
-// changed, and returns the names of those it put back. The recorder lock
-// is held, so that session is gone. What it cannot put back yet (Spotify
-// is closed, or did not answer) is returned as pending: the new session
-// keeps it and restores it when it ends.
-func (a *app) recoverSpotify(ctx context.Context, p player) (pending *session.SpotifyState, restored []string) {
+// changed, and returns the names of those it put back (and, with announce,
+// says so in a warning). The recorder lock is held, so that session is
+// gone. What it cannot put back yet (Spotify is closed, or did not answer)
+// is returned as pending: the new session keeps it and restores it when it
+// ends.
+func (a *app) recoverSpotify(ctx context.Context, p player, announce bool) (pending *session.SpotifyState, restored []string) {
 	st, err := session.ReadState(a.home)
 	if err != nil || !st.Spotify.NeedsRestore() {
 		return nil, nil
@@ -243,7 +244,7 @@ func (a *app) recoverSpotify(ctx context.Context, p player) (pending *session.Sp
 	// settings still pending, sees Spotify no longer holds what was set,
 	// and leaves them alone.
 	_ = session.WriteState(a.home, st)
-	if len(restored) > 0 {
+	if announce && len(restored) > 0 {
 		a.out.Warn("restored Spotify %s changed by interrupted session %s", strings.Join(restored, ", "), st.ID)
 	}
 	return nil, restored

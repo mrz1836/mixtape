@@ -181,6 +181,7 @@ func TestStopWithNothingRunningPutsBackWhatWasLeft(t *testing.T) {
 	h.world.player.snap = spotify.Snapshot{Shuffle: false, Repeat: true, Volume: 100}
 
 	require.Equal(t, ExitOK, h.run("stop"), h.stderr.String())
+	assert.Empty(t, h.warnings(), "the result names what was put back: no warning repeats it")
 	doc := h.json()
 	assert.Equal(t, false, doc["stopping"])
 	assert.Equal(t, []any{"output MacBook Pro Speakers back to 48000 Hz", "Spotify shuffle", "Spotify repeat"}, doc["restored"])

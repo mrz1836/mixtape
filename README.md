@@ -350,8 +350,8 @@ rate, the recording is a transparent copy of that sound.
 | `codec` | What is saved | Size of a 4-minute song |
 |---|---|---|
 | `alac` (default) | Apple Lossless, 24-bit capture | about 30–40 MB (7–10 MB a minute) |
-| `alac` with `bit_depth 16` | Apple Lossless, 16-bit | about 15 MB |
-| `aac` | AAC at `aac_bitrate` (256 kb/s), 16-bit capture | about 7.5 MB |
+| `alac` with `bit_depth 16` | Apple Lossless, 16-bit | about 20 MB (5 MB a minute) |
+| `aac` | AAC at `aac_bitrate` (256 kb/s), 16-bit capture | about 7.5 MB (1.9 MB a minute) |
 
 Each setting has an `MIXTAPE_*` variable and a `record` flag of the same name
 (`--codec`, `--aac-bitrate`, …); `mixtape config set codec aac` changes the
@@ -444,7 +444,7 @@ set artwork true`).
   library cannot be read; podcasts and audiobooks are not supported.
 - **What Spotify plays, not its file.** A recording is Spotify's decoded sound
   (see [Sound quality](#sound-quality)). On a MacBook Pro's built-in speakers
-  (macOS 15) the process tap rolls the very top off: flat to 18 kHz, about
+  (macOS 15.8) the process tap rolls the very top off: flat to 18 kHz, about
   2.5 dB down at 20 kHz. Through BlackHole the samples arrive bit for bit.
 - One recording session at a time per Mac.
 

@@ -434,7 +434,7 @@ func (a *app) restoreLeftovers(ctx context.Context) error {
 		}
 	}
 	if st, err := session.ReadState(a.home); err == nil && st.Spotify.NeedsRestore() {
-		_, names := a.recoverSpotify(ctx, a.deps.services.player())
+		_, names := a.recoverSpotify(ctx, a.deps.services.player(), false) // the result names them
 		for _, n := range names {
 			restored = append(restored, "Spotify "+n)
 		}

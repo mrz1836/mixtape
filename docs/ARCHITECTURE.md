@@ -181,7 +181,7 @@ fixture `internal/engine/testdata/trace-complete.ndjson`.
 | Settings writes | `set shuffling`/`set repeating` take effect, but a read in the same script still returns the old value | settings are read back on the next observation, never right after a write |
 | Process tap | delivers callbacks (512 frames at 48 kHz, every 10.7 ms) of pure zeros until the host app has *System Audio Recording* permission | the silence watchdog, exit 5 |
 
-Measured on a MacBook Pro (M1 Max, macOS 15.6), for the output rate and the
+Measured on a MacBook Pro (M1 Max, macOS 15.8), for the output rate and the
 lossless path:
 
 | Behavior | Measurement | Consequence |
@@ -189,7 +189,7 @@ lossless path:
 | Rate switch | setting the speakers' nominal rate returns at once; it reads back after ~55 ms, the device announces it after ~100 ms; they offer 44.1, 48, 88.2 and 96 kHz | wait for the announcement and the read-back (2 s each at most) |
 | A call app on the speakers | with Microsoft Teams holding the speakers, the rate went back to 48 kHz ~220 ms after a switch to 44.1 kHz | a 500 ms settle and a second read catch it: warn, record at the device's rate, never fight it |
 | Tap transparency | through the built-in speakers' tap, a test signal comes back flat (±0.01 dB) to 18 kHz, −2.5 dB at 20 kHz, −18 dB at 21 kHz, at 48 kHz, with drift compensation on or off; the same floats played into BlackHole read back bit for bit | the tap is transparent below the top octave's last few kHz; BlackHole is bit-exact |
-| ALAC | `afconvert -f m4af -d alac` from a plain 44-byte PCM header takes the WAV's depth ("from 24-bit source") and decodes bit-exact at 16 and 24 bits, 44.1 and 48 kHz; tagging leaves the `mdat` hash alone | no `WAVE_FORMAT_EXTENSIBLE`, no explicit depth flag |
+| ALAC | `afconvert -f m4af -d alac` from a plain 44-byte PCM header takes the WAV's depth ("from 24-bit source") and decodes bit-exact at 16 and 24 bits, 44.1 and 48 kHz; tagging leaves the `mdat` hash alone. A 24-bit capture of Spotify came to 9.5 MB a minute (99.6 % of samples with a busy low byte), a 16-bit one to 4.9 MB | no `WAVE_FORMAT_EXTENSIBLE`, no explicit depth flag |
 | AAC bit rate | `-b` lands on target for noise (128 → 127 kb/s, 320 → 326 kb/s); below 96 kb/s the encoder drops to 32 kHz | `aac_bitrate` 64–320, documented |
 | Encoder listing | `afconvert -hf` exits 2 even when it lists everything; inside a sandbox it lists no data formats for `m4af` | doctor parses the listing, ignores the exit code, and warns rather than fails |
 
