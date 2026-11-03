@@ -219,6 +219,9 @@ type takeState struct {
 	prevAt    time.Time
 	waiting   *request
 	follow    *followState
+	// movedOff is the track mixtape just moved Spotify away from (see
+	// moveOff and stillLeaving).
+	movedOff string
 	// earlyEnds holds how early (seconds before their end) consecutive
 	// songs changed on their own, to recognize crossfade.
 	earlyEnds []float64

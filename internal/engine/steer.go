@@ -235,7 +235,6 @@ type followState struct {
 	second     string
 	lastID     string // the previous track seen while following
 	skipNextOf string // press next when this track begins
-	notYet     string // the track mixtape just moved Spotify away from
 	startedAt  time.Time
 }
 
@@ -268,8 +267,8 @@ func (e *Engine) steerFollow(ctx context.Context, s spotify.Snapshot) bool {
 	// Play the playlist from its top, or from its last known song, which
 	// is then skipped: following picks up right after it. Until Spotify
 	// switches, it can still report the track that played before (in its
-	// own context): that is no song of the playlist (see notYet).
-	fs.notYet = s.Track.ID
+	// own context): that is no song of the playlist (see stillLeaving).
+	e.movedOff = s.Track.ID
 	uri, in := g.ContextURI, ""
 	if n := len(g.Items); n > 0 {
 		last := g.Items[n-1]
@@ -337,17 +336,8 @@ func (e *Engine) groupIndex(g *Group) int {
 func (e *Engine) followTrack(ctx context.Context, s spotify.Snapshot) *Item {
 	fs := e.follow
 	id := s.Track.ID
-	if notYet := fs.notYet; notYet != "" {
-		fs.notYet = "" // only the first track after the switch can be the old one
-		if id == notYet {
-			return nil
-		}
-	}
-	// moveOn presses next. Spotify can report the track it leaves once
-	// more before the next one: that is no new take of it.
-	moveOn := func() {
-		fs.notYet = id
-		e.next(ctx)
+	if e.stillLeaving(id) {
+		return nil
 	}
 	prev := fs.lastID
 	fs.lastID = id
@@ -356,7 +346,7 @@ func (e *Engine) followTrack(ctx context.Context, s spotify.Snapshot) *Item {
 		return nil
 	case id == fs.skipNextOf:
 		fs.skipNextOf = ""
-		moveOn()
+		e.moveOff(ctx, id)
 		return nil
 	case fs.looped(prev, id):
 		// Looped: the whole playlist has been seen. Steering follows the
@@ -370,7 +360,7 @@ func (e *Engine) followTrack(ctx context.Context, s spotify.Snapshot) *Item {
 	}
 	if it := fs.group.find(id); it != nil {
 		if it.state != itemPending {
-			moveOn() // known and handled
+			e.moveOff(ctx, id) // known and handled
 		}
 		return nil
 	}
@@ -400,11 +390,32 @@ func (e *Engine) next(ctx context.Context) {
 	e.command(ctx, "next", e.cfg.Player.Next)
 }
 
+// moveOff presses next to leave track id, a song mixtape does not record
+// now. Until Spotify switches it can report id once more, which is no new
+// take of it (see stillLeaving).
+func (e *Engine) moveOff(ctx context.Context, id string) {
+	e.movedOff = id
+	e.next(ctx)
+}
+
+// stillLeaving reports whether id is the track mixtape just moved Spotify
+// away from, reported once more before the switch. Only the first track
+// reported after the switch can be: the mark is cleared either way.
+func (e *Engine) stillLeaving(id string) bool {
+	left := e.movedOff
+	e.movedOff = ""
+	return left != "" && id == left
+}
+
 // ---------- live mode ----------
 
 // beginLive decides what to do with a track in live mode: record it,
 // leave it alone (--match), or skip it once the library says it is done.
 func (e *Engine) beginLive(ctx context.Context, t *take, s spotify.Snapshot) {
+	if e.stillLeaving(s.Track.ID) {
+		t.passive = true
+		return
+	}
 	if m := e.opts.Match; m != "" && !strings.Contains(strings.ToLower(s.Track.Name), strings.ToLower(m)) {
 		t.passive = true
 		return
@@ -429,7 +440,7 @@ func (e *Engine) beginLive(ctx context.Context, t *take, s spotify.Snapshot) {
 	case it.state == itemDone && it.retake:
 		it.state, it.retake = itemPending, false // cut short before, played again now
 	case it.state != itemPending:
-		e.next(ctx) // already handled this session
+		e.moveOff(ctx, s.Track.ID) // already handled this session
 		return
 	}
 	e.beginRecording(ctx, t, it, s)
@@ -452,7 +463,7 @@ func (e *Engine) onLookup(ctx context.Context, r result) {
 	}
 	if t := e.cur; t != nil && t.item == it {
 		t.recording, t.item = false, nil
-		e.next(ctx)
+		e.moveOff(ctx, t.track.ID)
 	}
 }
 
