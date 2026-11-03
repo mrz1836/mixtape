@@ -51,7 +51,7 @@
 ## What it does
 
 Point Mixtape at a Spotify link and it records the songs into your library, one
-tagged M4A per song, named after the song:
+tagged, lossless M4A per song, named after the song:
 
 ```bash
 mixtape record https://open.spotify.com/playlist/37i9dQZF1DXcBWIGoYBM5M
@@ -61,6 +61,10 @@ mixtape record https://open.spotify.com/playlist/37i9dQZF1DXcBWIGoYBM5M
   recorded for another playlist are copied over instantly; a stopped session
   picks up where it left off. Files carry the Spotify ID and an audio hash, so
   they are recognized even after renames.
+- **Lossless.** Songs are saved as Apple Lossless (ALAC) from a 24-bit
+  capture, so nothing is lost after Spotify's own output; `--codec aac` saves
+  256 kb/s AAC instead, at a quarter of the size. See
+  [Sound quality](#sound-quality).
 - **Exact cuts, complete songs.** Every song is cut out of a continuous capture
   by matching Spotify's playback position to the audio, to within a few
   milliseconds. Pauses are cut out (Spotify fades the sound out and back in
@@ -171,8 +175,8 @@ matter:
   (the Mac's volume does not matter). With the process tap, `--mute` does
   this for you and silences the speakers while it records.
 - **Streaming quality as high as your account allows:** Settings → Audio
-  quality → *Streaming quality*. *Automatic* can drop the quality mid-song on
-  a slow connection.
+  quality → *Streaming quality* (*Lossless* where your plan has it).
+  *Automatic* can drop the quality mid-song on a slow connection.
 - **Normalize volume and the equalizer:** both change the sound that is
   recorded. Turn them off to keep each song as it was mastered.
 - **Play on this Mac:** with Spotify Connect playing on another device, no
@@ -220,7 +224,7 @@ mixtape verify             # files, tags and audio hashes against the manifests
 | Recording | `record [LINK…]` | Record tracks, albums, playlists; no links: whatever plays |
 | | `status [--follow]` | The running (or last) session: progress, current song, ETA |
 | | `wait [--timeout D]` | Block until the session ends; exit with its result (124: still running) |
-| | `stop [--no-wait]` | Stop the running session gracefully and print the summary |
+| | `stop [--no-wait]` | Stop the running session gracefully and print the summary; with none running, put back what a crashed one left changed |
 | Library | `list [LINK]` (`ls`) | Folders, or the status of each song of a link |
 | | `verify [--fix]` | Check files, tags and audio hashes; repair manifests |
 | Setup | `setup` | Guided onboarding |
@@ -291,9 +295,9 @@ observation every 150 ms). Every observation and every audio block carries a
 time on the same clock, so each reported position pins the song's start to
 an exact frame; the median over many observations is accurate to
 milliseconds, measured at about 2–4 ms on real sessions. When a song ends, its
-frames are cut out (pauses removed), encoded with `afconvert` to 256 kb/s AAC,
-tagged, hashed, and written atomically into the library with its manifest and
-`.m3u8`.
+frames are cut out (pauses removed), encoded with `afconvert` (lossless ALAC by
+default, or AAC), tagged, hashed, and written atomically into the library with
+its manifest and `.m3u8`.
 
 For a list of links Mixtape plays each song in its album or playlist context,
 so the songs flow on naturally, and steps in only when Spotify plays
@@ -336,6 +340,47 @@ once with exit 5 and this fix.
 your speakers and *BlackHole 2ch* (speakers first, as the clock source), and
 choose it as the sound output. `mixtape doctor` checks the routing.
 
+### Sound quality
+
+Mixtape records what Spotify plays: the decoded sound on its way to the
+speakers, never Spotify's own file. With Spotify's volume at 100 %, *Normalize
+volume* and the equalizer off, a 24-bit capture and the output at Spotify's
+rate, the recording is a transparent copy of that sound.
+
+| `codec` | What is saved | Size of a 4-minute song |
+|---|---|---|
+| `alac` (default) | Apple Lossless, 24-bit capture | about 30–40 MB (7–10 MB a minute) |
+| `alac` with `bit_depth 16` | Apple Lossless, 16-bit | about 15 MB |
+| `aac` | AAC at `aac_bitrate` (256 kb/s), 16-bit capture | about 7.5 MB |
+
+Each setting has an `MIXTAPE_*` variable and a `record` flag of the same name
+(`--codec`, `--aac-bitrate`, …); `mixtape config set codec aac` changes the
+default:
+
+| Setting | Default | Values |
+|---|---|---|
+| `codec` | `alac` | `alac` (lossless), `aac` |
+| `aac_bitrate` | `256` | kb/s from 64 to 320, for `aac` only (below 96, Apple's encoder drops to 32 kHz) |
+| `bit_depth` | `auto` | `auto` (24-bit for ALAC, 16-bit for AAC), `16`, `24` |
+| `copy_codec` | `same` | `same`: copy a song found in another folder only in the codec this run records, else record it; `any`: copy it in any codec |
+| `output_rate` | `keep` | `keep`, or a rate in Hz the output device offers, such as `44100` (process tap only) |
+
+**The output rate.** Spotify plays at 44.1 kHz, and most Macs run their
+speakers at 48 kHz, so Spotify resamples every song before Mixtape hears it.
+`--output-rate 44100` runs the speakers at 44.1 kHz for the session and puts
+them back afterwards, even after a crash (`mixtape stop` or the next
+`mixtape record` does it; `mixtape doctor` shows it). A call app holding the
+speakers (Teams, Zoom) can set the rate back at once: Mixtape then says so and
+records at the speakers' rate. With BlackHole the setting does nothing: the
+Multi-Output Device sets that rate.
+
+**Upgrading from 0.1.** Songs you already have stay as they are (AAC). New
+recordings are 24-bit ALAC. A song already in its folder is never recorded
+again because the codec changed (`--redo` does that); a song found only as AAC
+in another folder is recorded in ALAC rather than copied (`record --dry-run` and
+`list <link>` show `other_codec`). `mixtape config set codec aac` gives the old
+behavior, and `copy_codec any` keeps copying AAC files.
+
 ### The library
 
 ```
@@ -373,6 +418,10 @@ set artwork true`).
 | `Liked Songs … are private to your account` (exit 2) | Mixtape cannot read your library's track lists. Add the songs to a playlist and link that, or play them in Spotify and run `mixtape record` with no link. |
 | `not allowed to control Spotify` (exit 5) | System Settings → Privacy & Security → Automation → your terminal app → enable Spotify. |
 | Recordings are quiet | Set Spotify's volume slider to the maximum, or record with `--mute` (process tap). |
+| Songs take far more space than before | They are lossless ALAC now. `mixtape config set codec aac` for 256 kb/s AAC, or `bit_depth 16` for smaller lossless files. |
+| doctor: `afconvert does not list the ALAC encoder here` | Run mixtape from a normal terminal session: a sandbox hides the encoders. A song that fails to encode keeps its WAV and is encoded on the next run. |
+| `could not run … at 44100 Hz (another app set the output rate back)` | A call app (Teams, Zoom) holds the speakers at its rate. Quit it, or record without `output_rate`. |
+| The speakers stayed at another rate after a crash | `mixtape stop` puts them back (so does the next `mixtape record`). |
 | A long session stopped overnight | The Mac slept: keep the lid open (or use an external display) and leave it on power. |
 | `another mixtape recording session is running` (exit 6) | `mixtape status`, then `mixtape stop`. |
 | A song keeps failing | `mixtape list <link>` shows the reason. Songs unavailable in your country are marked `unavailable`. |
@@ -393,6 +442,10 @@ set artwork true`).
   falls back to the oEmbed endpoint (the name only) and follows the playlist
   the same way. Private playlists, Liked Songs and the rest of your own
   library cannot be read; podcasts and audiobooks are not supported.
+- **What Spotify plays, not its file.** A recording is Spotify's decoded sound
+  (see [Sound quality](#sound-quality)). On a MacBook Pro's built-in speakers
+  (macOS 15) the process tap rolls the very top off: flat to 18 kHz, about
+  2.5 dB down at 20 kHz. Through BlackHole the samples arrive bit for bit.
 - One recording session at a time per Mac.
 
 <br/>
@@ -426,7 +479,7 @@ Before a commit, run the four checks in order: `magex format:fix`,
 Tests never touch Spotify or Core Audio: the engine runs against a simulated
 Spotify and replays real timing traces (`internal/engine/testdata`), and the
 suite passes on Linux too, where CI runs it. Tests that encode real audio skip
-themselves when the AAC encoder is unavailable (off macOS, or inside a
+themselves when the ALAC or AAC encoder is unavailable (off macOS, or inside a
 sandbox).
 
 **Live testing** plays Spotify and opens real capture, so it runs only when
@@ -436,6 +489,7 @@ you ask for it, with Spotify playing on this Mac:
 magex build:dev                              # the build under test, as `mixtape`
 mixtape doctor                               # what this Mac is ready for
 MIXTAPE_LIVE_CAPTURE=1 magex test            # the suite plus the live tap and device captures
+MIXTAPE_LIVE_OUTPUT_RATE=1 magex test        # also switches the speakers' rate, and back
 mixtape debug trace --duration 2m            # a timing trace while you play, pause and skip
 
 # keep test recordings out of your real library and session state
@@ -455,23 +509,26 @@ magex bench:save time=2s out=bench.txt
 magex bench:compare old=before.txt new=after.txt
 ```
 
-Latest baseline — Apple M1 Max · darwin/arm64 · Go 1.26 · `time=2s`:
+Latest baseline — Apple M1 Max · darwin/arm64 · Go 1.27 · `time=2s`:
 
 | Benchmark | ns/op | B/op | allocs/op | Path covered |
 |---|--:|--:|--:|---|
-| `BenchmarkPeak` (`internal/engine`) | 966 | 0 | 0 | loudness check of every 10 ms capture block |
-| `BenchmarkAppend` (`internal/spool`) | 694 | 36 | 0 | spooling one 10 ms block (48 kHz stereo) |
+| `BenchmarkConvertF32/24-bit` (`internal/capture`) | 2,206 | 0 | 0 | converting one 10 ms Core Audio buffer to 24-bit PCM |
+| `BenchmarkPeak/16-bit` (`internal/capture`) | 901 | 0 | 0 | loudness check of every 10 ms capture block |
+| `BenchmarkPeak/24-bit` (`internal/capture`) | 962 | 0 | 0 | the same, at 24 bits |
+| `BenchmarkAppend` (`internal/spool`) | 769 | 35 | 0 | spooling one 10 ms block (48 kHz stereo) |
 | `BenchmarkFrameAt` (`internal/spool`) | 81 | 0 | 0 | time → frame in a 10-minute spool |
-| `BenchmarkReadRange` (`internal/spool`) | 3,911,532 | 262,922 | 10 | reading a 3-minute song back out |
-| `BenchmarkSegmentize` (`internal/engine`) | 219,410 | 523,980 | 35 | cutting a 10-minute song with a pause |
-| `BenchmarkTag` (`internal/mp4tag`) | 526,780 | 8,491,856 | 73 | retagging a 7.5 MB song with a cover |
-| `BenchmarkAudioSHA256` (`internal/mp4tag`) | 3,151,502 | 464 | 5 | hashing the same song's audio |
+| `BenchmarkReadRange` (`internal/spool`) | 4,109,575 | 262,911 | 10 | reading a 3-minute song back out |
+| `BenchmarkSegmentize` (`internal/engine`) | 241,013 | 523,980 | 35 | cutting a 10-minute song with a pause |
+| `BenchmarkTag` (`internal/mp4tag`) | 669,096 | 8,491,858 | 73 | retagging a 7.5 MB song with a cover, in memory |
+| `BenchmarkTagFile` (`internal/mp4tag`) | 5,300,652 | 926,078 | 83 | retagging a 40 MB ALAC song from disk, streamed |
+| `BenchmarkAudioSHA256` (`internal/mp4tag`) | 3,191,493 | 464 | 5 | hashing a 7.5 MB song's audio |
 
 > Local-machine numbers, not targets: compare runs on the same hardware.
-> Last measured: 2026-11-02
+> Last measured: 2026-11-03
 
-**Releasing.** Run `magex test:race` on a Mac first (the AAC tests skip on
-Linux CI), then `magex version:bump bump=patch branch=master push` tags and
+**Releasing.** Run `magex test:race` on a Mac first (the encoder tests skip
+on Linux CI, and the darwin-only code is not even compiled there), then `magex version:bump bump=patch branch=master push` tags and
 pushes the release. On the tag, GoFortress runs lint, tests and security scans,
 then builds both macOS binaries on a macOS runner (`RELEASE_RUNNER` in
 `.github/env/90-project.env`) and publishes them with GoReleaser.

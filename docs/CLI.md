@@ -72,7 +72,8 @@ mixtape record [LINK|URI...] [flags]
 ```
 
 Records the songs of each link that are not already in the library, one
-tagged M4A per song. Links are `open.spotify.com` URLs (share links with
+tagged M4A per song: lossless ALAC from a 24-bit capture by default, or AAC
+(`--codec aac`). Links are `open.spotify.com` URLs (share links with
 `?si=` are fine, `/intl-xx/` paths too) or `spotify:track|album|playlist:`
 URIs. Track links go to `Singles` (or `--into`); each album and playlist gets
 its own folder. With no links, mixtape records whatever Spotify plays (live
@@ -84,10 +85,14 @@ For each song the plan decides one action:
 
 | Action | When |
 |---|---|
-| `skip` | Already complete in this folder |
-| `copy` | Complete elsewhere in the library (or recorded earlier in this session): copied and retagged, no playback |
+| `skip` | Already complete in this folder, in whatever codec (a codec change never redoes a song; `--redo` does) |
+| `copy` | Complete elsewhere in the library (or recorded earlier in this session) in the codec this session records (`copy_codec same`), or in any codec (`copy_codec any`): copied and retagged, no playback |
 | `encode` | Recorded before but encoding failed: the kept WAV is encoded again |
-| `record` | Everything else. `hint: unavailable` marks songs the catalog says cannot play here; they are still tried |
+| `record` | Everything else. `hint: unavailable` marks songs the catalog says cannot play here; they are still tried. `reason: other_codec` marks a song the library holds elsewhere only in another codec |
+
+The codec of a song elsewhere is read from its file, not from a manifest, so
+the plan, a song decided during a live session, `--dry-run` and `list LINK`
+always agree.
 
 | Flag | Meaning |
 |---|---|
@@ -106,6 +111,11 @@ For each song the plan decides one action:
 | `--idle-timeout D` | End after D with nothing to record (default 10m; 0 = never) |
 | `--max-failures N` | End after N failed attempts in a row; a song is tried twice (default 3; 0 = never) |
 | `--allow-crossfade` | Record even though crossfade or automix is on (songs will overlap) |
+| `--codec alac\|aac` | Audio format of new songs (config `codec`). Not to be confused with `-o/--output`, which is how mixtape reports |
+| `--aac-bitrate KBPS` | AAC bit rate, 64 to 320 (config `aac_bitrate`) |
+| `--bit-depth auto\|16\|24` | Capture depth: `auto` is 24 for ALAC, 16 for AAC (config `bit_depth`) |
+| `--copy-codec same\|any` | Which songs elsewhere are copied (config `copy_codec`) |
+| `--output-rate keep\|HZ` | Tap only: run the default output at HZ while recording, then put it back (config `output_rate`) |
 
 **Before anything plays** mixtape checks that Spotify is installed and
 running, crossfade and automix are off, afconvert exists, no other session
@@ -115,7 +125,13 @@ would be silent). When every song is already done, nothing plays and none of
 that is needed.
 
 **During the session** shuffle is turned off (and repeat on, to follow a
-long playlist), and restored at the end. Spotify is paused when the queue is
+long playlist), and restored at the end. With `output_rate` the default output
+runs at that rate (process tap only): what to undo is saved before anything
+changes, the original rate comes back at the end (only if the device still
+runs at the rate set: a change made since wins), and after a crash the next
+`record` or `mixtape stop` puts it back. A device that does not offer the
+rate, or an app that sets it straight back (a call app holding the speakers),
+is a warning, and the session records at the rate the device has. Spotify is paused when the queue is
 done, and the Mac is kept from idle-sleeping until then (closing the lid
 still sleeps it). Songs that were not captured start to finish are discarded
 and retried once. A false start (Spotify jumping elsewhere before the song
@@ -146,11 +162,17 @@ stop; SIGHUP and SIGPIPE are ignored.
     {"action": "record", "id": "56o35W5Xr5AimZqAHjeNGh", "title": "Queen Anne's Lace", "artist": "Radon",
      "collection": "Singles", "position": 1, "duration_ms": 200293},
     {"action": "copy", "id": "7gK6ZSHZVnigjKdmsXE8Hi", "title": "Cloudy", "artist": "Funkmammoth",
-     "collection": "Road Trip", "position": 2, "duration_ms": 176170, "from": "Singles/Funkmammoth-Cloudy.m4a"}
+     "collection": "Road Trip", "position": 2, "duration_ms": 176170, "from": "Singles/Funkmammoth-Cloudy.m4a"},
+    {"action": "record", "id": "4cOdK2wGLETKBW3PvgPWqT", "title": "Never Gonna Give You Up", "artist": "Rick Astley",
+     "collection": "Road Trip", "position": 3, "duration_ms": 213573, "reason": "other_codec"}
   ],
-  "counts": {"record": 1, "copy": 1}
+  "counts": {"record": 2, "copy": 1}
 }
 ```
+
+`reason` appears only when it applies: `other_codec` means the song is in the
+library elsewhere, but only in another codec than this session records, and
+`copy_codec` is `same`.
 
 `mode` is `queue`, `follow` (a playlist past the embed page's 100-track
 list, followed in Spotify), or `live`.
@@ -163,11 +185,11 @@ One compact JSON object per line on stdout, also appended to
 
 | `type` | Fields | Meaning |
 |---|---|---|
-| `session_started` | `mode`, `capture`, `library`, `pid` | The session began |
+| `session_started` | `mode`, `capture`, `library`, `pid`, `codec`, `bit_depth`, `sample_rate` | The session began. `codec` is what it encodes to; `bit_depth` and `sample_rate` describe the capture, and are absent when nothing plays |
 | `plan` | `items[]` (as in the dry run) | What will happen |
 | `track_started` | `track` | A song began recording from the top; sent once Spotify has played its first 2 seconds, so a false start (Spotify resuming elsewhere first) sends nothing |
-| `track_saved` | `track` with `file`, `recorded_ms`, `audio_sha256`, `partial` | A song is in the library |
-| `track_copied` | `track` with `file`, `copied_from` | A song was copied from another folder |
+| `track_saved` | `track` with `file`, `recorded_ms`, `audio_sha256`, `codec`, `partial` | A song is in the library |
+| `track_copied` | `track` with `file`, `copied_from`, `codec` | A song was copied from another folder |
 | `track_skipped` | `track`, `reason` | Already done, or skipped by you |
 | `track_discarded` | `track`, `reason` | A take was incomplete; it is retried once |
 | `track_failed` | `track`, `reason` | Given up for this session (marked in the manifest) |
@@ -222,7 +244,7 @@ true), where `session` is `session.json`:
   "started_at": "2026-11-02T15:01:57Z",
   "updated_at": "2026-11-02T15:02:05Z",
   "library": "/Users/you/Music/Mixtape",
-  "capture": "device (BlackHole 2ch)",
+  "capture": "device (BlackHole 2ch, 24-bit 48 kHz)",
   "targets": ["spotify:track:56o35W5Xr5AimZqAHjeNGh"],
   "current": {"track_id": "56o35W5Xr5AimZqAHjeNGh", "title": "Queen Anne's Lace", "artist": "Radon",
               "collection": "Singles", "position_seconds": 5.1, "duration_seconds": 200.293, "recording": true},
@@ -265,7 +287,13 @@ settings restored. `--no-wait` returns once the signal is sent, with
 `{"stopping": true, "session_id", "pid"}`. A session that ended just before
 the signal is reported as it finished. When the recorder lock cannot be read
 until the 2 minutes are up, `stop` reports that error rather than success.
-Nothing running exits 4.
+
+With no session running, `stop` takes the recorder lock and puts back what an
+interrupted session left changed: the output device's rate (`output_rate`) and
+Spotify's shuffle, repeat and volume, where they still hold what that session
+set. It prints `{"stopping": false, "restored": ["output MacBook Pro Speakers
+back to 48000 Hz", "Spotify shuffle"]}` and exits 0. With nothing to put back
+either, it exits 4.
 
 <br>
 
@@ -280,9 +308,12 @@ pending and failed (`{"library", "collections": [{folder, kind, name,
 spotify_id, url, songs, done, pending, failed, updated_at}]}`).
 
 With a link: each song with its status in the library (`recorded`, `copied`,
-`partial`, `pending`, `failed`, `unavailable`, `encode_failed`, or `new`) and
-what the next `record` would do (`next_action`: `skip`, `copy`, `encode`,
-`record`).
+`partial`, `pending`, `failed`, `unavailable`, `encode_failed`, or `new`),
+the `codec` of its file in that folder, and what the next `record` would do
+(`next_action`: `skip`, `copy`, `encode`, `record`, with `reason:
+other_codec` as in the plan). `{"library", "collection", "name", "tracks":
+[{position, id, title, artist, status, next_action, reason, file, codec,
+fail_reason}]}`.
 
 ## verify
 
@@ -338,8 +369,14 @@ mixtape doctor
 detail, fix}]}` with `status` `ok`, `warn`, `fail` or `skip`. Check IDs:
 `macos`, `config`, `spotify_installed`, `spotify_running`, `automation`,
 `crossfade`, `volume`, `capture`, `tap`, `system_audio_recording` (tap),
-`device`, `routing`, `microphone` (device), `afconvert`, `library`,
-`session`. Exits 3 when any check fails; warnings do not block. Doctor never
+`device`, `routing`, `microphone` (device), `output`, `afconvert`,
+`encoder`, `library`, `session`. Exits 3 when any check fails; warnings do
+not block. `output` names the default output device and its rate, and warns
+when `output_rate` cannot apply (not the tap, or a rate the device does not
+offer). `encoder` warns when afconvert does not list the encoder for `codec`
+(a sandbox hides them). `session` also warns about a rate or Spotify settings
+a session left changed, whatever way it ended (`mixtape stop` puts them
+back). Doctor never
 shows a permission prompt: an undecided Automation permission is a warning.
 When macOS will not list the running apps, `spotify_running` is a warning
 ("could not check Spotify") and Spotify is asked directly, which never
@@ -372,6 +409,14 @@ warnings.
 | `artwork` | `MIXTAPE_ARTWORK` | `false` | Embed album artwork |
 | `idle_timeout` | `MIXTAPE_IDLE_TIMEOUT` | `10m0s` | End a session after this long with nothing to record |
 | `max_failures` | `MIXTAPE_MAX_FAILURES` | `3` | End a session after this many failed attempts in a row; a song is tried twice (0 = never) |
+| `codec` | `MIXTAPE_CODEC` | `alac` | Format of new recordings: `alac` (lossless) or `aac` |
+| `aac_bitrate` | `MIXTAPE_AAC_BITRATE` | `256` | AAC bit rate in kb/s, 64 to 320 (`codec aac` only; below 96 Apple's encoder drops to 32 kHz) |
+| `bit_depth` | `MIXTAPE_BIT_DEPTH` | `auto` | Capture depth: `auto` (24-bit for ALAC, 16-bit for AAC), `16` or `24` |
+| `copy_codec` | `MIXTAPE_COPY_CODEC` | `same` | `same`: copy a song found elsewhere only in `codec`, else record it; `any`: copy it in any codec |
+| `output_rate` | `MIXTAPE_OUTPUT_RATE` | `keep` | `keep`, or a rate in Hz to run the default output at while the process tap records (such as `44100`) |
+
+`bit_depth` and `output_rate` take a word or a number: the file may hold
+either `"24"` or `24`, and `config set` writes numbers as numbers.
 
 Other environment variables: `MIXTAPE_HOME`, `MIXTAPE_OUTPUT`, `NO_COLOR`,
 `MIXTAPE_GITHUB_TOKEN` (a GitHub token for `update`, which otherwise uses a
@@ -415,6 +460,7 @@ README shows how to load it.
 | `~/.mixtape/spool/` | Captured audio of the running session (deleted at the end) |
 | `~/.mixtape/work/` | Encoding scratch; `failed/` keeps WAVs whose encode (or tagging) failed, for the next run |
 | `~/Library/Caches/mixtape/recorder.lock` | The recorder lock |
+| `~/Library/Caches/mixtape/output-restore.json` | An output rate a session switched and has not put back yet (per user, whatever `--home`) |
 | `~/Library/Application Support/mixtape/` | The passive update check's cache |
 | `<library>/<Folder>/mixtape.json` | A folder's manifest |
 | `<library>/<Folder>/<Folder>.m3u8` | The folder's playlist, in collection order |
@@ -434,8 +480,8 @@ README shows how to load it.
   "tracks": [
     {"position": 1, "requested_id": "…", "played_id": "…", "title": "…", "artist": "…", "album": "…",
      "album_artist": "…", "duration_ms": 213573, "status": "recorded", "file": "Artist-Title.m4a",
-     "recorded_ms": 213573, "audio_sha256": "…", "recorded_at": "…", "track_number": 1, "disc_number": 1,
-     "release_date": "1987-07-27"}
+     "recorded_ms": 213573, "audio_sha256": "…", "codec": "alac", "recorded_at": "…", "track_number": 1,
+     "disc_number": 1, "release_date": "1987-07-27"}
   ]
 }
 ```
@@ -443,4 +489,6 @@ README shows how to load it.
 `kind` is `playlist`, `album`, `singles` or `folder`. Track `status` is
 `pending`, `recorded`, `copied`, `unavailable`, `failed`, `encode_failed` or
 `removed` (left the collection; the file is kept), with `fail_reason`,
-`copied_from`, `partial` and `pending_wav` when they apply.
+`copied_from`, `partial` and `pending_wav` when they apply. `codec` (`alac` or
+`aac`) caches the codec of the file; songs stored before mixtape recorded ALAC
+have none, and the file is what counts.

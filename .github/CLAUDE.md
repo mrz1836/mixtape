@@ -9,7 +9,8 @@
 ## What this project is
 
 `mixtape` is a macOS CLI that records Spotify tracks, albums and playlists into
-tagged, per-song M4A files. It captures audio (a Core Audio process tap, or a
+tagged, per-song M4A files (lossless ALAC from a 24-bit capture by default, or
+AAC). It captures audio (a Core Audio process tap, or a
 capture device such as BlackHole), follows Spotify over AppleScript, cuts each
 song out of a spooled capture by matching Spotify's position to the audio, and
 stores it in a library with manifests, `.m3u8` playlists and audio hashes.
@@ -34,18 +35,18 @@ stores it in a library with manifests, `.m3u8` playlists and audio hashes.
 | `internal/cli` | cobra tree, output (text/JSON/NDJSON), error → exit-code mapping, commands |
 | `internal/config` | `config.json` + `MIXTAPE_*` env + flags, with value sources |
 | `internal/spotify` | link parsing, AppleScript player, catalog (embed/oEmbed), prefs |
-| `internal/capture` | backend-neutral types, method selection and the shared source lifecycle (no cgo) |
-| `internal/capture/tap` | Core Audio process tap (ObjC, C ring) |
-| `internal/capture/device` | malgo capture device |
+| `internal/capture` | backend-neutral types, method selection, the shared source lifecycle, Float32 → 16/24-bit PCM, and the output rate switch logic (no cgo) |
+| `internal/capture/tap` | Core Audio process tap (ObjC, Float32 C ring) and output device rate control |
+| `internal/capture/device` | malgo capture device (Float32, converted in Go) |
 | `internal/spool` | chunked PCM spool with a time index |
 | `internal/engine` | plan, steer, segment (pure), commit worker |
 | `internal/library` | folders, manifests, naming, encode/tag/hash, verify |
-| `internal/mp4tag` | pure-Go MP4 tags (`ilst`, `----` freeform, `covr`, `mdat` hash) |
-| `internal/session` | recorder lock, `session.json`, event log, detach, Spotify restore |
+| `internal/mp4tag` | pure-Go MP4 tags (`ilst`, `----` freeform, `covr`, `mdat` hash), the codec of a file, streamed retagging |
+| `internal/session` | recorder lock, `session.json`, event log, detach, Spotify restore, the output rate to put back |
 | `internal/permission` | macOS privacy permissions of the host app: check, prompt, Settings deep links (C) |
 | `internal/fileutil` | atomic writes and copies |
-| `internal/wav` | PCM16 WAV header |
-| `internal/testutil` | test-only: synthetic M4A/WAV files, a stand-in encoder, AAC and live-capture skips |
+| `internal/wav` | 16- and 24-bit PCM WAV header |
+| `internal/testutil` | test-only: synthetic M4A/WAV files, a stand-in encoder, encoder and live-capture skips |
 
 <br>
 
@@ -66,13 +67,15 @@ This repo uses MAGE-X, not raw `go` invocations. Full reference:
 `magex build` injects `version`, `commit` and `buildDate` through the ldflags in
 [../.mage.yaml](../.mage.yaml); `mixtape version` prints them.
 
-**Sandboxes.** Tests that encode real AAC skip themselves when `afconvert`
-cannot see its AAC encoder (it can't inside an agent sandbox); run the suite
-outside the sandbox before calling a change done. Never run anything that
+**Sandboxes.** Tests that encode real ALAC or AAC skip themselves when
+`afconvert` cannot see the encoder (it can't inside an agent sandbox), and
+Core Audio hides the output devices there too; run the suite outside the
+sandbox before calling a change done. Never run anything that
 plays Spotify or opens a capture device without the owner present. With the
 owner's go-ahead, live checks are `MIXTAPE_LIVE_CAPTURE=1 magex test` (`magex
 test` enables every build tag it finds, `captureintegration` included, so the
-tag alone must stay harmless), `magex build:dev` installs the build under test
+tag alone must stay harmless; `MIXTAPE_LIVE_OUTPUT_RATE=1` also switches the
+speakers' rate and back), `magex build:dev` installs the build under test
 as `mixtape`, and timing traces come from `mixtape debug trace`. Point
 `MIXTAPE_HOME` and `MIXTAPE_LIBRARY` at a scratch folder to keep live
 recordings out of the owner's library.
@@ -125,7 +128,11 @@ go-broadcast source, not here.
 builds and tests there), but the release build needs the macOS SDK for its cgo
 binaries, so `RELEASE_RUNNER=macos-15` in `90-project.env` runs the release
 job alone on macOS. On a `v*` tag, the lint, tests and security scans run first.
-The AAC tests skip on Linux, so run `magex test:race` on a Mac before tagging.
+The encoder tests skip on Linux, and the darwin-only code (`//go:build darwin
+&& cgo`: the tap, the device backend, the Core Audio output control) is not
+even compiled there, so Linux CI cannot catch a mistake in it: run `magex lint`
+and `magex test:race` on a Mac before pushing a change to it, and before
+tagging.
 
 <br>
 
