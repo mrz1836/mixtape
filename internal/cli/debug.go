@@ -46,6 +46,7 @@ func newDebugCmd(a *app) *cobra.Command {
 		Long:   `Diagnostics for tuning mixtape's timing and for bug reports. Not part of the stable interface.`,
 		Hidden: true,
 		Args:   cobra.NoArgs,
+		RunE:   showHelp,
 	}
 	cmd.AddCommand(newTraceCmd(a))
 	return cmd

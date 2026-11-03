@@ -32,8 +32,8 @@ func TestAllCommandsHaveShortAndLong(t *testing.T) {
 func TestLeafCommandsHaveExamples(t *testing.T) {
 	t.Parallel()
 	walkCommands(testRoot(t), func(cmd *cobra.Command) {
-		if cmd.RunE == nil && cmd.Run == nil {
-			return
+		if cmd.HasSubCommands() || (cmd.RunE == nil && cmd.Run == nil) {
+			return // a group shows its help, and its subcommands have the examples
 		}
 		assert.NotEmpty(t, cmd.Example, "%s: leaf command missing Example", cmd.CommandPath())
 	})

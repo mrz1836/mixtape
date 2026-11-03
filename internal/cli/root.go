@@ -24,6 +24,12 @@ import (
 
 const rootName = "mixtape"
 
+// showHelp is the RunE of a command with subcommands, such as config. It
+// makes the command runnable, so cobra checks its arguments: a subcommand it
+// does not have is a usage error (exit 2), as at the top level, instead of
+// its help and exit 0. On its own the command prints its help.
+func showHelp(cmd *cobra.Command, _ []string) error { return cmd.Help() }
+
 // Command groups, in help order.
 const (
 	groupRecording = "recording"

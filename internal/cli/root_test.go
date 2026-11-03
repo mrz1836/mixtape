@@ -4,8 +4,10 @@ import (
 	"os"
 	"path/filepath"
 	"runtime/debug"
+	"strings"
 	"testing"
 
+	"github.com/spf13/cobra"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -41,6 +43,34 @@ func TestUsageErrorsExit2(t *testing.T) {
 			assert.Contains(t, h.stderr.String(), "mixtape: ")
 		})
 	}
+}
+
+// TestUnknownSubcommandsExit2 checks every command group: a subcommand it
+// does not have is a usage error, as at the top level, while the group on
+// its own prints its help.
+func TestUnknownSubcommandsExit2(t *testing.T) {
+	t.Parallel()
+	groups := 0
+	walkCommands(testRoot(t), func(cmd *cobra.Command) {
+		if !cmd.HasParent() || !cmd.HasSubCommands() {
+			return
+		}
+		groups++
+		path := strings.Fields(cmd.CommandPath())[1:]
+		t.Run(cmd.Name(), func(t *testing.T) {
+			t.Parallel()
+			h := newHarness(t)
+			require.Equal(t, ExitUsage, h.run(append(path, "bogus", "-o", "json")...))
+			assert.Empty(t, h.stdout.String())
+			e := h.errDoc()
+			assert.Equal(t, "usage", e["code"])
+			assert.Contains(t, e["message"], `unknown command "bogus" for "`+cmd.CommandPath()+`"`)
+
+			require.Equal(t, ExitOK, h.run(path...))
+			assert.Contains(t, h.stdout.String(), cmd.Long)
+		})
+	})
+	assert.Positive(t, groups, "the tree has command groups")
 }
 
 func TestUsageErrorJSON(t *testing.T) {

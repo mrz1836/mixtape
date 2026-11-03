@@ -46,6 +46,7 @@ environment variable, the config file, and the built-in default.
 'mixtape config show' prints every value and where it came from.`,
 		GroupID: groupSetup,
 		Args:    cobra.NoArgs,
+		RunE:    showHelp,
 	}
 	cmd.AddCommand(newConfigShowCmd(a), newConfigSetCmd(a), newConfigPathCmd(a))
 	return cmd
