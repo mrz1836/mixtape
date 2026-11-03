@@ -64,7 +64,9 @@ func TestRecoveredSettingsAreMarkedRestored(t *testing.T) {
 	h.world.player.snap = spotify.Snapshot{Shuffle: false, Repeat: true}
 	a := &app{deps: h.deps, out: plainOutput(t, false), home: h.env["MIXTAPE_HOME"]}
 
-	assert.Nil(t, a.recoverSpotify(t.Context(), h.world.player), "nothing is pending")
+	pending, restored := a.recoverSpotify(t.Context(), h.world.player)
+	assert.Nil(t, pending, "nothing is pending")
+	assert.Equal(t, []string{"shuffle", "repeat"}, restored, "what was put back is named")
 	st, err := session.ReadState(a.home)
 	require.NoError(t, err)
 	assert.Equal(t, "old", st.ID)

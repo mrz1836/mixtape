@@ -40,16 +40,26 @@ type captureRequest struct {
 	Device string         // device name substring
 	Mute   bool           // tap only
 	Bits   int            // bits a sample: 16 or 24 (config.Settings.Bits)
+
+	// The output rate to run the default output at while the tap records
+	// (0 leaves it alone), and what the switch needs (see tap.Options).
+	OutputRate  int
+	Pending     *capture.OutputRestore
+	SaveRestore func(capture.OutputRestore) error
+	Warn        func(msg string)
+	SessionID   string
 }
 
 // services are the heavyweight collaborators commands reach through the
 // app, so tests can substitute fakes. Production values come from
 // newProcessServices.
 type services struct {
-	player         func() player
-	catalog        func() catalog
-	openCapture    func(context.Context, captureRequest) (capture.Source, error)
-	tapStatus      func() capture.TapStatus
+	player      func() player
+	catalog     func() catalog
+	openCapture func(context.Context, captureRequest) (capture.Source, error)
+	tapStatus   func() capture.TapStatus
+	// output reads and sets output device rates (doctor, crash recovery).
+	output         func() capture.OutputControl
 	devices        func() ([]device.Info, error)
 	defaultOutput  func() (device.Info, error)
 	spotifyRunning func() (bool, error)
@@ -86,6 +96,7 @@ func newProcessServices() services {
 		catalog:        func() catalog { return spotify.NewCatalog() },
 		openCapture:    openCapture,
 		tapStatus:      tap.Available,
+		output:         tap.OutputControl,
 		devices:        device.List,
 		defaultOutput:  device.DefaultOutput,
 		spotifyRunning: spotify.IsRunning,
@@ -130,7 +141,10 @@ func newProcessServices() services {
 func openCapture(ctx context.Context, r captureRequest) (capture.Source, error) {
 	switch r.Method {
 	case capture.MethodTap:
-		return tap.Open(ctx, tap.Options{Mute: r.Mute, Wait: 10 * time.Second, Bits: r.Bits})
+		return tap.Open(ctx, tap.Options{
+			Mute: r.Mute, Wait: 10 * time.Second, Bits: r.Bits,
+			OutputRate: r.OutputRate, Pending: r.Pending, SaveRestore: r.SaveRestore, Warn: r.Warn, SessionID: r.SessionID,
+		})
 	case capture.MethodDevice:
 		return device.Open(r.Device, r.Bits)
 	case capture.MethodAuto:

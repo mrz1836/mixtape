@@ -42,6 +42,26 @@ type Options struct {
 	BundlePrefix string
 	Wait         time.Duration
 	Bits         int
+	OutputRate   int
+	SaveRestore  func(capture.OutputRestore) error
+	Pending      *capture.OutputRestore
+	Warn         func(msg string)
+	SessionID    string
+}
+
+// OutputControl is unsupported in this build: every call fails.
+func OutputControl() capture.OutputControl { return noOutput{} }
+
+type noOutput struct{}
+
+var errNoOutput = errors.New("output devices need macOS and cgo")
+
+func (noOutput) DefaultOutput() (capture.OutputDevice, error) {
+	return capture.OutputDevice{}, errNoOutput
+}
+func (noOutput) OutputRate(string) (int, error) { return 0, errNoOutput }
+func (noOutput) SetOutputRate(context.Context, string, int) error {
+	return errNoOutput
 }
 
 // Source is unavailable in this build.

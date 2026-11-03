@@ -114,6 +114,23 @@ type Options struct {
 	// Bits is the depth of the PCM delivered: 16 or 24 (0 means 16, and
 	// Format reports it as given).
 	Bits int
+	// OutputRate, when set, runs the default output device at this rate
+	// in Hz while the tap records (Spotify then plays its 44.1 kHz streams
+	// without resampling them), and puts the original back on Close. It
+	// never fails Open: a rate the device does not offer, or a switch that
+	// does not hold, is a warning, and the rate stays as it was.
+	OutputRate int
+	// SaveRestore persists what the switch must undo, before switching
+	// (and the zero record once undone), so a crash can be repaired.
+	SaveRestore func(capture.OutputRestore) error
+	// Pending is a switch an interrupted session left in place, taken
+	// over when it is the one OutputRate asks for (see
+	// capture.OutputSwitch.Begin).
+	Pending *capture.OutputRestore
+	// Warn receives the output switch's warnings; nil discards them.
+	Warn func(msg string)
+	// SessionID names the session in the restore record.
+	SessionID string
 }
 
 // Source records the tapped processes. It implements capture.Source.
@@ -127,6 +144,8 @@ type Source struct {
 	tap    unsafe.Pointer // retained MTTap, owned by the drain once started
 	procs  []uint32
 	format capture.Format
+
+	output *capture.OutputSwitch // nil unless Options.OutputRate is set
 }
 
 var _ capture.Source = (*Source)(nil)
@@ -146,10 +165,61 @@ func Open(ctx context.Context, o Options) (*Source, error) {
 		return nil, err
 	}
 	s := &Source{opts: o, events: capture.NewEmitter()}
+	switched := s.switchOutput(ctx)
 	if err := s.build(procs); err != nil {
+		s.restoreOutput(ctx)
 		return nil, err
 	}
+	if want := o.OutputRate; switched && s.Format().Rate != want {
+		// The aggregate can come up at the old rate when it is built right
+		// after the switch: rebuild it once, quietly.
+		s.closeTap()
+		if err := s.build(procs); err != nil {
+			s.restoreOutput(ctx)
+			return nil, err
+		}
+		if got := s.Format().Rate; got != want {
+			s.warn(fmt.Sprintf("the tap records at %d Hz although the output was switched to %d Hz", got, want))
+		}
+	}
 	return s, nil
+}
+
+// switchOutput runs the output at Options.OutputRate, and reports whether
+// it switched (or took over an interrupted session's switch).
+func (s *Source) switchOutput(ctx context.Context) bool {
+	if s.opts.OutputRate <= 0 {
+		return false
+	}
+	s.output = &capture.OutputSwitch{
+		Control: OutputControl(), Save: s.opts.SaveRestore, Warn: s.opts.Warn, SessionID: s.opts.SessionID,
+	}
+	return s.output.Begin(ctx, s.opts.OutputRate, s.opts.Pending)
+}
+
+// restoreOutput puts the output's rate back, if Open switched it. It
+// finishes even when ctx ends (capture.OutputSwitch.End).
+func (s *Source) restoreOutput(ctx context.Context) {
+	if s.output != nil {
+		s.output.End(ctx)
+	}
+}
+
+// closeTap destroys the current tap, if any.
+func (s *Source) closeTap() {
+	s.mu.Lock()
+	t := s.tap
+	s.tap = nil
+	s.mu.Unlock()
+	if t != nil {
+		C.mt_tap_close(t)
+	}
+}
+
+func (s *Source) warn(msg string) {
+	if s.opts.Warn != nil {
+		s.opts.Warn(msg)
+	}
 }
 
 // processIDs lists the sorted object IDs of the processes to tap; none is
@@ -367,17 +437,14 @@ func (s *Source) rebuild(kind capture.EventKind, detail string) {
 	s.events.Emit(kind, detail)
 }
 
-// Close stops capture and destroys the tap. It is idempotent.
+// Close stops capture, destroys the tap and puts back the output rate Open
+// switched. It is idempotent.
 func (s *Source) Close() error {
 	if !s.life.Close(nil) {
 		return nil
 	}
-	s.mu.Lock()
-	if s.tap != nil {
-		C.mt_tap_close(s.tap)
-		s.tap = nil
-	}
-	s.mu.Unlock()
+	s.closeTap()
+	s.restoreOutput(context.Background())
 	s.events.Close()
 	return nil
 }
