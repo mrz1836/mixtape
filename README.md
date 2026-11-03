@@ -16,6 +16,7 @@
 <a href="https://github.com/mrz1836/mixtape/releases"><img src="https://img.shields.io/github/release-pre/mrz1836/mixtape?include_prereleases&style=flat-square&logo=github&color=black" alt="Release"></a>
 <a href="https://golang.org/"><img src="https://img.shields.io/github/go-mod/go-version/mrz1836/mixtape?style=flat-square&logo=go&color=00ADD8" alt="Go Version"></a>
 <a href="https://github.com/mrz1836/mixtape/blob/master/LICENSE"><img src="https://img.shields.io/github/license/mrz1836/mixtape?style=flat-square&color=blue&v=2" alt="License"></a>
+<a href="https://codecov.io/gh/mrz1836/mixtape"><img src="https://codecov.io/gh/mrz1836/mixtape/branch/master/graph/badge.svg?style=flat-square" alt="Coverage"></a>
 <img src="https://img.shields.io/badge/platform-macOS-lightgrey?style=flat-square&logo=apple" alt="macOS">
 
 </div>
