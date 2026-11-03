@@ -14,9 +14,6 @@ import (
 	"github.com/mrz1836/mixtape/internal/capture"
 )
 
-// DefaultBundlePrefix matches Spotify's app and its helper processes.
-const DefaultBundlePrefix = "com.spotify.client"
-
 var (
 	// ErrNoProcess reports that Spotify has no audio process to tap.
 	ErrNoProcess = errors.New("spotify has no audio process to tap (is it running?)")
@@ -52,7 +49,7 @@ type Source struct{}
 var _ capture.Source = (*Source)(nil)
 
 // Open is unsupported in this build.
-func Open(Options) (*Source, error) {
+func Open(context.Context, Options) (*Source, error) {
 	return nil, fmt.Errorf("%w: %s", capture.ErrTapUnsupported, unsupportedReason)
 }
 

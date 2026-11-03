@@ -47,6 +47,15 @@ const (
 // Done reports whether the status means the song is in the folder.
 func (s Status) Done() bool { return s == StatusRecorded || s == StatusCopied }
 
+// Failed reports whether the status is one a song ends in when it could
+// not be recorded: failed (no usable take), unavailable (Spotify would not
+// play it) or encode_failed (captured, but could not be encoded or tagged;
+// the WAV is kept for RetryEncode). Pending and removed songs are neither
+// done nor failed.
+func (s Status) Failed() bool {
+	return s == StatusFailed || s == StatusUnavailable || s == StatusEncodeFailed
+}
+
 // Track is the metadata the library records for a song.
 type Track struct {
 	ID          string // requested track ID: the one in the collection

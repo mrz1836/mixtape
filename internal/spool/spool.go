@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
@@ -48,8 +49,8 @@ var (
 )
 
 // Spool is an append-only, chunked PCM store with a time index. One
-// goroutine may Append while another reads (FrameAt, TimeAt, ReadRange,
-// Prune); ReadRange and Prune must not run concurrently with each other.
+// goroutine may Append while another reads (FrameAt, ReadRange, Prune);
+// ReadRange and Prune must not run concurrently with each other.
 type Spool struct {
 	mu          sync.Mutex
 	dir         string
@@ -64,6 +65,9 @@ type Spool struct {
 	frames  int64 // frames appended so far
 	anchors []anchor
 	closed  bool
+	// orphans are pruned chunk files that could not be deleted yet; every
+	// Prune and Close tries again.
+	orphans []string
 }
 
 type chunk struct {
@@ -228,27 +232,6 @@ func (s *Spool) FrameAt(t time.Time) int64 {
 	return lo.frame + int64(frac*float64(hi.frame-lo.frame))
 }
 
-// TimeAt maps a frame position to its capture time; the inverse of FrameAt.
-func (s *Spool) TimeAt(frame int64) time.Time {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	a := s.anchors
-	switch {
-	case len(a) == 0:
-		return time.Time{}
-	case len(a) == 1 || frame <= a[0].frame:
-		return a[0].at.Add(s.format.Duration(frame - a[0].frame))
-	}
-	last := a[len(a)-1]
-	if frame >= last.frame {
-		return last.at.Add(s.format.Duration(frame - last.frame))
-	}
-	i := sort.Search(len(a), func(i int) bool { return a[i].frame > frame })
-	lo, hi := a[i-1], a[i]
-	frac := float64(frame-lo.frame) / float64(hi.frame-lo.frame)
-	return lo.at.Add(time.Duration(frac * float64(hi.at.Sub(lo.at))))
-}
-
 // ReadRange writes the PCM of frames [from, to) to w, clipped to the
 // retained range [Oldest, Frames). It returns the number of frames written.
 func (s *Spool) ReadRange(from, to int64, w io.Writer) (int64, error) {
@@ -304,20 +287,36 @@ func (s *Spool) Prune(before int64) error {
 	if s.closed {
 		return ErrClosed
 	}
-	var errs []error
 	keep := 0
 	for keep < len(s.chunks)-1 && s.chunks[keep].start+s.chunks[keep].frames <= before {
 		c := s.chunks[keep]
-		errs = append(errs, c.f.Close(), os.Remove(c.path))
+		_ = c.f.Close() // read-only from here on: nothing to lose
+		s.orphans = append(s.orphans, c.path)
 		keep++
 	}
 	s.chunks = s.chunks[keep:]
+	err := s.removeOrphans()
 
 	cut := 0
 	for cut+1 < len(s.anchors) && s.anchors[cut+1].frame <= before {
 		cut++
 	}
 	s.anchors = s.anchors[cut:]
+	return err
+}
+
+// removeOrphans deletes the pruned chunk files, keeping those that could
+// not be deleted for the next try.
+func (s *Spool) removeOrphans() error {
+	var errs []error
+	left := s.orphans[:0]
+	for _, path := range s.orphans {
+		if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			errs = append(errs, err)
+			left = append(left, path)
+		}
+	}
+	s.orphans = left
 	return errors.Join(errs...)
 }
 
@@ -329,11 +328,11 @@ func (s *Spool) Close() error {
 		return nil
 	}
 	s.closed = true
-	var errs []error
+	errs := []error{s.removeOrphans()}
 	for _, c := range s.chunks {
 		errs = append(errs, c.f.Close(), os.Remove(c.path))
 	}
-	s.chunks, s.w, s.anchors = nil, nil, nil
+	s.chunks, s.w, s.anchors, s.orphans = nil, nil, nil, nil
 	return errors.Join(errs...)
 }
 

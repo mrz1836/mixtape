@@ -1,10 +1,10 @@
 package spotify
 
 import (
-	"bufio"
 	"bytes"
 	"errors"
 	"io/fs"
+	"math"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -77,13 +77,11 @@ func newestPrefs(base string) (string, error) {
 	return global, nil
 }
 
-// parsePrefs reads key=value lines.
+// parsePrefs reads key=value lines, however long.
 func parsePrefs(data []byte) Prefs {
 	var p Prefs
-	sc := bufio.NewScanner(bytes.NewReader(data))
-	sc.Buffer(make([]byte, 0, 4096), 1<<20)
-	for sc.Scan() {
-		key, value, ok := strings.Cut(strings.TrimSpace(sc.Text()), "=")
+	for line := range bytes.Lines(data) {
+		key, value, ok := strings.Cut(strings.TrimSpace(string(line)), "=")
 		if !ok {
 			continue
 		}
@@ -95,7 +93,8 @@ func parsePrefs(data []byte) Prefs {
 		case key == prefMigrated:
 			p.Stale = value == "true"
 		case key == prefCrossfadeTime:
-			if ms, err := strconv.ParseFloat(value, 64); err == nil && ms > 0 {
+			// ParseFloat accepts "Inf", which is no crossfade length.
+			if ms, err := strconv.ParseFloat(value, 64); err == nil && ms > 0 && !math.IsInf(ms, 0) {
 				p.CrossfadeSeconds = ms / 1000
 			}
 		case strings.Contains(strings.ToLower(key), prefAutomixWord) && value == "true":

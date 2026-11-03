@@ -43,7 +43,7 @@ failure, one error document. In text mode errors read
 `mixtape: <command>: <message>` followed by `  fix: <hint>` when there is one.
 
 ```json
-{"error":{"code":"not_ready","message":"spotify crossfade is on, …","hint":"turn off Spotify → Settings → Playback → Crossfade songs, or pass --allow-crossfade","exit_code":3}}
+{"error":{"code":"not_ready","message":"spotify crossfade is on, so songs overlap and cannot be cut cleanly (crossfade is set to 6.0s)","hint":"in Spotify → Settings → Playback turn off \"Crossfade songs\" and \"Automix\", or pass --allow-crossfade","exit_code":3}}
 ```
 
 <br>
@@ -104,13 +104,15 @@ For each song the plan decides one action:
 | `--device NAME` | Capture device (substring) for `--capture device` |
 | `--mute` | Tap only: silence Spotify on the speakers while recording (volume raised to 100 meanwhile) |
 | `--idle-timeout D` | End after D with nothing to record (default 10m; 0 = never) |
-| `--max-failures N` | End after N songs in a row could not be recorded (default 3; 0 = never) |
-| `--allow-crossfade` | Record even though crossfade is on (songs will overlap) |
+| `--max-failures N` | End after N failed attempts in a row; a song is tried twice (default 3; 0 = never) |
+| `--allow-crossfade` | Record even though crossfade or automix is on (songs will overlap) |
 
 **Before anything plays** mixtape checks that Spotify is installed and
-running, crossfade is off, afconvert exists, the library is writable, no
-other session is recording, and Spotify answers (Automation permission).
-When every song is already done, nothing plays and none of that is needed.
+running, crossfade and automix are off, afconvert exists, no other session
+is recording, Spotify answers (Automation permission), and macOS lets the
+app that runs mixtape capture audio (exit 5 at once otherwise: the capture
+would be silent). When every song is already done, nothing plays and none of
+that is needed.
 
 **During the session** shuffle is turned off (and repeat on, to follow a
 long playlist), and restored at the end. Spotify is paused when the queue is
@@ -120,17 +122,19 @@ and retried once. A false start (Spotify jumping elsewhere before the song
 really began) is requested again without counting as an attempt.
 
 **When nothing can work** the session stops early instead of trying every
-song: after `--max-failures` songs (or attempts) in a row could not be
-recorded, it ends with `no_sound` causes (`songs keep playing without any
-sound reaching mixtape`: Spotify plays on another device or is muted;
-exit 3), `songs keep not starting in Spotify` (signed out or offline; exit
-3), or `the songs keep failing` (mixed causes; exit 7). A library that
-cannot take a file (an unplugged drive, a full disk) ends the session at
-once (exit 5), as does audio that cannot be buffered to disk (exit 1). Songs
-not saved stay pending for the next run. Keys on a terminal: `space` pause/resume, `n` skip the song (not
-retried), `q` quit; Ctrl-C quits after the current song is settled, a second
-Ctrl-C forces it. SIGTERM (what `mixtape stop` sends) is a graceful stop;
-SIGHUP and SIGPIPE are ignored.
+song: after `--max-failures` failed attempts in a row, it ends with what
+they have in common: `songs keep playing without any sound reaching
+mixtape` (Spotify plays on another device or is muted; exit 3), `the songs
+keep not starting in Spotify` (signed out or offline; exit 3), or `the
+songs keep failing` (mixed causes; exit 7). A library that cannot take a
+file (an unplugged drive, a full disk) ends the session at once (exit 5), as
+does audio that cannot be buffered to disk (exit 1). Songs not saved stay
+pending for the next run.
+
+**Keys and signals.** On a terminal: `space` pause/resume, `n` skip the song
+(not retried), `q` quit; Ctrl-C quits after the current song is settled, a
+second Ctrl-C forces it. SIGTERM (what `mixtape stop` sends) is a graceful
+stop; SIGHUP and SIGPIPE are ignored.
 
 ### Dry run (`--dry-run -o json`)
 
@@ -168,7 +172,7 @@ One compact JSON object per line on stdout, also appended to
 | `track_discarded` | `track`, `reason` | A take was incomplete; it is retried once |
 | `track_failed` | `track`, `reason` | Given up for this session (marked in the manifest) |
 | `warning` | `message` | Something worth knowing; the session continues |
-| `boundary` | `track`, `offset_seconds`, `drift_seconds`, `runs` | `--verbose` only: measured timing of a song |
+| `boundary` | `track`, `offset_seconds`, `drift_seconds`, `runs`, `reason` | `--verbose` only: measured timing of a song (`reason` when it was incomplete) |
 | `session_finished` | `result`, `counts`, `exit_code`, `message` | The end: `result` is `complete`, `incomplete` or `stopped` |
 
 `track` is `{id, played_id?, title, artist, collection, position,
@@ -234,7 +238,8 @@ finished session adds `result`, `exit_code`, `finished_at` and possibly
 `spotify` object records the Spotify settings the session changed and
 whether they were restored. `stale: true` means the session stopped without finishing (killed
 or crashed); the next `record` resumes it. `--follow` streams the event log
-until the session ends. No session at all exits 4.
+until the session ends (it gives up with an error if the recorder lock stays
+unreadable for 30 s). No session at all exits 4.
 
 ## wait
 
@@ -258,7 +263,9 @@ PID), waits for it to exit (up to 2 minutes), and prints the summary (the
 `status` JSON). The song in progress is discarded, Spotify is paused and its
 settings restored. `--no-wait` returns once the signal is sent, with
 `{"stopping": true, "session_id", "pid"}`. A session that ended just before
-the signal is reported as it finished. Nothing running exits 4.
+the signal is reported as it finished. When the recorder lock cannot be read
+until the 2 minutes are up, `stop` reports that error rather than success.
+Nothing running exits 4.
 
 <br>
 
@@ -334,11 +341,15 @@ detail, fix}]}` with `status` `ok`, `warn`, `fail` or `skip`. Check IDs:
 `device`, `routing`, `microphone` (device), `afconvert`, `library`,
 `session`. Exits 3 when any check fails; warnings do not block. Doctor never
 shows a permission prompt: an undecided Automation permission is a warning.
+When macOS will not list the running apps, `spotify_running` is a warning
+("could not check Spotify") and Spotify is asked directly, which never
+launches it.
 
 ## devices
 
 `{"tap": {"supported": bool, "reason": "…"}, "default_output": "…",
-"devices": [{name, input, output, default_input, default_output}]}`.
+"devices": [{name, input, output, default_input, default_output}]}`. `reason`
+says why the tap is unsupported; it is absent when the tap is supported.
 
 ## config
 
@@ -349,8 +360,9 @@ mixtape config path            # the file's path
 ```
 
 Settings resolve from, highest first: flag, environment, config file,
-default. The file is JSON (`~/.mixtape/config.json`); unknown keys are kept
-and reported as warnings.
+default. The file is JSON (`~/.mixtape/config.json`); keys are lowercase, and
+unknown keys (including a known one in other case) are kept and reported as
+warnings.
 
 | Key | Env | Default | Meaning |
 |---|---|---|---|
@@ -359,7 +371,7 @@ and reported as warnings.
 | `device` | `MIXTAPE_DEVICE` | `BlackHole` | Capture device name (substring) |
 | `artwork` | `MIXTAPE_ARTWORK` | `false` | Embed album artwork |
 | `idle_timeout` | `MIXTAPE_IDLE_TIMEOUT` | `10m0s` | End a session after this long with nothing to record |
-| `max_failures` | `MIXTAPE_MAX_FAILURES` | `3` | End a session after this many songs in a row could not be recorded (0 = never) |
+| `max_failures` | `MIXTAPE_MAX_FAILURES` | `3` | End a session after this many failed attempts in a row; a song is tried twice (0 = never) |
 
 Other environment variables: `MIXTAPE_HOME`, `MIXTAPE_OUTPUT`, `NO_COLOR`,
 `MIXTAPE_GITHUB_TOKEN` (a GitHub token for `update`, which otherwise uses a
@@ -401,7 +413,7 @@ README shows how to load it.
 | `~/.mixtape/session.json` | The running or last session |
 | `~/.mixtape/sessions/<id>.ndjson` | Each session's events (`<id>.log` for detached ones) |
 | `~/.mixtape/spool/` | Captured audio of the running session (deleted at the end) |
-| `~/.mixtape/work/` | Encoding scratch; `failed/` keeps WAVs whose encode failed |
+| `~/.mixtape/work/` | Encoding scratch; `failed/` keeps WAVs whose encode (or tagging) failed, for the next run |
 | `~/Library/Caches/mixtape/recorder.lock` | The recorder lock |
 | `~/Library/Application Support/mixtape/` | The passive update check's cache |
 | `<library>/<Folder>/mixtape.json` | A folder's manifest |

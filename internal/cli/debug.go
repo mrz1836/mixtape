@@ -46,6 +46,7 @@ func newDebugCmd(a *app) *cobra.Command {
 		Long:   `Diagnostics for tuning mixtape's timing and for bug reports. Not part of the stable interface.`,
 		Hidden: true,
 		Args:   cobra.NoArgs,
+		RunE:   showHelp,
 	}
 	cmd.AddCommand(newTraceCmd(a))
 	return cmd
@@ -93,7 +94,7 @@ func (a *app) trace(ctx context.Context, duration, poll time.Duration, method, o
 	if err != nil {
 		return err
 	}
-	src, err := a.deps.services.openCapture(captureRequest{Method: m, Device: s.Device})
+	src, err := a.deps.services.openCapture(ctx, captureRequest{Method: m, Device: s.Device})
 	if err != nil {
 		return err
 	}
@@ -101,82 +102,103 @@ func (a *app) trace(ctx context.Context, duration, poll time.Duration, method, o
 	if out == "" {
 		out = filepath.Join(a.home, "traces", a.deps.now().UTC().Format("20060102-150405")+".ndjson")
 	}
-	if mkErr := os.MkdirAll(filepath.Dir(out), 0o700); mkErr != nil {
-		return mkErr
-	}
-	f, err := os.Create(filepath.Clean(out))
+	tw, err := createTrace(out)
 	if err != nil {
 		return err
 	}
-	defer func() { _ = f.Close() }()
-	w := bufio.NewWriter(f)
-	enc := json.NewEncoder(w)
-	var (
-		mu       sync.Mutex
-		writeErr error // first trace write failure, guarded by mu
-	)
-	write := func(l traceLine) {
-		mu.Lock()
-		defer mu.Unlock()
-		if encErr := enc.Encode(l); encErr != nil && writeErr == nil {
-			writeErr = encErr
-		}
-	}
+	defer tw.close()
 
 	start := time.Now()
 	format := src.Format()
-	write(traceLine{K: "meta", Rate: format.Rate, Chans: format.Channels, Src: src.Name(), PollM: poll.Milliseconds()})
-	var frame int64
-	err = src.Start(ctx, func(b capture.Block) {
-		peakVal := pcmPeak(b.PCM[:min(len(b.PCM), b.Frames*format.BytesPerFrame())])
-		mu.Lock()
-		at := frame
-		frame += int64(b.Frames)
-		mu.Unlock()
-		write(traceLine{K: "audio", T: b.At.Sub(start).Nanoseconds(), Frame: at, N: b.Frames, Peak: peakVal})
-	})
-	if err != nil {
+	tw.write(traceLine{K: "meta", Rate: format.Rate, Chans: format.Channels, Src: src.Name(), PollM: poll.Milliseconds()})
+	if err := src.Start(ctx, tw.audioSink(start, format)); err != nil {
 		return err
 	}
-
-	tctx, cancel := context.WithTimeout(ctx, duration)
-	defer cancel()
 	a.out.Println("tracing for %s with %s at %d Hz into %s — play, skip, pause and seek in Spotify now (Ctrl-C ends early)",
 		duration, src.Name(), format.Rate, out)
-	sigs, stopSigs := a.deps.services.signals()
-	defer stopSigs()
-	snaps := a.deps.services.player().Watch(tctx, poll)
-	for done := false; !done; {
-		select {
-		case <-sigs:
-			done = true
-		case snap, ok := <-snaps:
-			if !ok {
-				done = true
-				continue
-			}
-			l := traceLine{
-				K: "snap", T: snap.At.Sub(start).Nanoseconds(), State: string(snap.State), Pos: snap.Position,
-				ID: snap.Track.URI, Name: snap.Track.Name, DurMS: snap.Track.Duration.Milliseconds(), Vol: snap.Volume,
-			}
-			if snap.Err != nil {
-				l.Err = snap.Err.Error()
-			}
-			write(l)
-		}
-	}
-	_ = src.Close()
-	mu.Lock()
-	ferr := w.Flush()
-	if writeErr != nil {
-		ferr = writeErr
-	}
-	mu.Unlock()
-	if ferr != nil {
-		return ferr
+	a.traceSnapshots(ctx, tw, start, duration, poll)
+	_ = src.Close() // no audio may arrive while the trace is flushed
+	if err := tw.flush(); err != nil {
+		return err
 	}
 	return a.out.Result(analyzeTrace(out), pathDoc{Path: out})
 }
+
+// traceSnapshots writes Spotify's snapshots until duration passes or a
+// stop signal arrives.
+func (a *app) traceSnapshots(ctx context.Context, tw *traceWriter, start time.Time, duration, poll time.Duration) {
+	tctx, cancel := context.WithTimeout(ctx, duration)
+	defer cancel()
+	stopSigs := a.watchSignals(func(os.Signal) { cancel() })
+	defer stopSigs()
+	for snap := range a.deps.services.player().Watch(tctx, poll) {
+		l := traceLine{
+			K: "snap", T: snap.At.Sub(start).Nanoseconds(), State: string(snap.State), Pos: snap.Position,
+			ID: snap.Track.URI, Name: snap.Track.Name, DurMS: snap.Track.Duration.Milliseconds(), Vol: snap.Volume,
+		}
+		if snap.Err != nil {
+			l.Err = snap.Err.Error()
+		}
+		tw.write(l)
+	}
+}
+
+// traceWriter writes trace lines from the capture and the player
+// goroutines; the first write error sticks.
+type traceWriter struct {
+	mu    sync.Mutex
+	f     *os.File
+	w     *bufio.Writer
+	enc   *json.Encoder
+	err   error
+	frame int64 // index of the next audio frame
+}
+
+// createTrace creates the trace file at path, and its folder.
+func createTrace(path string) (*traceWriter, error) {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return nil, fmt.Errorf("create trace: %w", err)
+	}
+	f, err := os.Create(filepath.Clean(path))
+	if err != nil {
+		return nil, fmt.Errorf("create trace: %w", err)
+	}
+	w := bufio.NewWriter(f)
+	return &traceWriter{f: f, w: w, enc: json.NewEncoder(w)}, nil
+}
+
+func (tw *traceWriter) write(l traceLine) {
+	tw.mu.Lock()
+	defer tw.mu.Unlock()
+	if err := tw.enc.Encode(l); err != nil && tw.err == nil {
+		tw.err = err
+	}
+}
+
+// audioSink traces each captured block: its time, first frame, length and
+// loudest sample.
+func (tw *traceWriter) audioSink(start time.Time, f capture.Format) func(capture.Block) {
+	return func(b capture.Block) {
+		peak := pcmPeak(b.PCM[:min(len(b.PCM), b.Frames*f.BytesPerFrame())])
+		tw.mu.Lock()
+		at := tw.frame
+		tw.frame += int64(b.Frames)
+		tw.mu.Unlock()
+		tw.write(traceLine{K: "audio", T: b.At.Sub(start).Nanoseconds(), Frame: at, N: b.Frames, Peak: peak})
+	}
+}
+
+// flush writes out what is buffered and reports the first error.
+func (tw *traceWriter) flush() error {
+	tw.mu.Lock()
+	defer tw.mu.Unlock()
+	if err := tw.w.Flush(); err != nil && tw.err == nil {
+		tw.err = err
+	}
+	return tw.err
+}
+
+func (tw *traceWriter) close() { _ = tw.f.Close() }
 
 // analyzeTrace summarizes a trace file: per playback start (a track change
 // or a resume), the offset between the audio onset and the position-based
@@ -195,8 +217,6 @@ func analyzeTrace(path string) string {
 			audio = append(audio, l)
 		}
 	}
-	frameAt := func(t int64) float64 { return interpolateFrame(audio, t, rate) }
-
 	var b strings.Builder
 	fmt.Fprintf(&b, "trace %s: %d snapshots, %d audio blocks at %d Hz", path, len(snaps), len(audio), rate)
 	var steps []float64
@@ -205,33 +225,26 @@ func analyzeTrace(path string) string {
 		if c.State == "playing" && p.State == "playing" && c.ID == p.ID && c.Pos > p.Pos {
 			steps = append(steps, c.Pos-p.Pos)
 		}
-		started := c.State == "playing" && (p.State != "playing" || c.ID != p.ID)
-		if !started {
+		if c.State != "playing" || (p.State == "playing" && c.ID == p.ID) {
+			continue // not a start
+		}
+		anchor, stale, ok := startAnchor(snaps, i, audio, rate)
+		if !ok {
 			continue
 		}
-		var anchors []float64
-		stale := 0
-		for j := i; j < len(snaps) && snaps[j].T-c.T < int64(2*time.Second) && snaps[j].State == "playing" && snaps[j].ID == c.ID; j++ {
-			elapsed := float64(snaps[j].T-p.T) / 1e9
-			if c.ID != p.ID && snaps[j].Pos > elapsed+0.3 {
-				stale++
-				continue
-			}
-			anchors = append(anchors, frameAt(snaps[j].T)-snaps[j].Pos*float64(rate))
-		}
-		if len(anchors) == 0 {
-			continue
-		}
-		slices.Sort(anchors)
-		anchor := anchors[len(anchors)/2]
-		onset := audioOnset(audio, p.T)
 		kind := "change"
 		if c.ID == p.ID {
 			kind = "resume"
 		}
+		// The audio starts where playback starts: at position 0 after a
+		// change, at the paused position after a resume.
+		estimate := anchor
+		if kind == "resume" {
+			estimate += p.Pos * float64(rate)
+		}
 		fmt.Fprintf(&b, "\n  %6.2fs %-6s %-32.32s stale=%d", float64(c.T)/1e9, kind, c.Name, stale)
-		if onset >= 0 {
-			fmt.Fprintf(&b, "  onset−estimate = %+.3fs", (onset-anchor)/float64(rate))
+		if onset := audioOnset(audio, p.T); onset >= 0 {
+			fmt.Fprintf(&b, "  onset−estimate = %+.3fs", (onset-estimate)/float64(rate))
 		}
 	}
 	if len(steps) > 0 {
@@ -239,6 +252,31 @@ func analyzeTrace(path string) string {
 		fmt.Fprintf(&b, "\n  position step: min %.3fs, median %.3fs, max %.3fs", steps[0], steps[len(steps)/2], steps[len(steps)-1])
 	}
 	return b.String()
+}
+
+// startAnchor estimates the frame of position 0 for the playback that
+// starts at snaps[i]: the median, over its first two seconds, of each
+// snapshot's frame minus its position. Positions a song that just started
+// could not have reached are stale (the previous track's, reported under
+// the new one) and counted instead; ok is false when none is left.
+func startAnchor(snaps []traceLine, i int, audio []traceLine, rate int) (anchor float64, stale int, ok bool) {
+	p, c := snaps[i-1], snaps[i]
+	var anchors []float64
+	for _, s := range snaps[i:] {
+		if s.T-c.T >= int64(2*time.Second) || s.State != "playing" || s.ID != c.ID {
+			break
+		}
+		if elapsed := float64(s.T-p.T) / 1e9; c.ID != p.ID && s.Pos > elapsed+0.3 {
+			stale++
+			continue
+		}
+		anchors = append(anchors, interpolateFrame(audio, s.T, rate)-s.Pos*float64(rate))
+	}
+	if len(anchors) == 0 {
+		return 0, stale, false
+	}
+	slices.Sort(anchors)
+	return anchors[len(anchors)/2], stale, true
 }
 
 func readTrace(path string) ([]traceLine, int) {
@@ -282,27 +320,37 @@ func interpolateFrame(audio []traceLine, t int64, rate int) float64 {
 	return float64(a.Frame) + float64(t-a.T)/1e9*float64(rate)
 }
 
-// audioOnset finds the first loud frame after at least 200 ms of silence
-// following time from; -1 when there is none within 5 s.
+// audioOnset finds where sound starts after time from (the last
+// observation before playback started): the first audible block after at
+// least 200 ms of silence, confirmed when the sound turns loud. The silence
+// may begin before from (a pause). Spotify fades a resumed song in, so the
+// sound rises through moderate levels and can dip back to quiet on the
+// way; only another 200 ms of silence means it died away and was not the
+// start. -1 when there is none within 5 s.
 func audioOnset(audio []traceLine, from int64) float64 {
 	const loud, quiet = 300, 16
-	var silentSince int64 = -1
+	const silence = int64(200 * time.Millisecond)
+	quietSince := int64(-1) // start of the current run of quiet blocks
+	rise := -1.0            // first frame of sound after a long enough silence
 	for _, a := range audio {
-		if a.T < from {
-			continue
-		}
 		if a.T-from > int64(5*time.Second) {
 			return -1
 		}
-		switch {
-		case a.Peak <= quiet:
-			if silentSince < 0 {
-				silentSince = a.T
+		if a.Peak <= quiet {
+			if quietSince < 0 {
+				quietSince = a.T
 			}
-		case a.Peak >= loud && silentSince >= 0 && a.T-silentSince >= int64(200*time.Millisecond):
-			return float64(a.Frame)
-		default:
-			silentSince = -1
+			if rise >= 0 && a.T-quietSince >= silence {
+				rise = -1 // the sound died away again
+			}
+			continue
+		}
+		if rise < 0 && quietSince >= 0 && a.T-quietSince >= silence && a.T >= from {
+			rise = float64(a.Frame)
+		}
+		quietSince = -1
+		if rise >= 0 && a.Peak >= loud {
+			return rise
 		}
 	}
 	return -1

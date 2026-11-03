@@ -29,7 +29,6 @@ type Player interface {
 	Poll(ctx context.Context) spotify.Snapshot
 	Watch(ctx context.Context, interval time.Duration) <-chan spotify.Snapshot
 	PlayTrack(ctx context.Context, trackURI, contextURI string) error
-	Play(ctx context.Context) error
 	Pause(ctx context.Context) error
 	Next(ctx context.Context) error
 	PlayPause(ctx context.Context) error
@@ -97,7 +96,7 @@ type Options struct {
 	Poll time.Duration
 	// StartTimeout is how long a requested song may take to start.
 	StartTimeout time.Duration
-	// MaxFailures ends a queue session after this many songs in a row
+	// MaxFailures ends a queue session after this many attempts in a row
 	// could not be recorded (silent, not started, cut short); 0 never does.
 	MaxFailures int
 	// Verbose emits boundary diagnostics.
@@ -160,51 +159,79 @@ const (
 	tickEvery           = 500 * time.Millisecond
 	spoolKeep           = 2 * time.Minute // audio kept before the oldest open song
 	cleanupTimeout      = 15 * time.Second
+	resultBuffer        = 64 // finished jobs the worker can report before it waits
 )
 
 // Engine runs one session. Create it with New and call Run once.
+//
+// Its state is grouped by who may touch it: the capture state is shared
+// with the capture goroutine (guarded by spoolMu, or atomic), the worker
+// state links the engine goroutine to the library worker, and everything
+// else belongs to the engine goroutine alone, except the progress snapshot,
+// which is guarded by mu.
 type Engine struct {
+	captureState
+	workerState
+	takeState
+	sessionState
+
 	cfg  Config
 	opts Options
 	tn   Tuning
 	now  func() time.Time
 	plan *Plan
 
-	spoolMu  sync.Mutex
-	spool    *spool.Spool
-	spoolErr error // the first spool write error (guarded by spoolMu)
+	mu       sync.Mutex
+	progress Progress // what Progress returns, refreshed by the engine goroutine
+}
 
-	// streak holds the setbacks since the last song recorded (see setback).
-	streak      []setbackKind
-	lastSetback string
-	// capStart is when capture began; loudAt is the offset from it of the
-	// last block above the silence floor (−1 before any).
+// captureState is shared with the capture goroutine, which appends to the
+// spool through sink.
+type captureState struct {
+	spoolMu  sync.Mutex
+	spool    *spool.Spool // guarded by spoolMu
+	spoolErr error        // the first spool write error (guarded by spoolMu)
+	// capStart is when capture began (set before it starts); loudAt is the
+	// offset from it of the last block above the silence floor (−1 before
+	// any).
 	capStart time.Time
 	loudAt   atomic.Int64
+}
 
+// workerState connects the engine goroutine to the library worker.
+type workerState struct {
 	jobs     *jobQueue
 	results  chan result
-	inflight int // jobs submitted and not yet reported
+	inflight int // jobs submitted and not yet reported (engine goroutine)
 	// working mirrors inflight for other goroutines (the test simulator
 	// holds its clock while library work runs).
 	working atomic.Int32
 	wg      sync.WaitGroup
+}
 
+// takeState is what the engine goroutine follows of Spotify's playback.
+type takeState struct {
 	cur       *take
 	pending   []spotify.Snapshot // observations of another track, awaiting confirmation
 	lastEnded *take
-	finals    []*take
+	finals    []*take // ended takes waiting for their audio
 	last      spotify.Snapshot
 	prevAt    time.Time
 	waiting   *request
 	follow    *followState
-	stopping  bool
-	outcome   string
-	fatal     error
-
 	// earlyEnds holds how early (seconds before their end) consecutive
 	// songs changed on their own, to recognize crossfade.
-	earlyEnds    []float64
+	earlyEnds []float64
+}
+
+// sessionState is the engine goroutine's account of the session.
+type sessionState struct {
+	stopping bool
+	outcome  string
+	fatal    error
+	// streak holds the setbacks since the last song recorded (see setback).
+	streak       []setbackKind
+	lastSetback  string
 	spotifyState session.SpotifyState
 	counts       session.Counts
 	recorded     int
@@ -212,9 +239,6 @@ type Engine struct {
 	lastTick     time.Time
 	goneSince    time.Time
 	warned       map[string]bool
-
-	mu       sync.Mutex
-	progress Progress
 }
 
 // New validates cfg and returns an engine.
@@ -240,8 +264,8 @@ func New(cfg Config) (*Engine, error) {
 	}
 	e := &Engine{
 		cfg: cfg, opts: o, tn: cfg.Tuning, now: cfg.Now,
-		jobs: newJobQueue(), results: make(chan result, 64),
-		warned: map[string]bool{},
+		workerState:  workerState{jobs: newJobQueue(), results: make(chan result, resultBuffer)},
+		sessionState: sessionState{warned: map[string]bool{}},
 	}
 	e.loudAt.Store(-1)
 	return e, nil
@@ -272,7 +296,7 @@ func (e *Engine) Run(ctx context.Context, plan *Plan, controls <-chan Control) R
 	e.instantWork()
 	if plan.Mode != ModeLive && e.pendingRecords() == 0 && !e.hasFollow() {
 		e.drainWorker(ctx)
-		return e.result(e.queueOutcome())
+		return e.result(e.queueOutcome(), nil)
 	}
 
 	if err := e.setupSpotify(ctx); err != nil {
@@ -292,7 +316,7 @@ func (e *Engine) Run(ctx context.Context, plan *Plan, controls <-chan Control) R
 
 	if e.plan.Mode != ModeLive {
 		c, cancel := context.WithTimeout(cleanup, cleanupTimeout)
-		_ = e.cfg.Player.Pause(c)
+		e.command(c, "pause", e.cfg.Player.Pause)
 		cancel()
 	}
 	e.drainWorker(ctx)
@@ -319,6 +343,7 @@ func (e *Engine) loop(ctx context.Context, controls <-chan Control) {
 			return
 		case s, ok := <-snaps:
 			if !ok {
+				snaps = nil // a closed channel would be chosen on every turn
 				e.fail(ErrSpotifyGone)
 				continue
 			}
@@ -425,11 +450,15 @@ func (e *Engine) onTick(ctx context.Context) {
 }
 
 // warn emits a warning event once per distinct message.
-func (e *Engine) warn(msg string) {
-	if e.warned[msg] {
+func (e *Engine) warn(msg string) { e.warnOnce(msg, msg) }
+
+// warnOnce emits a warning event the first time key comes up: for a
+// problem whose message changes each time it recurs.
+func (e *Engine) warnOnce(key, msg string) {
+	if e.warned[key] {
 		return
 	}
-	e.warned[msg] = true
+	e.warned[key] = true
 	e.emit(Event{Type: EventWarning, Message: msg})
 }
 
@@ -440,13 +469,10 @@ func (e *Engine) emit(ev Event) {
 	e.cfg.Emit(ev)
 }
 
-// result finishes the session's accounting. The caller emits
-// session_finished, because only it knows the process exit code.
-func (e *Engine) result(outcome string, err ...error) Result {
-	var fatal error
-	if len(err) > 0 {
-		fatal = err[0]
-	}
+// result finishes the session's accounting; fatal is why it could not
+// continue, if anything. The caller emits session_finished, because only
+// it knows the process exit code.
+func (e *Engine) result(outcome string, fatal error) Result {
 	if outcome == "" {
 		outcome = e.queueOutcome()
 	}

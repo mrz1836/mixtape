@@ -3,10 +3,10 @@ package engine
 import (
 	"bufio"
 	"context"
-	"encoding/binary"
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -81,7 +81,6 @@ func (p *replayPlayer) Watch(context.Context, time.Duration) <-chan spotify.Snap
 }
 
 func (p *replayPlayer) PlayTrack(context.Context, string, string) error { return p.log("play") }
-func (p *replayPlayer) Play(context.Context) error                      { return p.log("play") }
 func (p *replayPlayer) Pause(context.Context) error                     { return p.log("pause") }
 func (p *replayPlayer) Next(context.Context) error                      { return p.log("next") }
 func (p *replayPlayer) PlayPause(context.Context) error                 { return p.log("playpause") }
@@ -90,41 +89,9 @@ func (p *replayPlayer) SetShuffle(context.Context, bool) error          { return
 func (p *replayPlayer) SetRepeat(context.Context, bool) error           { return p.log("repeat") }
 func (p *replayPlayer) SetVolume(context.Context, int) error            { return p.log("volume") }
 
-// replaySource delivers the trace's audio slices.
-type replaySource struct {
-	rate   int
-	mu     sync.Mutex
-	sink   func(capture.Block)
-	events chan capture.Event
-}
-
-func (s *replaySource) Name() string                 { return "replay" }
-func (s *replaySource) Method() capture.Method       { return capture.MethodDevice }
-func (s *replaySource) Format() capture.Format       { return capture.Format{Rate: s.rate, Channels: 2} }
-func (s *replaySource) Events() <-chan capture.Event { return s.events }
-func (s *replaySource) Close() error                 { return nil }
-
-func (s *replaySource) Start(_ context.Context, sink func(capture.Block)) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.sink = sink
-	return nil
-}
-
-func (s *replaySource) emit(frames, peak int, at time.Time) {
-	s.mu.Lock()
-	sink := s.sink
-	s.mu.Unlock()
-	pcm := make([]byte, frames*4)
-	for i := 0; i+1 < len(pcm); i += 2 {
-		binary.LittleEndian.PutUint16(pcm[i:], uint16(min(peak, 32767)))
-	}
-	sink(capture.Block{PCM: pcm, Frames: frames, At: at})
-}
-
 // replay runs the engine in live mode over a golden trace and returns the
-// events and the library it recorded into.
-func replay(t *testing.T, name string) ([]Event, *library.Library, *fakeEncoder) {
+// events, the encoder that saw every cut, and the trace's sample rate.
+func replay(t *testing.T, name string) ([]Event, *fakeEncoder, int) {
 	t.Helper()
 	rate, lines := loadFixture(t, name)
 	t0 := time.Date(2026, 11, 2, 12, 0, 0, 0, time.UTC)
@@ -140,8 +107,8 @@ func replay(t *testing.T, name string) ([]Event, *library.Library, *fakeEncoder)
 	snap := func(l fixtureLine) spotify.Snapshot {
 		s := spotify.Snapshot{At: t0.Add(time.Duration(l.T)), State: spotify.State(l.State), Position: l.Pos, Volume: 100}
 		s.Track = spotify.Track{URI: l.URI, Name: l.Name, Artist: "Artist", Duration: time.Duration(l.DurMS) * time.Millisecond}
-		if len(l.URI) > len("spotify:track:") && l.URI[:len("spotify:track:")] == "spotify:track:" {
-			s.Track.ID = l.URI[len("spotify:track:"):]
+		if id, ok := strings.CutPrefix(l.URI, "spotify:track:"); ok {
+			s.Track.ID = id
 		}
 		return s
 	}
@@ -152,8 +119,8 @@ func replay(t *testing.T, name string) ([]Event, *library.Library, *fakeEncoder)
 			break
 		}
 	}
-	src := &replaySource{rate: rate, events: make(chan capture.Event)}
-	enc := &fakeEncoder{frames: map[string]int64{}}
+	src := &fakeSource{rate: rate, events: make(chan capture.Event)}
+	enc := newFakeEncoder()
 	home := t.TempDir()
 	lib, err := library.Open(t.TempDir(), library.Options{Encoder: enc, WorkDir: filepath.Join(home, "work"), Now: clock})
 	require.NoError(t, err)
@@ -169,12 +136,28 @@ func replay(t *testing.T, name string) ([]Event, *library.Library, *fakeEncoder)
 	require.NoError(t, Prepare(lib, plan))
 
 	controls := make(chan Control, 1)
-	go func() {
-		for src.sinkReady() == nil {
-			time.Sleep(time.Millisecond)
+	ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
+	defer cancel()
+	// send delivers a snapshot unless the session is over.
+	send := func(s spotify.Snapshot) bool {
+		select {
+		case p.ch <- s:
+			return true
+		case <-ctx.Done():
+			return false
+		}
+	}
+	var feeder sync.WaitGroup
+	feeder.Go(func() {
+		for !src.started() {
+			select {
+			case <-ctx.Done():
+				return // capture never started: Run reports why
+			case <-time.After(time.Millisecond):
+			}
 		}
 		for _, l := range lines {
-			for eng.working.Load() > 0 {
+			for eng.working.Load() > 0 && ctx.Err() == nil {
 				time.Sleep(200 * time.Microsecond)
 			}
 			mu.Lock()
@@ -182,9 +165,11 @@ func replay(t *testing.T, name string) ([]Event, *library.Library, *fakeEncoder)
 			mu.Unlock()
 			switch l.K {
 			case "a":
-				src.emit(l.N, l.Peak, t0.Add(time.Duration(l.T)))
+				src.emitLevel(l.N, l.Peak, t0.Add(time.Duration(l.T)))
 			case "s":
-				p.ch <- snap(l)
+				if !send(snap(l)) {
+					return
+				}
 			}
 		}
 		controls <- ControlStop
@@ -194,20 +179,16 @@ func replay(t *testing.T, name string) ([]Event, *library.Library, *fakeEncoder)
 			now = now.Add(100 * time.Millisecond)
 			at := now
 			mu.Unlock()
-			src.emit(rate/10, 0, at)
-			p.ch <- spotify.Snapshot{At: at, State: spotify.StatePaused}
+			src.emitLevel(rate/10, 0, at)
+			if !send(spotify.Snapshot{At: at, State: spotify.StatePaused}) {
+				return
+			}
 		}
-	}()
-	ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
-	defer cancel()
+	})
 	eng.Run(ctx, plan, controls)
-	return events, lib, enc
-}
-
-func (s *replaySource) sinkReady() func(capture.Block) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.sink
+	cancel() // the feeder may still be offering snapshots nobody reads
+	feeder.Wait()
+	return events, enc, rate
 }
 
 // TestGoldenTraceCompleteSongWithPause replays a real Spotify session:
@@ -215,7 +196,7 @@ func (s *replaySource) sinkReady() func(capture.Block) {
 // resumed, played out gaplessly into "Breathe", which was paused 7 s in.
 func TestGoldenTraceCompleteSongWithPause(t *testing.T) {
 	t.Parallel()
-	events, _, enc := replay(t, "trace-complete.ndjson")
+	events, enc, rate := replay(t, "trace-complete.ndjson")
 
 	var saved, discarded []Event
 	for _, ev := range events {
@@ -236,7 +217,6 @@ func TestGoldenTraceCompleteSongWithPause(t *testing.T) {
 	// margins, to within 50 ms.
 	frames := enc.totalFrames()
 	require.Len(t, frames, 1)
-	rate, _ := loadFixture(t, "trace-complete.ndjson")
 	want := float64(64333)/1000 + 2*DefaultTuning().Margin.Seconds()
 	assert.InDelta(t, want, float64(frames[0])/float64(rate), 0.05)
 }

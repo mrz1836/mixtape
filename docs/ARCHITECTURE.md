@@ -13,7 +13,7 @@ AppleScript, is the player state: which track is loaded, whether it plays,
 and its position. Mixtape captures the Mac's audio and lines the two up:
 
 - **Audio** arrives as timestamped PCM from one of two capture backends.
-- **Player observations** arrive about every 120 ms from one long-running
+- **Player observations** arrive every 150 ms from one long-running
   `osascript` process.
 - Both carry times on the same monotonic clock, so every observation can be
   placed on the audio timeline.
@@ -31,17 +31,20 @@ cmd/mixtape            two-line main: build metadata in, exit code out
 internal/cli           the command tree (cobra), output, errors and exit codes
 internal/config        config.json + MIXTAPE_* environment + flags
 internal/spotify       links, the AppleScript player, the catalog, prefs
-internal/capture       backend-neutral types and method selection (no cgo)
+internal/capture       backend-neutral types, method selection and the shared
+                       start/stop lifecycle of a source (no cgo)
   capture/tap          Core Audio process tap (Objective-C, macOS 14.2+)
   capture/device       capture device such as BlackHole (malgo)
 internal/spool         append-only chunked PCM on disk with a time index
 internal/engine        plan, steer, observe, segment, commit
 internal/library       folders, manifests, naming, encode/tag/hash, verify
-internal/mp4tag        pure-Go MP4 tag writer (ilst, ---- freeform, covr)
+internal/mp4tag        pure-Go MP4 tags: read and write ilst, ---- freeform and
+                       covr atoms, fix chunk offsets, hash the audio
 internal/session       recorder lock, session.json, event log, detach
 internal/permission    macOS privacy permissions of the host app (C)
 internal/fileutil      atomic writes and copies
 internal/wav           the 44-byte PCM WAV header
+internal/testutil      test-only: synthetic M4A and WAV files, a stand-in encoder
 ```
 
 Cgo lives only in `capture/tap` and `capture/device`. Everything that
@@ -104,7 +107,9 @@ Every captured frame goes to disk, in 30-second chunk files under
 `~/.mixtape/spool`, with a sparse index of (frame, time) anchors one per
 50 ms. `FrameAt(t)` interpolates between anchors. Memory stays at one chunk
 whatever the session length; songs are frame ranges cut out of the spool
-after they end, and old chunks are pruned behind the oldest open song.
+after they end, and old chunks are pruned behind the oldest open song. A
+pruned chunk that cannot be deleted is tried again at the next prune and
+when the spool closes (the session warns once).
 
 <br>
 
@@ -119,15 +124,18 @@ has far less timing jitter.
 
 The script never launches Spotify: every query sits behind `application
 "Spotify" is running`. Every value spliced into AppleScript is a validated
-base62 ID.
+base62 ID. The lines are read as they come; system log noise on the same
+stream is skipped, and an absurdly long line is cut rather than ending the
+watch.
 
 <br>
 
 ## Measured Spotify behavior
 
 These come from `mixtape debug trace` runs against Spotify 1.2 on macOS 15
-(BlackHole at 48 kHz, 100 ms polls). A trimmed trace is the golden fixture
-`internal/engine/testdata/trace-complete.ndjson`.
+(BlackHole at 48 kHz, 100 ms polls) and, for the pause and old-track rows,
+recordings with the process tap on macOS 15.8. A trimmed trace is the golden
+fixture `internal/engine/testdata/trace-complete.ndjson`.
 
 | Behavior | Measurement | Consequence |
 |---|---|---|
@@ -140,6 +148,8 @@ These come from `mixtape debug trace` runs against Spotify 1.2 on macOS 15
 | Track blips | while it loads a song, Spotify can report another track for 1–11 polls | a change away from a take with no believable position, or to a track that appears mid-song, counts once it holds for 1 s |
 | Track change | the new title and duration can appear one poll before the new URI | half-updated snapshots are ignored |
 | Paused load | `play track` shows the new track paused for one poll before it plays | the take starts recording when it plays |
+| Old track after `play track` | Spotify can report the track it is leaving, as it was (even paused), for a poll before the new one | while a request waits, that track is not taken for Spotify skipping the requested song |
+| Pause and resume | Spotify fades the sound out over ~0.5 s when paused and back in on resume; just after a resume its position runs 0.4–0.6 s ahead of the sound | the pause is cut out, but a song paused mid-way keeps an audible dip of ~0.7 s there (about 0.2 s of it silence): for a seamless file, do not pause |
 | Crossfade | the reported duration drops by the crossfade time ~1.4 s into a song; albums are exempt | detected from the first song (exit 3) |
 | Prefs | `audio.crossfade_v2` in `prefs` is stale once `audio.crossfade_migrated_to_ps=true` | it is a warning, not a verdict |
 | Settings writes | `set shuffling`/`set repeating` take effect, but a read in the same script still returns the old value | settings are read back on the next observation, never right after a write |
@@ -162,10 +172,13 @@ frame ranges to keep and a verdict.
 2. **Runs.** A pause, or an anchor jumping by more than `SeekJump` (0.75 s),
    starts a new run. The anchor of a run is the median of its samples.
 3. **Coverage.** Each run covers positions [start, end]: a run that began in
-   the poll after the previous track ended starts at 0; a resumed run starts
-   at the paused position; the last run ends at the duration if the last
-   position was within `EndSlack` (1.5 s) of it and mixtape did not cause the
-   change.
+   the poll after the previous track ended starts at 0; a run that resumed
+   where it paused (its first position is the paused one plus at most the
+   time since the observation before it, give or take `Gap`) starts at the
+   paused position; any other run starts where its own positions say, so a
+   slider moved while paused is a seek. The last run ends at the duration if
+   the last position was within `EndSlack` (1.5 s) of it and mixtape did not
+   cause the change. A run never ends before it starts.
 4. **Ranges.** Each run contributes `[anchor + start·rate, anchor + end·rate)`;
    the audio between runs (the pauses) is dropped, and `Margin` (150 ms) is
    added before the first and after the last frame.
@@ -197,11 +210,12 @@ goes somewhere else (Spotify Connect, a muted Spotify), and the error says
 so (exit 3). After the first audible sample, silence only invalidates the
 song it falls in.
 
-**Failures in a row.** Each song (or attempt) that cannot be recorded for a
-reason outside mixtape's and the listener's control is a setback: a silent
-song, a request Spotify does not start, a cut-short take, a failed render.
-A skip, a stop, or mixtape's own restart is not. After `MaxFailures` (3)
-setbacks in a row the session ends with what they have in common:
+**Failures in a row.** Each attempt that cannot be recorded for a reason
+outside mixtape's and the listener's control is a setback: a silent take, a
+request Spotify does not start, a cut-short take, a failed render. A skip, a
+stop, or mixtape's own restart is not. A song is tried twice, so three
+setbacks can be two songs. After `MaxFailures` (3) setbacks in a row the
+session ends with what they have in common:
 `ErrNoSound` (all silent), `ErrNotStarting` (none started), or `ErrFailing`.
 A recorded song resets the count. Without this, a signed-out Spotify would
 burn two 15 s waits on every song, and Spotify Connect would play every song
@@ -252,13 +266,18 @@ listed songs playing one after the other in order mean the context wrapped
 around (playback beyond the list never returns to it otherwise). Spotify
 skips the same unplayable songs on every pass, so this holds even when the
 first song never plays. Without a list, the first two songs seen repeating
-mark the loop.
+mark the loop. Several such playlists are followed one after the other. Right
+after mixtape moves Spotify on (to the playlist, or with "next"), Spotify can
+report the track it left once more; that report is not taken for a song of
+the playlist.
 
 **Live mode.** With no links, mixtape records whatever plays into `Singles`
 (or `--into`). Songs already in that folder are skipped with "next"; songs
 complete elsewhere are copied and skipped; a song joined mid-way is
-restarted from the top. `--match` limits recording to matching titles and
-leaves the rest alone.
+restarted from the top. A song cut short (a skip, a seek) is not requested
+again, but is recorded if it plays again. `--match` limits recording to
+matching titles and leaves the rest alone; once `--limit` songs are recorded
+or on their way, whatever plays next is left alone too.
 
 <br>
 
@@ -314,13 +333,17 @@ leaves the rest alone.
 **Commit pipeline.** Render the ranges to a WAV in `~/.mixtape/work` →
 `afconvert -f m4af -d aac -b 256000` → hash `mdat` → tag → write into the
 folder (temp file, fsync, rename) → manifest (atomic) → `.m3u8`. If encoding
-fails, the WAV moves to `work/failed/`, the song is `encode_failed`, and the
-next run encodes it again without recording. A partial take (`--keep-partial`)
-never replaces a complete file of the same song: it is discarded instead.
+or tagging fails, the WAV moves to `work/failed/`, the song is
+`encode_failed`, and the next run encodes it again without recording; a
+retry that cannot write the file (an unplugged drive) keeps the WAV for the
+one after. A partial take (`--keep-partial`) never replaces a complete file
+of the same song: it is discarded instead.
 
-**Crash consistency.** A song whose file exists with matching tags but whose
-manifest entry is not done (a crash between rename and manifest write) is
-reconciled to recorded. Stale temp files, and kept WAVs such a repair made
+**Crash consistency.** A song whose file exists with matching tags and intact
+audio (its `mdat` matches its own `MIXTAPE_AUDIO_SHA256`) but whose manifest
+entry is not done (a crash between rename and manifest write) is reconciled
+to recorded. A file whose audio no longer matches is left for `verify` and
+recorded again. Stale temp files, and kept WAVs such a repair made
 unnecessary, are removed by the next writer: opening the library only reads.
 An embed page without a track list is never taken for an empty collection
 (which would mark every song removed); mixtape follows the collection in
@@ -340,4 +363,7 @@ unmounted (missing, or more than half of its files missing) unless `--force`.
 Both are `flock`s; contention exits 6. The recorder lock file names the
 holder's PID, session ID and home, so `status`, `wait` and `stop` find the
 session from any home, and `stop` signals only a process that holds the
-lock: never a reused PID.
+lock: never a reused PID. A lock that cannot be read says nothing about the
+session: `stop` keeps looking until its 2-minute limit and `status --follow`
+for 30 s, then they report the error instead of taking the session for
+stopped.

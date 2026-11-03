@@ -3,7 +3,6 @@ package library
 import (
 	"strings"
 	"testing"
-	"time"
 	"unicode/utf8"
 
 	"github.com/stretchr/testify/assert"
@@ -76,12 +75,4 @@ func TestFolderName(t *testing.T) {
 	assert.Equal(t, "Abbey-Road", folderName(Spec{Kind: KindAlbum, Name: "Abbey Road"}))
 	assert.Equal(t, "Singles", folderName(Spec{Kind: KindSingles, Name: "whatever"}))
 	assert.Equal(t, "Road-Trip", folderName(Spec{Kind: KindFolder, Name: "Road Trip"}))
-}
-
-func TestMMSS(t *testing.T) {
-	t.Parallel()
-	cases := map[int]string{0: "0:00", 59: "0:59", 60: "1:00", 192: "3:12", 904: "15:04"}
-	for secs, want := range cases {
-		assert.Equal(t, want, MMSS(time.Duration(secs)*time.Second))
-	}
 }

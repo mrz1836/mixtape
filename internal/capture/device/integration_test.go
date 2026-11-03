@@ -1,13 +1,14 @@
 //go:build captureintegration && darwin && cgo
 
-// This test opens a real capture device. It triggers the macOS microphone
-// prompt for the host app the first time, so it runs only on request:
+// This test opens a real capture device (MIXTAPE_TEST_DEVICE, default
+// BlackHole). It triggers the macOS microphone prompt for the host app the
+// first time, so it runs only on request:
 //
-//	MIXTAPE_LIVE_CAPTURE=1 MIXTAPE_TEST_DEVICE=BlackHole go test -tags captureintegration -run Integration -v ./internal/capture/device/
+//	MIXTAPE_LIVE_CAPTURE=1 magex test
 //
-// The build tag alone is not enough: tools that enable every discovered
-// tag (magex test) must never open live audio, so the environment variable
-// is required too.
+// magex test enables every build tag it finds, captureintegration
+// included, so the tag alone must stay harmless: the environment variable
+// is what opens live audio.
 package device
 
 import (
@@ -22,11 +23,12 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/mrz1836/mixtape/internal/capture"
+	"github.com/mrz1836/mixtape/internal/testutil"
 )
 
 func TestIntegrationDeviceRecords(t *testing.T) {
 	t.Parallel()
-	requireLive(t)
+	testutil.RequireLive(t)
 	name := os.Getenv("MIXTAPE_TEST_DEVICE")
 	if name == "" {
 		name = "BlackHole"
@@ -63,12 +65,4 @@ func TestIntegrationDeviceRecords(t *testing.T) {
 	defer mu.Unlock()
 	t.Logf("%d frames (%.2fs), peak %d, largest block gap %v", frames, float64(frames)/float64(f.Rate), peak, maxGap)
 	assert.Positive(t, frames)
-}
-
-// requireLive skips unless live capture tests were asked for explicitly.
-func requireLive(t *testing.T) {
-	t.Helper()
-	if os.Getenv("MIXTAPE_LIVE_CAPTURE") != "1" {
-		t.Skip("live capture test: set MIXTAPE_LIVE_CAPTURE=1 (needs Spotify playing and the owner present)")
-	}
 }

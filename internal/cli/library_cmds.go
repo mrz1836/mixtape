@@ -4,7 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"strings"
-	"text/tabwriter"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -71,11 +70,7 @@ what the next 'mixtape record' would do with it (skip, copy or record).`,
 		GroupID: groupLibrary,
 		Args:    cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			s, err := a.settings(config.Overrides{})
-			if err != nil {
-				return err
-			}
-			lib, err := library.Open(s.Library, a.libraryOptions())
+			lib, _, err := a.openLibrary(config.Overrides{})
 			if err != nil {
 				return err
 			}
@@ -99,7 +94,7 @@ func summarize(c *library.Collection) collectionDoc {
 			continue
 		case e.Status.Done() && !e.Partial:
 			d.Done++
-		case e.Status == library.StatusFailed || e.Status == library.StatusUnavailable || e.Status == library.StatusEncodeFailed:
+		case e.Status.Failed():
 			d.Failed++
 		default:
 			d.Pending++
@@ -111,29 +106,30 @@ func summarize(c *library.Collection) collectionDoc {
 
 func (a *app) listCollections(lib *library.Library) error {
 	doc := listDoc{Library: lib.Root(), Collections: []collectionDoc{}}
-	var b strings.Builder
-	tw := tabwriter.NewWriter(&b, 0, 0, 2, ' ', 0)
-	_, _ = fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n", a.out.paint(colorBold, "FOLDER"), a.out.paint(colorBold, "KIND"),
-		a.out.paint(colorBold, "DONE"), a.out.paint(colorBold, "NAME"))
 	for _, c := range lib.Collections() {
-		d := summarize(c)
-		doc.Collections = append(doc.Collections, d)
+		doc.Collections = append(doc.Collections, summarize(c))
+	}
+	return a.out.Result(a.collectionsText(doc), doc)
+}
+
+// collectionsText renders `list` for people.
+func (a *app) collectionsText(doc listDoc) string {
+	if len(doc.Collections) == 0 {
+		return "the library at " + doc.Library + " is empty: start with 'mixtape record <link>'"
+	}
+	rows := make([][]string, 0, len(doc.Collections))
+	for _, d := range doc.Collections {
 		progress := fmt.Sprintf("%d/%d", d.Done, d.Songs)
 		if d.Failed > 0 {
 			progress += a.out.paint(colorYellow, fmt.Sprintf(" (%d failed)", d.Failed))
 		}
-		_, _ = fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n", d.Folder, d.Kind, progress, d.Name)
+		rows = append(rows, []string{d.Folder, d.Kind, progress, d.Name})
 	}
-	_ = tw.Flush()
-	text := strings.TrimRight(b.String(), "\n")
-	if len(doc.Collections) == 0 {
-		text = "the library at " + lib.Root() + " is empty: start with 'mixtape record <link>'"
-	}
-	return a.out.Result(text, doc)
+	return a.out.table([]string{"FOLDER", "KIND", "DONE", "NAME"}, rows)
 }
 
 func (a *app) listLink(cmd *cobra.Command, lib *library.Library, link string) error {
-	refs, err := parseRefs(cmd, []string{link})
+	refs, err := parseRefs(cmd.CommandPath(), []string{link})
 	if err != nil {
 		return err
 	}
@@ -141,47 +137,52 @@ func (a *app) listLink(cmd *cobra.Command, lib *library.Library, link string) er
 	if err != nil {
 		return err
 	}
-	plan := engine.BuildPlan(lib, cols, engine.PlanOptions{})
+	// One link is one folder: the plan has a single group.
+	g := engine.BuildPlan(lib, cols, engine.PlanOptions{}).Groups[0]
 	doc := listLinkDoc{Library: lib.Root(), Name: cols[0].Name, Tracks: []trackDoc{}}
-	var b strings.Builder
-	for _, g := range plan.Groups {
-		if g.Collection != nil {
-			d := summarize(g.Collection)
-			doc.Collection = &d
+	if g.Collection != nil {
+		d := summarize(g.Collection)
+		doc.Collection = &d
+	}
+	for i, it := range g.Items {
+		td := trackDoc{
+			Position: i + 1, ID: it.Track.ID, Title: it.Track.Title, Artist: it.Track.Artist,
+			Status: "new", Action: string(it.Action),
 		}
-		fmt.Fprintf(&b, "%s", a.out.paint(colorBold, g.Spec.Name))
-		for i, it := range g.Items {
-			td := trackDoc{
-				Position: i + 1, ID: it.Track.ID, Title: it.Track.Title, Artist: it.Track.Artist,
-				Status: "new", Action: string(it.Action),
-			}
-			if g.Collection != nil {
-				if e := g.Collection.Entry(it.Track.ID); e != nil {
-					td.Status, td.File, td.FailReason = string(e.Status), e.File, e.FailReason
-					if e.Partial {
-						td.Status = "partial"
-					}
+		if g.Collection != nil {
+			if e := g.Collection.Entry(it.Track.ID); e != nil {
+				td.Status, td.File, td.FailReason = string(e.Status), e.File, e.FailReason
+				if e.Partial {
+					td.Status = "partial"
 				}
 			}
-			doc.Tracks = append(doc.Tracks, td)
-			fmt.Fprintf(&b, "\n  %3d  %-13s %s", td.Position, a.statusMark(td.Status), songLabel(td.Artist, td.Title))
-			if td.FailReason != "" {
-				b.WriteString(a.out.paint(colorDim, "  ("+td.FailReason+")"))
-			}
+		}
+		doc.Tracks = append(doc.Tracks, td)
+	}
+	return a.out.Result(a.linkText(doc, g.Spec.Name), doc)
+}
+
+// linkText renders `list LINK` for people, under the folder's name.
+func (a *app) linkText(doc listLinkDoc, folder string) string {
+	var b strings.Builder
+	b.WriteString(a.out.paint(colorBold, folder))
+	for _, td := range doc.Tracks {
+		fmt.Fprintf(&b, "\n  %3d  %-13s %s", td.Position, a.statusMark(td.Status), songLabel(td.Artist, td.Title))
+		if td.FailReason != "" {
+			b.WriteString(a.out.paint(colorDim, "  ("+td.FailReason+")"))
 		}
 	}
-	return a.out.Result(b.String(), doc)
+	return b.String()
 }
 
 // statusMark colors a song status for the terminal.
 func (a *app) statusMark(status string) string {
 	pad := fmt.Sprintf("%-13s", status)
-	switch library.Status(status) {
-	case library.StatusRecorded, library.StatusCopied:
+	switch st := library.Status(status); {
+	case st == library.StatusRecorded || st == library.StatusCopied:
 		return a.out.paint(colorGreen, pad)
-	case library.StatusFailed, library.StatusUnavailable, library.StatusEncodeFailed:
+	case st.Failed():
 		return a.out.paint(colorRed, pad)
-	case library.StatusPending, library.StatusRemoved:
 	}
 	return a.out.paint(colorDim, pad)
 }
@@ -209,11 +210,7 @@ Exits 0 when the library is consistent and 1 when problems remain.`,
 		GroupID: groupLibrary,
 		Args:    cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			s, err := a.settings(config.Overrides{})
-			if err != nil {
-				return err
-			}
-			lib, err := library.Open(s.Library, a.libraryOptions())
+			lib, _, err := a.openLibrary(config.Overrides{})
 			if err != nil {
 				return err
 			}
@@ -234,7 +231,8 @@ Exits 0 when the library is consistent and 1 when problems remain.`,
 			if serious := seriousProblems(rep); serious > 0 {
 				hint := "run 'mixtape verify --fix'"
 				if fix {
-					hint = "the next 'mixtape record' run re-records songs set back to pending"
+					hint = "--fix leaves these to you: move a file back into its folder, or replace or delete a file " +
+						"tagged for another song (then 'mixtape record' records what is missing)"
 				}
 				return newError(ExitError, errVerify, hint, "%d problem(s) in the library", serious)
 			}

@@ -8,6 +8,9 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/mrz1836/mixtape/internal/capture"
+	"github.com/mrz1836/mixtape/internal/testutil"
 )
 
 const testHome = "/Users/test"
@@ -16,15 +19,13 @@ func env(m map[string]string) func(string) string {
 	return func(k string) string { return m[k] }
 }
 
-func ptr[T any](v T) *T { return &v }
-
 func TestResolveDefaults(t *testing.T) {
 	t.Parallel()
 	s, err := Resolve(File{}, env(nil), Overrides{}, testHome)
 	require.NoError(t, err)
 
 	assert.Equal(t, "/Users/test/Music/Mixtape", s.Library)
-	assert.Equal(t, CaptureAuto, s.Capture)
+	assert.Equal(t, capture.MethodAuto, s.Capture)
 	assert.Equal(t, DefaultDevice, s.Device)
 	assert.False(t, s.Artwork)
 	assert.Equal(t, 10*time.Minute, s.IdleTimeout)
@@ -36,20 +37,20 @@ func TestResolveDefaults(t *testing.T) {
 func TestResolvePrecedence(t *testing.T) {
 	t.Parallel()
 	f := File{
-		Library:     ptr("~/Archive"),
-		Capture:     ptr("device"),
-		Artwork:     ptr(true),
-		IdleTimeout: ptr("5m"),
+		Library:     testutil.Ptr("~/Archive"),
+		Capture:     testutil.Ptr("device"),
+		Artwork:     testutil.Ptr(true),
+		IdleTimeout: testutil.Ptr("5m"),
 	}
 	e := env(map[string]string{EnvCapture: "TAP", EnvDevice: "Loopback"})
-	o := Overrides{Library: ptr("/Volumes/Ext/Music"), IdleTimeout: ptr(time.Duration(0))}
+	o := Overrides{Library: testutil.Ptr("/Volumes/Ext/Music"), IdleTimeout: testutil.Ptr(time.Duration(0))}
 
 	s, err := Resolve(f, e, o, testHome)
 	require.NoError(t, err)
 
 	assert.Equal(t, "/Volumes/Ext/Music", s.Library)
 	assert.Equal(t, SourceFlag, s.Sources[KeyLibrary])
-	assert.Equal(t, CaptureTap, s.Capture, "env beats file, and values are case-folded")
+	assert.Equal(t, capture.MethodTap, s.Capture, "env beats file, and values are case-folded")
 	assert.Equal(t, SourceEnv, s.Sources[KeyCapture])
 	assert.Equal(t, "Loopback", s.Device)
 	assert.True(t, s.Artwork)
@@ -64,12 +65,12 @@ func TestResolveInvalid(t *testing.T) {
 		file File
 		env  map[string]string
 	}{
-		"bad capture in file":   {file: File{Capture: ptr("blackhole")}},
+		"bad capture in file":   {file: File{Capture: testutil.Ptr("blackhole")}},
 		"bad duration in env":   {env: map[string]string{EnvIdleTimeout: "soon"}},
 		"negative duration":     {env: map[string]string{EnvIdleTimeout: "-1m"}},
 		"bad bool in env":       {env: map[string]string{EnvArtwork: "maybe"}},
-		"empty library in file": {file: File{Library: ptr("  ")}},
-		"empty device in file":  {file: File{Device: ptr("")}},
+		"empty library in file": {file: File{Library: testutil.Ptr("  ")}},
+		"empty device in file":  {file: File{Device: testutil.Ptr("")}},
 	}
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -143,10 +144,10 @@ func TestMaxFailures(t *testing.T) {
 	assert.Equal(t, DefaultMaxFailures, s.MaxFailures)
 	assert.Equal(t, "3", s.Value(KeyMaxFailures))
 
-	s, err = Resolve(File{MaxFailures: ptr(5)}, env(map[string]string{EnvMaxFailures: "2"}), Overrides{}, testHome)
+	s, err = Resolve(File{MaxFailures: testutil.Ptr(5)}, env(map[string]string{EnvMaxFailures: "2"}), Overrides{}, testHome)
 	require.NoError(t, err)
 	assert.Equal(t, 2, s.MaxFailures, "env beats file")
-	s, err = Resolve(File{MaxFailures: ptr(5)}, env(nil), Overrides{MaxFailures: ptr(0)}, testHome)
+	s, err = Resolve(File{MaxFailures: testutil.Ptr(5)}, env(nil), Overrides{MaxFailures: testutil.Ptr(0)}, testHome)
 	require.NoError(t, err)
 	assert.Equal(t, 0, s.MaxFailures, "a flag beats both; 0 means never")
 	assert.Equal(t, SourceFlag, s.Sources[KeyMaxFailures])
@@ -195,7 +196,7 @@ func TestSettingsValue(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "false", s.Value(KeyArtwork))
 	assert.Equal(t, "10m0s", s.Value(KeyIdleTimeout))
-	assert.Equal(t, CaptureAuto, s.Value(KeyCapture))
+	assert.Equal(t, "auto", s.Value(KeyCapture))
 	assert.Empty(t, s.Value("nope"))
 }
 
@@ -213,4 +214,43 @@ func TestPaths(t *testing.T) {
 	t.Parallel()
 	assert.Equal(t, "/Users/test/.mixtape", DefaultHome(testHome))
 	assert.Equal(t, "/h/config.json", Path("/h"))
+}
+
+func TestLoadIgnoresKeysThatDifferInCase(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "config.json")
+	require.NoError(t, os.WriteFile(path, []byte(`{"LIBRARY": "/elsewhere", "Device": "Loopback"}`), 0o600))
+	f, warnings, err := Load(path)
+	require.NoError(t, err)
+	assert.Equal(t, File{}, f, "a key the warning calls ignored is ignored")
+	assert.Len(t, warnings, 2)
+}
+
+func TestLoadNamesTheKeyOfAWrongType(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "config.json")
+	require.NoError(t, os.WriteFile(path, []byte(`{"artwork": "yes"}`), 0o600))
+	_, _, err := Load(path)
+	require.ErrorIs(t, err, ErrDecode)
+	assert.Contains(t, err.Error(), "artwork")
+}
+
+func TestEverySettingIsDescribedOnce(t *testing.T) {
+	t.Parallel()
+	names := map[string]bool{}
+	envs := map[string]bool{}
+	for _, st := range table() {
+		assert.False(t, names[st.Name], st.Name)
+		assert.False(t, envs[st.Env], st.Env)
+		names[st.Name], envs[st.Env] = true, true
+		assert.NotEmpty(t, st.Help, st.Name)
+		var defaults Settings
+		require.NoError(t, st.apply(&defaults, st.Default, testHome), "the documented default of %s parses", st.Name)
+		var f File
+		var o Overrides
+		_, inFile := fieldText(st.inFile(&f))
+		_, inFlag := fieldText(st.inFlag(&o))
+		assert.False(t, inFile || inFlag, "a zero File and Overrides set nothing")
+	}
+	assert.Len(t, Keys(), len(names))
 }

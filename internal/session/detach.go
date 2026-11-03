@@ -6,9 +6,10 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"syscall"
 	"time"
+
+	"github.com/mrz1836/mixtape/internal/fileutil"
 )
 
 // EnvDetached marks the background child of `record --detach`; its value
@@ -24,17 +25,14 @@ var ErrDetachFailed = errors.New("the background session exited before it starte
 // and stdout and stderr appended to logPath. env is added to the current
 // environment. It returns the child's PID without waiting for it.
 func Spawn(exe string, args, env []string, logPath string) (*os.Process, error) {
-	if err := os.MkdirAll(filepath.Dir(logPath), 0o700); err != nil {
-		return nil, err
-	}
-	logFile, err := os.OpenFile(filepath.Clean(logPath), os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o600)
+	logFile, err := fileutil.OpenAppend(logPath)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("open session log: %w", err)
 	}
 	defer func() { _ = logFile.Close() }()
 	devNull, err := os.Open(os.DevNull)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("start background session: %w", err)
 	}
 	defer func() { _ = devNull.Close() }()
 

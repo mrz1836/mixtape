@@ -1,13 +1,10 @@
 package library
 
 import (
-	"context"
+	"encoding/json"
 	"errors"
-	"math"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -15,7 +12,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/mrz1836/mixtape/internal/mp4tag"
-	"github.com/mrz1836/mixtape/internal/wav"
+	"github.com/mrz1836/mixtape/internal/testutil"
 )
 
 // Public track IDs used across the tests.
@@ -29,24 +26,11 @@ const (
 
 var errFakeEncode = errors.New("fake encoder failure")
 
-// requireAAC skips the test unless afconvert can encode AAC here (the
-// encoder is invisible inside a sandbox). afconvert -hf exits non-zero
-// even on success, so only its listing counts.
-func requireAAC(t *testing.T) {
-	t.Helper()
-	if _, err := exec.LookPath("afconvert"); err != nil {
-		t.Skip("afconvert not available (macOS only)")
-	}
-	out, _ := exec.CommandContext(t.Context(), "afconvert", "-hf").CombinedOutput()
-	if !strings.Contains(string(out), "'aac '") {
-		t.Skip("afconvert cannot encode AAC here (sandboxed?)")
-	}
-}
-
 // fixture is a library in a temp dir with captured warnings.
 type fixture struct {
 	t     *testing.T
 	lib   *Library
+	enc   Encoder // every Open of the fixture encodes with it
 	root  string
 	work  string
 	now   time.Time
@@ -54,17 +38,25 @@ type fixture struct {
 	warns []string
 }
 
+// newFixture opens a library in a temp dir that encodes with enc. Unlike
+// Options, nil means a testutil.Encoder, so the suite runs where afconvert
+// cannot encode AAC (Linux CI, sandboxes); pass AFConvert{} for the real
+// encoder.
 func newFixture(t *testing.T, enc Encoder) *fixture {
 	t.Helper()
-	f := &fixture{t: t, root: t.TempDir(), work: t.TempDir(), now: time.Date(2026, 11, 2, 9, 30, 0, 0, time.UTC)}
-	f.lib = f.open(enc)
+	if enc == nil {
+		enc = &testutil.Encoder{}
+	}
+	f := &fixture{t: t, enc: enc, root: t.TempDir(), work: t.TempDir(), now: time.Date(2026, 11, 2, 9, 30, 0, 0, time.UTC)}
+	f.lib = f.open()
 	return f
 }
 
-func (f *fixture) open(enc Encoder) *Library {
+// open opens the library again, as the next run of mixtape would.
+func (f *fixture) open() *Library {
 	f.t.Helper()
 	lib, err := Open(f.root, Options{
-		Encoder: enc,
+		Encoder: f.enc,
 		WorkDir: f.work,
 		Now:     func() time.Time { return f.now },
 		Warn: func(msg string) {
@@ -77,29 +69,18 @@ func (f *fixture) open(enc Encoder) *Library {
 	return lib
 }
 
-// wav writes a short stereo sine WAV at freq Hz; distinct frequencies give
-// distinct audio hashes.
-func (f *fixture) wav(freq float64) string {
-	f.t.Helper()
-	const rate = 44100
-	n := rate / 5 // 0.2s
-	data := make([]byte, 0, n*4)
-	for i := range n {
-		v := int16(12000 * math.Sin(2*math.Pi*freq*float64(i)/rate))
-		data = append(data, byte(v), byte(v>>8), byte(v), byte(v>>8))
-	}
-	path := filepath.Join(f.t.TempDir(), "rec.wav")
-	file, err := os.Create(path)
-	require.NoError(f.t, err)
-	require.NoError(f.t, wav.Write(file, data, rate, 2))
-	require.NoError(f.t, file.Close())
-	return path
+// warnings returns the warnings reported so far.
+func (f *fixture) warnings() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.warns...)
 }
 
-// commit records t into c from a fresh WAV at freq.
+// commit records t into c from a fresh sine WAV at freq; distinct
+// frequencies give distinct audio hashes.
 func (f *fixture) commit(c *Collection, t Track, freq float64, o CommitOptions) Entry {
 	f.t.Helper()
-	e, err := f.lib.Commit(f.t.Context(), c, t, f.wav(freq), o)
+	e, err := f.lib.Commit(f.t.Context(), c, t, testutil.SineWAV(f.t, freq), o)
 	require.NoError(f.t, err)
 	return e
 }
@@ -140,7 +121,80 @@ func trackMoney() Track {
 	return Track{ID: idMoney, Title: "Money", Artist: "Pink Floyd", DurationMS: 382000, TrackNumber: 6}
 }
 
-// failEncoder always fails.
-type failEncoder struct{}
+func readManifest(t *testing.T, dir string) Manifest {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(dir, ManifestName))
+	require.NoError(t, err)
+	var m Manifest
+	require.NoError(t, json.Unmarshal(data, &m))
+	return m
+}
 
-func (failEncoder) Encode(context.Context, string, string) error { return errFakeEncode }
+// crash rewrites the manifest in dir as edit leaves it: the state a crash
+// between a file's rename into place and the manifest write leaves behind.
+func crash(t *testing.T, dir string, edit func(m *Manifest)) {
+	t.Helper()
+	m := readManifest(t, dir)
+	edit(&m)
+	data, err := json.Marshal(m)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(filepath.Join(dir, ManifestName), data, 0o600))
+}
+
+// forget turns e back into the pending entry it was before its recording
+// was stored, relink included.
+func forget(e *Entry) {
+	e.Status, e.File, e.AudioSHA256, e.PlayedID = StatusPending, "", "", ""
+	e.Partial, e.RecordedAt, e.RecordedMS = false, nil, 0
+}
+
+// swapAudio replaces the audio of the song at path but keeps its tags, so
+// its MIXTAPE_AUDIO_SHA256 no longer matches.
+func swapAudio(t *testing.T, path string) {
+	t.Helper()
+	tags, err := mp4tag.ReadFile(path)
+	require.NoError(t, err)
+	data, err := mp4tag.Tag(testutil.M4A(testutil.M4AOptions{Audio: []byte("other audio")}), tags)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(path, data, 0o600))
+}
+
+// retag replaces the tags of the song at path with tags; its audio stays.
+func retag(t *testing.T, path string, tags mp4tag.Tags) {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	require.NoError(t, err)
+	data, err = mp4tag.Tag(data, tags)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(path, data, 0o600))
+}
+
+// truncate cuts the end off the song at path: its tags (moov comes first)
+// stay readable, its audio does not.
+func truncate(t *testing.T, path string) {
+	t.Helper()
+	info, err := os.Stat(path)
+	require.NoError(t, err)
+	require.NoError(t, os.Truncate(path, info.Size()-4))
+}
+
+// writeSong writes a synthetic M4A holding audio and tagged with freeform
+// as dir/name, and returns its path.
+func writeSong(t *testing.T, dir, name, audio string, freeform map[string]string) string {
+	t.Helper()
+	data, err := mp4tag.Tag(testutil.M4A(testutil.M4AOptions{Audio: []byte(audio)}), mp4tag.Tags{Freeform: freeform})
+	require.NoError(t, err)
+	path := filepath.Join(dir, name)
+	require.NoError(t, os.WriteFile(path, data, 0o600))
+	return path
+}
+
+// reopen opens the library again, as the next run would, and returns it
+// with its copy of the collection s names.
+func (f *fixture) reopen(s Spec) (*Library, *Collection) {
+	f.t.Helper()
+	lib := f.open()
+	c, ok := lib.Lookup(s)
+	require.True(f.t, ok)
+	return lib, c
+}

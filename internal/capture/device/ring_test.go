@@ -10,6 +10,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/mrz1836/mixtape/internal/capture"
 )
 
 func seq(start, n int) []byte {
@@ -135,4 +137,14 @@ func TestRingConcurrent(t *testing.T) {
 	mu.Lock()
 	defer mu.Unlock()
 	assert.Equal(t, produced.Bytes(), consumed.Bytes(), "every published byte arrives once, in order")
+}
+
+func TestOriginCapturedAt(t *testing.T) {
+	t.Parallel()
+	f := capture.Format{Rate: 48000, Channels: 2}
+	at := time.Date(2026, 11, 2, 12, 0, 0, 0, time.UTC)
+	o := origin{at: at, offset: 480 * 4, ok: true} // 480 frames past the stamp
+	assert.Equal(t, at.Add(10*time.Millisecond), o.capturedAt(f))
+	assert.Equal(t, at, origin{at: at, ok: true}.capturedAt(f), "the stamped byte itself")
+	assert.True(t, origin{at: at}.capturedAt(f).IsZero(), "no stamp, no time")
 }

@@ -108,10 +108,11 @@ type Source interface {
 	Close() error
 }
 
-// TapStatus reports whether the process tap can be used on this Mac.
+// TapStatus reports whether the process tap can be used on this Mac. It is
+// the "tap" object of `mixtape devices -o json`.
 type TapStatus struct {
-	Supported bool   // macOS 14.2 or later, built with cgo
-	Reason    string // why not, when unsupported
+	Supported bool   `json:"supported"`        // macOS 14.2 or later, built with cgo
+	Reason    string `json:"reason,omitempty"` // why not, when unsupported
 }
 
 // Errors from method selection.

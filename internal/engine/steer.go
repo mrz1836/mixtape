@@ -15,6 +15,10 @@ import (
 type request struct {
 	item *Item
 	at   time.Time
+	// left is the track Spotify reported when the request was sent. Until
+	// the song starts, Spotify can report it once more: that is the old
+	// track, not a jump past the song.
+	left string
 }
 
 // relinkTolerance is how far a relinked track's duration may differ.
@@ -22,9 +26,12 @@ const relinkTolerance = 2 * time.Second
 
 // beginQueued decides what a new track means in queue and follow mode.
 func (e *Engine) beginQueued(ctx context.Context, t *take, s spotify.Snapshot) {
+	if w := e.waiting; w != nil && w.left != "" && s.Track.URI == w.left && s.Track.ID != w.item.Track.ID {
+		return // the track Spotify is leaving, reported once more
+	}
 	it := e.match(s.Track)
 	if it == nil && e.follow != nil && e.follow.active {
-		it = e.followTrack(ctx, t, s)
+		it = e.followTrack(ctx, s)
 	}
 	if it == nil || e.limitReached() {
 		return
@@ -178,7 +185,7 @@ func (e *Engine) request(ctx context.Context, it *Item, at time.Time) {
 	if err != nil {
 		e.warn("spotify play: " + err.Error())
 	}
-	e.waiting = &request{item: it, at: at}
+	e.waiting = &request{item: it, at: at, left: e.last.Track.URI}
 	e.lastActive = at
 }
 
@@ -187,10 +194,8 @@ func (e *Engine) unavailable(it *Item, reason string) {
 	if it.state != itemPending {
 		return
 	}
-	it.state, it.reason = itemFailed, reason
-	e.counts.Failed++
 	e.submit(job{kind: jobMark, item: it, status: library.StatusUnavailable, reason: reason})
-	e.emit(Event{Type: EventTrackFailed, Track: itemTrack(it), Reason: reason})
+	e.markFailed(it, reason)
 }
 
 // limitReached reports that --limit songs are recorded or on their way:
@@ -230,18 +235,18 @@ type followState struct {
 	second     string
 	lastID     string // the previous track seen while following
 	skipNextOf string // press next when this track begins
+	notYet     string // the track mixtape just moved Spotify away from
 	startedAt  time.Time
 }
 
 // steerFollow starts or continues following; it reports false when there
 // is nothing left to follow.
 func (e *Engine) steerFollow(ctx context.Context, s spotify.Snapshot) bool {
-	if e.follow != nil && e.follow.active {
-		if s.State != spotify.StatePlaying && s.At.Sub(e.follow.startedAt) > e.opts.StartTimeout {
-			e.follow.active = false // the playlist stopped: done
-			return false
+	if fs := e.follow; fs != nil && fs.active {
+		if s.State == spotify.StatePlaying || s.At.Sub(fs.startedAt) <= e.opts.StartTimeout {
+			return true
 		}
-		return true
+		fs.active = false // the playlist stopped: done with it, on to the next
 	}
 	g := e.nextFollowGroup()
 	if g == nil {
@@ -254,25 +259,25 @@ func (e *Engine) steerFollow(ctx context.Context, s spotify.Snapshot) bool {
 		fs.lastID = g.Items[n-1].Track.ID
 		e.follow = fs
 		if t := e.cur; t != nil && !t.ad && !t.recording {
-			if it := e.followTrack(ctx, t, s); it != nil {
+			if it := e.followTrack(ctx, s); it != nil {
 				e.adopt(t, it, s.At)
 			}
 		}
 		return true
 	}
+	// Play the playlist from its top, or from its last known song, which
+	// is then skipped: following picks up right after it. Until Spotify
+	// switches, it can still report the track that played before (in its
+	// own context): that is no song of the playlist (see notYet).
+	fs.notYet = s.Track.ID
+	uri, in := g.ContextURI, ""
 	if n := len(g.Items); n > 0 {
 		last := g.Items[n-1]
 		fs.skipNextOf = last.Track.ID
-		e.releaseCur()
-		e.command(ctx, "play", func(c context.Context) error {
-			return e.cfg.Player.PlayTrack(c, spotify.TrackURI(last.Track.ID), g.ContextURI)
-		})
-	} else {
-		e.releaseCur()
-		e.command(ctx, "play", func(c context.Context) error {
-			return e.cfg.Player.PlayTrack(c, g.ContextURI, "")
-		})
+		uri, in = spotify.TrackURI(last.Track.ID), g.ContextURI
 	}
+	e.releaseCur()
+	e.command(ctx, "play", func(c context.Context) error { return e.cfg.Player.PlayTrack(c, uri, in) })
 	e.follow = fs
 	e.lastActive = s.At
 	return true
@@ -329,9 +334,21 @@ func (e *Engine) groupIndex(g *Group) int {
 
 // followTrack handles a new track while following: skip what is known,
 // detect the loop, and add new songs to the plan.
-func (e *Engine) followTrack(ctx context.Context, t *take, s spotify.Snapshot) *Item {
+func (e *Engine) followTrack(ctx context.Context, s spotify.Snapshot) *Item {
 	fs := e.follow
 	id := s.Track.ID
+	if notYet := fs.notYet; notYet != "" {
+		fs.notYet = "" // only the first track after the switch can be the old one
+		if id == notYet {
+			return nil
+		}
+	}
+	// moveOn presses next. Spotify can report the track it leaves once
+	// more before the next one: that is no new take of it.
+	moveOn := func() {
+		fs.notYet = id
+		e.next(ctx)
+	}
 	prev := fs.lastID
 	fs.lastID = id
 	switch {
@@ -339,11 +356,12 @@ func (e *Engine) followTrack(ctx context.Context, t *take, s spotify.Snapshot) *
 		return nil
 	case id == fs.skipNextOf:
 		fs.skipNextOf = ""
-		e.next(ctx)
+		moveOn()
 		return nil
 	case fs.looped(prev, id):
-		fs.active = false // looped: the whole playlist has been seen
-		e.stop("")
+		// Looped: the whole playlist has been seen. Steering follows the
+		// next truncated playlist, or ends the session.
+		fs.active = false
 		return nil
 	case fs.first == "":
 		fs.first = id
@@ -352,19 +370,27 @@ func (e *Engine) followTrack(ctx context.Context, t *take, s spotify.Snapshot) *
 	}
 	if it := fs.group.find(id); it != nil {
 		if it.state != itemPending {
-			e.next(ctx) // known and handled: move on
+			moveOn() // known and handled
 		}
 		return nil
 	}
+	return e.addOnTheFly(fs.group, s.Track, true)
+}
+
+// addOnTheFly adds a song Spotify played that the plan did not list (a
+// followed playlist past its known songs, or live mode) and, when lookup
+// is set, asks the library whether it is already done.
+func (e *Engine) addOnTheFly(g *Group, tr spotify.Track, lookup bool) *Item {
 	it := &Item{
-		Group:  fs.group,
-		Track:  library.Track{ID: id, Title: s.Track.Name, Artist: s.Track.Artist, DurationMS: s.Track.Duration.Milliseconds()},
-		Action: ActionRecord,
+		Group: g, Action: ActionRecord,
+		Track: library.Track{ID: tr.ID, Title: tr.Name, Artist: tr.Artist, DurationMS: tr.Duration.Milliseconds()},
 	}
-	fs.group.Items = append(fs.group.Items, it)
+	g.Items = append(g.Items, it)
 	e.plan.Items = append(e.plan.Items, it)
 	e.counts.Total++
-	e.submit(job{kind: jobLookup, item: it, take: t})
+	if lookup {
+		e.submit(job{kind: jobLookup, item: it})
+	}
 	return it
 }
 
@@ -389,25 +415,21 @@ func (e *Engine) beginLive(ctx context.Context, t *take, s spotify.Snapshot) {
 	}
 	g := e.plan.Groups[0]
 	it := g.find(s.Track.ID)
-	if it == nil {
-		it = &Item{
-			Group: g, Action: ActionRecord,
-			Track: library.Track{ID: s.Track.ID, Title: s.Track.Name, Artist: s.Track.Artist, DurationMS: s.Track.Duration.Milliseconds()},
-		}
-		g.Items = append(g.Items, it)
-		e.plan.Items = append(e.plan.Items, it)
-		e.counts.Total++
-		if !e.opts.Redo {
-			e.submit(job{kind: jobLookup, item: it, take: t})
-		}
-	} else if it.state == itemBusy {
+	switch {
+	case e.limitReached():
+		// --limit: enough songs are recorded or on their way. Whatever
+		// plays next is the listener's: the session ends once they are saved.
+		t.passive = true
+		return
+	case it == nil:
+		it = e.addOnTheFly(g, s.Track, !e.opts.Redo)
+	case it.state == itemBusy:
 		t.passive = true // the song just recorded, seen again as Spotify moves on
 		return
-	} else if it.state != itemPending || e.limitReached() {
+	case it.state == itemDone && it.retake:
+		it.state, it.retake = itemPending, false // cut short before, played again now
+	case it.state != itemPending:
 		e.next(ctx) // already handled this session
-		return
-	}
-	if e.limitReached() {
 		return
 	}
 	e.beginRecording(ctx, t, it, s)
@@ -423,9 +445,7 @@ func (e *Engine) onLookup(ctx context.Context, r result) {
 	}
 	switch {
 	case r.inFolder:
-		it.state = itemDone
-		e.counts.Skipped++
-		e.emit(Event{Type: EventTrackSkipped, Track: itemTrack(it), Reason: "already in the library"})
+		e.skip(it, itemTrack(it), reasonInLibrary)
 	default:
 		it.Action, it.From = ActionCopy, r.from
 		e.submit(job{kind: jobCopy, item: it, from: r.from})

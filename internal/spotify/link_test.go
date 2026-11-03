@@ -14,9 +14,10 @@ const (
 	testPlaylistID = "37i9dQZF1DXcBWIGoYBM5M"
 )
 
-func TestParseRef(t *testing.T) {
-	t.Parallel()
-	tests := map[string]Ref{
+// parseRefAccepted maps links and URIs ParseRef accepts to their Ref.
+// FuzzParseRef seeds from it too.
+func parseRefAccepted() map[string]Ref {
+	return map[string]Ref{
 		"https://open.spotify.com/track/" + testTrackID:                 {KindTrack, testTrackID},
 		"https://open.spotify.com/track/" + testTrackID + "?si=abc123":  {KindTrack, testTrackID},
 		"https://open.spotify.com/track/" + testTrackID + "#t=30":       {KindTrack, testTrackID},
@@ -37,7 +38,11 @@ func TestParseRef(t *testing.T) {
 		`"spotify:track:` + testTrackID + `"`:                      {KindTrack, testTrackID},
 		"'spotify:TRACK:" + testTrackID + "'":                      {KindTrack, testTrackID},
 	}
-	for in, want := range tests {
+}
+
+func TestParseRef(t *testing.T) {
+	t.Parallel()
+	for in, want := range parseRefAccepted() {
 		t.Run(in, func(t *testing.T) {
 			t.Parallel()
 			got, err := ParseRef(in)
@@ -47,9 +52,9 @@ func TestParseRef(t *testing.T) {
 	}
 }
 
-func TestParseRefRejects(t *testing.T) {
-	t.Parallel()
-	bad := []string{
+// parseRefRejected lists text ParseRef rejects as ErrBadLink.
+func parseRefRejected() []string {
+	return []string{
 		"",
 		"   ",
 		"Still Loving You",
@@ -70,7 +75,11 @@ func TestParseRefRejects(t *testing.T) {
 		"%zz",
 		"https://open.spotify.com/%zz",
 	}
-	for _, in := range bad {
+}
+
+func TestParseRefRejects(t *testing.T) {
+	t.Parallel()
+	for _, in := range parseRefRejected() {
 		t.Run(in, func(t *testing.T) {
 			t.Parallel()
 			_, err := ParseRef(in)
@@ -79,9 +88,10 @@ func TestParseRefRejects(t *testing.T) {
 	}
 }
 
-func TestParseRefUnsupported(t *testing.T) {
-	t.Parallel()
-	tests := map[string]string{
+// parseRefUnsupported maps links ParseRef rejects as ErrUnsupportedLink
+// to a word its message must contain.
+func parseRefUnsupported() map[string]string {
+	return map[string]string{
 		"https://open.spotify.com/episode/" + testTrackID: "episode",
 		"https://open.spotify.com/show/" + testTrackID:    "show",
 		"https://open.spotify.com/artist/" + testTrackID:  "artist",
@@ -91,7 +101,11 @@ func TestParseRefUnsupported(t *testing.T) {
 		"spotify:ad:" + testTrackID:                       "ads",
 		"spotify:artist:" + testTrackID:                   "artist",
 	}
-	for in, want := range tests {
+}
+
+func TestParseRefUnsupported(t *testing.T) {
+	t.Parallel()
+	for in, want := range parseRefUnsupported() {
 		t.Run(in, func(t *testing.T) {
 			t.Parallel()
 			_, err := ParseRef(in)
@@ -136,15 +150,20 @@ func TestParseTrackURI(t *testing.T) {
 	assert.Empty(t, parseTrackURI(""))
 }
 
-func TestParseRefLikedSongsIsUnsupported(t *testing.T) {
-	t.Parallel()
-	for _, in := range []string{
+// likedSongsLinks are links into the listener's own library.
+func likedSongsLinks() []string {
+	return []string{
 		"https://open.spotify.com/collection/tracks",
 		"open.spotify.com/collection/tracks?si=abc",
 		"spotify:collection:tracks",
 		"spotify:user:someone:collection",
 		"spotify:user:someone:collection:tracks",
-	} {
+	}
+}
+
+func TestParseRefLikedSongsIsUnsupported(t *testing.T) {
+	t.Parallel()
+	for _, in := range likedSongsLinks() {
 		_, err := ParseRef(in)
 		require.ErrorIs(t, err, ErrUnsupportedLink, in)
 		assert.Contains(t, err.Error(), "Liked Songs", in)

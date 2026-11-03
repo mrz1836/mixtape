@@ -20,6 +20,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/mrz1836/mixtape/internal/capture"
 	"github.com/mrz1836/mixtape/internal/fileutil"
 )
 
@@ -42,13 +43,6 @@ const (
 	EnvArtwork     = "MIXTAPE_ARTWORK"
 	EnvIdleTimeout = "MIXTAPE_IDLE_TIMEOUT"
 	EnvMaxFailures = "MIXTAPE_MAX_FAILURES"
-)
-
-// Capture methods accepted by the capture setting.
-const (
-	CaptureAuto   = "auto"
-	CaptureTap    = "tap"
-	CaptureDevice = "device"
 )
 
 // Defaults.
@@ -106,7 +100,7 @@ type Overrides struct {
 // Settings is the resolved configuration.
 type Settings struct {
 	Library     string
-	Capture     string
+	Capture     capture.Method
 	Device      string
 	Artwork     bool
 	IdleTimeout time.Duration
@@ -123,19 +117,148 @@ type Key struct {
 	Help    string
 }
 
-// Keys lists every setting in display order.
-func Keys() []Key {
-	return []Key{
-		{KeyLibrary, EnvLibrary, "~/" + DefaultLibraryDir, "Folder that holds every recording and manifest"},
-		{KeyCapture, EnvCapture, CaptureAuto, "Capture method: auto, tap (Core Audio process tap) or device (BlackHole)"},
-		{KeyDevice, EnvDevice, DefaultDevice, "Capture device name (substring) for the device method"},
-		{KeyArtwork, EnvArtwork, "false", "Embed album artwork in each file (one image download per song)"},
-		{KeyIdleTimeout, EnvIdleTimeout, DefaultIdleTimeout.String(), "End a session after this long with nothing recording (0 = never)"},
+// setting is everything about one key: its description, how a value from
+// any layer is parsed into Settings and shown back, how config.json stores
+// it, and which field of File and of Overrides holds it.
+type setting struct {
+	Key
+
+	// apply parses value (as text, from any layer) into s.
+	apply func(s *Settings, value, userHome string) error
+	// show renders the resolved value, for `config show`.
+	show func(s Settings) string
+	// encode is a value apply accepted, as config.json stores it.
+	encode func(value string, parsed Settings) any
+	// inFile and inFlag return the field holding the setting (a **T).
+	inFile func(f *File) any
+	inFlag func(o *Overrides) any
+}
+
+// table lists every setting in display order. Every function of this
+// package that handles settings goes through it.
+func table() []setting {
+	trimmed := func(value string, _ Settings) any { return strings.TrimSpace(value) }
+	return []setting{
 		{
-			KeyMaxFailures, EnvMaxFailures, strconv.Itoa(DefaultMaxFailures),
-			"End a session after this many songs in a row could not be recorded (0 = never)",
+			Key: Key{KeyLibrary, EnvLibrary, "~/" + DefaultLibraryDir, "Folder that holds every recording and manifest"},
+			apply: func(s *Settings, value, userHome string) error {
+				v, err := nonEmpty(value, "library path")
+				if err != nil {
+					return err
+				}
+				s.Library = ExpandHome(v, userHome)
+				return nil
+			},
+			show:   func(s Settings) string { return s.Library },
+			encode: trimmed,
+			inFile: func(f *File) any { return &f.Library },
+			inFlag: func(o *Overrides) any { return &o.Library },
+		},
+		{
+			Key: Key{
+				KeyCapture, EnvCapture, string(capture.MethodAuto),
+				"Capture method: auto, tap (Core Audio process tap) or device (BlackHole)",
+			},
+			apply: func(s *Settings, value, _ string) error {
+				m, err := capture.ParseMethod(value)
+				if err != nil || strings.TrimSpace(value) == "" {
+					return fmt.Errorf("%w: capture %q (want auto, tap or device)", ErrInvalidValue, value)
+				}
+				s.Capture = m
+				return nil
+			},
+			show:   func(s Settings) string { return string(s.Capture) },
+			encode: func(_ string, s Settings) any { return string(s.Capture) },
+			inFile: func(f *File) any { return &f.Capture },
+			inFlag: func(o *Overrides) any { return &o.Capture },
+		},
+		{
+			Key: Key{KeyDevice, EnvDevice, DefaultDevice, "Capture device name (substring) for the device method"},
+			apply: func(s *Settings, value, _ string) error {
+				v, err := nonEmpty(value, "device name")
+				if err != nil {
+					return err
+				}
+				s.Device = v
+				return nil
+			},
+			show:   func(s Settings) string { return s.Device },
+			encode: trimmed,
+			inFile: func(f *File) any { return &f.Device },
+			inFlag: func(o *Overrides) any { return &o.Device },
+		},
+		{
+			Key: Key{KeyArtwork, EnvArtwork, "false", "Embed album artwork in each file (one image download per song)"},
+			apply: func(s *Settings, value, _ string) error {
+				b, err := strconv.ParseBool(strings.TrimSpace(value))
+				if err != nil {
+					return fmt.Errorf("%w: artwork %q (want true or false)", ErrInvalidValue, value)
+				}
+				s.Artwork = b
+				return nil
+			},
+			show:   func(s Settings) string { return strconv.FormatBool(s.Artwork) },
+			encode: func(_ string, s Settings) any { return s.Artwork },
+			inFile: func(f *File) any { return &f.Artwork },
+			inFlag: func(o *Overrides) any { return &o.Artwork },
+		},
+		{
+			Key: Key{
+				KeyIdleTimeout, EnvIdleTimeout, DefaultIdleTimeout.String(),
+				"End a session after this long with nothing recording (0 = never)",
+			},
+			apply: func(s *Settings, value, _ string) error {
+				d, err := time.ParseDuration(strings.TrimSpace(value))
+				if err != nil || d < 0 {
+					return fmt.Errorf("%w: idle_timeout %q (want a duration such as 10m, or 0)", ErrInvalidValue, value)
+				}
+				s.IdleTimeout = d
+				return nil
+			},
+			show:   func(s Settings) string { return s.IdleTimeout.String() },
+			encode: trimmed, // as written: "10m" stays "10m"
+			inFile: func(f *File) any { return &f.IdleTimeout },
+			inFlag: func(o *Overrides) any { return &o.IdleTimeout },
+		},
+		{
+			Key: Key{
+				KeyMaxFailures, EnvMaxFailures, strconv.Itoa(DefaultMaxFailures),
+				"End a session after this many failed attempts in a row (a song is tried twice; 0 = never)",
+			},
+			apply: func(s *Settings, value, _ string) error {
+				n, err := strconv.Atoi(strings.TrimSpace(value))
+				if err != nil || n < 0 {
+					return fmt.Errorf("%w: max_failures %q (want a whole number, or 0 for never)", ErrInvalidValue, value)
+				}
+				s.MaxFailures = n
+				return nil
+			},
+			show:   func(s Settings) string { return strconv.Itoa(s.MaxFailures) },
+			encode: func(_ string, s Settings) any { return s.MaxFailures },
+			inFile: func(f *File) any { return &f.MaxFailures },
+			inFlag: func(o *Overrides) any { return &o.MaxFailures },
 		},
 	}
+}
+
+// lookup returns the setting named key.
+func lookup(key string) (setting, bool) {
+	for _, st := range table() {
+		if st.Name == key {
+			return st, true
+		}
+	}
+	return setting{}, false
+}
+
+// Keys lists every setting in display order.
+func Keys() []Key {
+	t := table()
+	keys := make([]Key, 0, len(t))
+	for _, st := range t {
+		keys = append(keys, st.Key)
+	}
+	return keys
 }
 
 // DefaultHome returns ~/.mixtape for the given user home directory.
@@ -158,15 +281,21 @@ func Load(path string) (File, []string, error) {
 	if err != nil {
 		return File{}, nil, err
 	}
-	var warnings []string
+	// Only exact key names count: JSON decoding alone would also take
+	// "LIBRARY" for library, against the warning that it is ignored.
+	var (
+		f        File
+		warnings []string
+	)
 	for _, k := range sortedKeys(raw) {
-		if !isKnown(k) {
+		st, ok := lookup(k)
+		if !ok {
 			warnings = append(warnings, fmt.Sprintf("%s: ignoring unknown key %q", path, k))
+			continue
 		}
-	}
-	var f File
-	if err := json.Unmarshal(data, &f); err != nil {
-		return File{}, warnings, fmt.Errorf("%w: %s: %w", ErrDecode, path, err)
+		if err := json.Unmarshal(raw[k], st.inFile(&f)); err != nil {
+			return File{}, warnings, fmt.Errorf("%w: %s: %s: %w", ErrDecode, path, k, err)
+		}
 	}
 	return f, warnings, nil
 }
@@ -177,54 +306,70 @@ func Load(path string) (File, []string, error) {
 func Resolve(f File, getenv func(string) string, o Overrides, userHome string) (Settings, error) {
 	s := Settings{
 		Library:     filepath.Join(userHome, DefaultLibraryDir),
-		Capture:     CaptureAuto,
+		Capture:     capture.MethodAuto,
 		Device:      DefaultDevice,
 		IdleTimeout: DefaultIdleTimeout,
 		MaxFailures: DefaultMaxFailures,
 		Sources:     map[string]Source{},
 	}
-	for _, k := range Keys() {
-		s.Sources[k.Name] = SourceDefault
-	}
-
 	layers := []struct {
-		src    Source
-		values map[string]string
+		src   Source
+		value func(st setting) (string, bool)
 	}{
-		{SourceFile, fileValues(f)},
-		{SourceEnv, envValues(getenv)},
-		{SourceFlag, flagValues(o)},
+		{SourceFile, func(st setting) (string, bool) { return fieldText(st.inFile(&f)) }},
+		{SourceEnv, func(st setting) (string, bool) {
+			if getenv == nil {
+				return "", false
+			}
+			v := getenv(st.Env)
+			return v, v != ""
+		}},
+		{SourceFlag, func(st setting) (string, bool) { return fieldText(st.inFlag(&o)) }},
 	}
-	for _, layer := range layers {
-		for _, k := range Keys() {
-			v, ok := layer.values[k.Name]
+	for _, st := range table() {
+		s.Sources[st.Name] = SourceDefault
+		for _, layer := range layers {
+			v, ok := layer.value(st)
 			if !ok {
 				continue
 			}
-			if err := applySetting(&s, k.Name, v, userHome); err != nil {
+			if err := st.apply(&s, v, userHome); err != nil {
 				return Settings{}, fmt.Errorf("%w (from %s)", err, layer.src)
 			}
-			s.Sources[k.Name] = layer.src
+			s.Sources[st.Name] = layer.src
 		}
 	}
 	return s, nil
 }
 
+// fieldText renders the value of a File or Overrides field (a **T) as
+// text; ok is false when the field is unset.
+func fieldText(field any) (string, bool) {
+	switch p := field.(type) {
+	case **string:
+		if *p != nil {
+			return **p, true
+		}
+	case **bool:
+		if *p != nil {
+			return strconv.FormatBool(**p), true
+		}
+	case **int:
+		if *p != nil {
+			return strconv.Itoa(**p), true
+		}
+	case **time.Duration:
+		if *p != nil {
+			return (**p).String(), true
+		}
+	}
+	return "", false
+}
+
 // Value returns a setting rendered as text, for `config show`.
 func (s Settings) Value(key string) string {
-	switch key {
-	case KeyLibrary:
-		return s.Library
-	case KeyCapture:
-		return s.Capture
-	case KeyDevice:
-		return s.Device
-	case KeyArtwork:
-		return strconv.FormatBool(s.Artwork)
-	case KeyIdleTimeout:
-		return s.IdleTimeout.String()
-	case KeyMaxFailures:
-		return strconv.Itoa(s.MaxFailures)
+	if st, ok := lookup(key); ok {
+		return st.show(s)
 	}
 	return ""
 }
@@ -234,7 +379,8 @@ func (s Settings) Value(key string) string {
 // the key, restoring the default. Keys Mixtape does not know are kept as
 // they are, so a downgrade never loses settings.
 func Set(path, key, value, userHome string) error {
-	if !isKnown(key) {
+	st, ok := lookup(key)
+	if !ok {
 		return fmt.Errorf("%w %q (known: %s)", ErrUnknownKey, key, strings.Join(knownNames(), ", "))
 	}
 	raw := map[string]json.RawMessage{}
@@ -245,76 +391,39 @@ func Set(path, key, value, userHome string) error {
 			return err
 		}
 	case !errors.Is(err, fs.ErrNotExist):
-		return err
+		return fmt.Errorf("read config: %w", err)
 	}
 
 	if value == "" {
 		delete(raw, key)
 	} else {
-		var probe Settings
-		if applyErr := applySetting(&probe, key, value, userHome); applyErr != nil {
-			return applyErr
+		var parsed Settings
+		if err := st.apply(&parsed, value, userHome); err != nil {
+			return err
 		}
-		enc, encErr := encodeValue(key, value)
-		if encErr != nil {
-			return encErr
+		enc, err := json.Marshal(st.encode(value, parsed))
+		if err != nil {
+			return fmt.Errorf("encode %s: %w", key, err)
 		}
 		raw[key] = enc
 	}
 
-	out, err := json.MarshalIndent(raw, "", "  ")
-	if err != nil {
-		return err
-	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return err
+		return fmt.Errorf("write config: %w", err)
 	}
-	return fileutil.WriteAtomic(path, append(out, '\n'), 0o600)
-}
-
-// applySetting parses value and stores it as setting key in s.
-func applySetting(s *Settings, key, value, userHome string) error {
-	switch key {
-	case KeyLibrary:
-		v := strings.TrimSpace(value)
-		if v == "" {
-			return fmt.Errorf("%w: library path is empty", ErrInvalidValue)
-		}
-		s.Library = ExpandHome(v, userHome)
-	case KeyCapture:
-		v := strings.ToLower(strings.TrimSpace(value))
-		if !slices.Contains([]string{CaptureAuto, CaptureTap, CaptureDevice}, v) {
-			return fmt.Errorf("%w: capture %q (want auto, tap or device)", ErrInvalidValue, value)
-		}
-		s.Capture = v
-	case KeyDevice:
-		v := strings.TrimSpace(value)
-		if v == "" {
-			return fmt.Errorf("%w: device name is empty", ErrInvalidValue)
-		}
-		s.Device = v
-	case KeyArtwork:
-		b, err := strconv.ParseBool(strings.TrimSpace(value))
-		if err != nil {
-			return fmt.Errorf("%w: artwork %q (want true or false)", ErrInvalidValue, value)
-		}
-		s.Artwork = b
-	case KeyIdleTimeout:
-		d, err := time.ParseDuration(strings.TrimSpace(value))
-		if err != nil || d < 0 {
-			return fmt.Errorf("%w: idle_timeout %q (want a duration such as 10m, or 0)", ErrInvalidValue, value)
-		}
-		s.IdleTimeout = d
-	case KeyMaxFailures:
-		n, err := strconv.Atoi(strings.TrimSpace(value))
-		if err != nil || n < 0 {
-			return fmt.Errorf("%w: max_failures %q (want a whole number, or 0 for never)", ErrInvalidValue, value)
-		}
-		s.MaxFailures = n
-	default:
-		return fmt.Errorf("%w %q", ErrUnknownKey, key)
+	if err := fileutil.WriteJSON(path, raw, 0o600); err != nil {
+		return fmt.Errorf("write config: %w", err)
 	}
 	return nil
+}
+
+// nonEmpty trims value and rejects an empty one, naming what it is.
+func nonEmpty(value, what string) (string, error) {
+	v := strings.TrimSpace(value)
+	if v == "" {
+		return "", fmt.Errorf("%w: %s is empty", ErrInvalidValue, what)
+	}
+	return v, nil
 }
 
 // ExpandHome replaces a leading "~" or "~/" in path with userHome and
@@ -333,85 +442,6 @@ func ExpandHome(path, userHome string) string {
 	return filepath.Clean(path)
 }
 
-func fileValues(f File) map[string]string {
-	m := map[string]string{}
-	put := func(k string, v *string) {
-		if v != nil {
-			m[k] = *v
-		}
-	}
-	put(KeyLibrary, f.Library)
-	put(KeyCapture, f.Capture)
-	put(KeyDevice, f.Device)
-	put(KeyIdleTimeout, f.IdleTimeout)
-	if f.Artwork != nil {
-		m[KeyArtwork] = strconv.FormatBool(*f.Artwork)
-	}
-	if f.MaxFailures != nil {
-		m[KeyMaxFailures] = strconv.Itoa(*f.MaxFailures)
-	}
-	return m
-}
-
-func envValues(getenv func(string) string) map[string]string {
-	m := map[string]string{}
-	if getenv == nil {
-		return m
-	}
-	for _, k := range Keys() {
-		if v := getenv(k.Env); v != "" {
-			m[k.Name] = v
-		}
-	}
-	return m
-}
-
-func flagValues(o Overrides) map[string]string {
-	m := map[string]string{}
-	if o.Library != nil {
-		m[KeyLibrary] = *o.Library
-	}
-	if o.Capture != nil {
-		m[KeyCapture] = *o.Capture
-	}
-	if o.Device != nil {
-		m[KeyDevice] = *o.Device
-	}
-	if o.Artwork != nil {
-		m[KeyArtwork] = strconv.FormatBool(*o.Artwork)
-	}
-	if o.IdleTimeout != nil {
-		m[KeyIdleTimeout] = o.IdleTimeout.String()
-	}
-	if o.MaxFailures != nil {
-		m[KeyMaxFailures] = strconv.Itoa(*o.MaxFailures)
-	}
-	return m
-}
-
-// encodeValue renders a validated value as the JSON type its key uses.
-func encodeValue(key, value string) (json.RawMessage, error) {
-	if key == KeyArtwork {
-		b, err := strconv.ParseBool(strings.TrimSpace(value))
-		if err != nil {
-			return nil, fmt.Errorf("%w: artwork %q", ErrInvalidValue, value)
-		}
-		return json.Marshal(b)
-	}
-	if key == KeyMaxFailures {
-		n, err := strconv.Atoi(strings.TrimSpace(value))
-		if err != nil {
-			return nil, fmt.Errorf("%w: max_failures %q", ErrInvalidValue, value)
-		}
-		return json.Marshal(n)
-	}
-	v := strings.TrimSpace(value)
-	if key == KeyCapture {
-		v = strings.ToLower(v)
-	}
-	return json.Marshal(v)
-}
-
 func decodeRaw(data []byte) (map[string]json.RawMessage, error) {
 	raw := map[string]json.RawMessage{}
 	if len(bytes.TrimSpace(data)) == 0 {
@@ -422,8 +452,6 @@ func decodeRaw(data []byte) (map[string]json.RawMessage, error) {
 	}
 	return raw, nil
 }
-
-func isKnown(key string) bool { return slices.Contains(knownNames(), key) }
 
 func knownNames() []string {
 	keys := Keys()

@@ -139,6 +139,10 @@ const (
 	watchBackoffMax  = 5 * time.Second
 )
 
+// maxDurationMS is the longest track duration, in milliseconds, that a
+// time.Duration can hold (about 292 years). A longer one would wrap.
+const maxDurationMS = float64(math.MaxInt64 / int64(time.Millisecond))
+
 // errBadSnapshot reports a script line Mixtape cannot parse.
 var errBadSnapshot = errors.New("unexpected snapshot output")
 
@@ -194,47 +198,20 @@ func (p *Player) Watch(ctx context.Context, interval time.Duration) <-chan Snaps
 	return out
 }
 
+// watch runs the watch script until ctx is done: start a process, relay
+// its snapshots, and back off before the next one. A send fails only once
+// ctx is done, which the backoff wait then sees, so its result is not
+// checked here.
 func (p *Player) watch(ctx context.Context, interval time.Duration, out chan<- Snapshot) {
 	defer close(out)
-	send := func(s Snapshot) bool {
-		select {
-		case out <- s:
-			return true
-		case <-ctx.Done():
-			return false
-		}
-	}
 	ms := strconv.FormatInt(interval.Milliseconds(), 10)
 	backoff := p.backoffMin
 	for ctx.Err() == nil {
 		lines, err := p.run.Start(ctx, watchScript, ms)
 		if err != nil {
-			if !send(Snapshot{At: p.now(), Err: p.classify(err)}) {
-				return
-			}
-		} else {
-			healthy := false
-			for l := range lines {
-				if l.Err != nil {
-					if ctx.Err() != nil {
-						return
-					}
-					if !send(Snapshot{At: l.At, Err: p.classify(l.Err)}) {
-						return
-					}
-					continue
-				}
-				if !isSnapshotLine(l.Text) {
-					continue // framework noise on stderr (NSLog lines), not ours
-				}
-				healthy = true
-				if !send(p.parseSnapshot(l.Text, l.At)) {
-					return
-				}
-			}
-			if healthy {
-				backoff = p.backoffMin
-			}
+			send(ctx, out, Snapshot{At: p.now(), Err: p.classify(err)})
+		} else if p.consume(ctx, lines, out) {
+			backoff = p.backoffMin // it ran, so a new failure starts the backoff over
 		}
 		select {
 		case <-ctx.Done():
@@ -242,6 +219,41 @@ func (p *Player) watch(ctx context.Context, interval time.Duration, out chan<- S
 		case <-time.After(backoff):
 		}
 		backoff = min(backoff*2, p.backoffMax)
+	}
+}
+
+// consume relays the lines of one watch process to out as snapshots,
+// until the process ends or ctx is done. It reports whether the process
+// emitted any snapshot line, which shows the script itself works.
+func (p *Player) consume(ctx context.Context, lines <-chan Line, out chan<- Snapshot) bool {
+	healthy := false
+	for l := range lines {
+		var s Snapshot
+		switch {
+		case l.Err != nil && ctx.Err() != nil:
+			return healthy // the process exited because the watch was canceled
+		case l.Err != nil:
+			s = Snapshot{At: l.At, Err: p.classify(l.Err)}
+		case !isSnapshotLine(l.Text):
+			continue // framework noise on stderr (NSLog lines), not ours
+		default:
+			healthy = true
+			s = p.parseSnapshot(l.Text, l.At)
+		}
+		if !send(ctx, out, s) {
+			return healthy
+		}
+	}
+	return healthy
+}
+
+// send delivers s on out, giving up when ctx is done first.
+func send(ctx context.Context, out chan<- Snapshot, s Snapshot) bool {
+	select {
+	case out <- s:
+		return true
+	case <-ctx.Done():
+		return false
 	}
 }
 
@@ -312,8 +324,9 @@ func (p *Player) command(ctx context.Context, cmd string) error {
 	return fmt.Errorf("%w: %s: %q", errBadSnapshot, cmd, out)
 }
 
-// classify maps a runner error to a sentinel, consulting the process list
-// only when the error is ambiguous.
+// classify maps a runner error, or an error the snapshot script reported,
+// to a sentinel. The process list is read only for the error numbers whose
+// meaning depends on it.
 func (p *Player) classify(err error) error {
 	running := false
 	if needsProcessCheck(err) {
@@ -337,12 +350,9 @@ func (p *Player) parseSnapshot(line string, at time.Time) Snapshot {
 			snap.Err = fmt.Errorf("%w: %s", ErrScript, rest)
 			return snap
 		}
-		detail := fmt.Sprintf("%s (%d)", msg, code)
-		running := false
-		if ambiguousCode(code) {
-			running, _ = p.isRunning()
-		}
-		snap.Err = classifyCode(code, detail, running)
+		// The script caught the error itself, so it never reached
+		// osascript's stderr; spell it the way osascript would.
+		snap.Err = p.classify(&ScriptError{Code: code, Msg: fmt.Sprintf("%s (%d)", msg, code)})
 		return snap
 	case markSnapshot:
 	default:
@@ -375,7 +385,7 @@ func (p *Player) parseSnapshot(line string, at time.Time) Snapshot {
 		Popularity:  atoi(f[fPopularity]),
 		ArtworkURL:  strings.TrimSpace(f[fArtwork]),
 	}
-	if ms, ok := parseReal(f[fDuration]); ok && ms > 0 {
+	if ms, ok := parseReal(f[fDuration]); ok && ms > 0 && ms < maxDurationMS {
 		snap.Track.Duration = time.Duration(ms) * time.Millisecond
 	}
 	return snap

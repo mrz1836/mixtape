@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"unicode/utf8"
 )
 
 // Output formats accepted by --output.
@@ -128,14 +129,6 @@ func (o *Output) Warn(format string, args ...any) {
 	_ = o.writeText(o.stderr, o.paintErr(colorYellow, "mixtape: warning: ")+msg, o.errColor)
 }
 
-// Debugf prints a --verbose diagnostic line to stderr (text mode only).
-func (o *Output) Debugf(format string, args ...any) {
-	if !o.verbose || o.json {
-		return
-	}
-	_ = o.writeText(o.stderr, o.paintErr(colorDim, "mixtape: "+fmt.Sprintf(format, args...)), o.errColor)
-}
-
 // Fail renders e on stderr for the command at label ("record", "config
 // set", or "" for the root): text with an optional "fix:" line, or a JSON
 // error document.
@@ -197,6 +190,35 @@ const (
 	colorDim    = "2"
 	colorBold   = "1"
 )
+
+// table renders rows as columns under a bold header, two spaces apart.
+// Widths count what is visible, so colored cells do not skew the columns.
+func (o *Output) table(header []string, rows [][]string) string {
+	widths := make([]int, len(header))
+	for _, r := range append([][]string{header}, rows...) {
+		for i, c := range r {
+			widths[i] = max(widths[i], visibleWidth(c))
+		}
+	}
+	var b strings.Builder
+	line := func(cells []string, paint func(string) string) {
+		for i, c := range cells {
+			if i > 0 {
+				b.WriteString(strings.Repeat(" ", widths[i-1]-visibleWidth(cells[i-1])+2))
+			}
+			b.WriteString(paint(c))
+		}
+	}
+	line(header, func(s string) string { return o.paint(colorBold, s) })
+	for _, r := range rows {
+		b.WriteByte('\n')
+		line(r, func(s string) string { return s })
+	}
+	return b.String()
+}
+
+// visibleWidth is the number of characters s shows, without color codes.
+func visibleWidth(s string) int { return utf8.RuneCountInString(ansiSGR.ReplaceAllString(s, "")) }
 
 // paint wraps s in an SGR color when stdout color is on.
 func (o *Output) paint(code, s string) string { return sgr(o.color, code, s) }

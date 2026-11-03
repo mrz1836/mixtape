@@ -162,7 +162,7 @@ func (r *run) anchor() float64 {
 	for i, s := range r.samples {
 		a[i] = s.anchor
 	}
-	return median(a)
+	return medianInPlace(a)
 }
 
 // Segmentize turns a track's observations into the frame ranges to keep
@@ -192,8 +192,10 @@ func Segmentize(tl Timeline, clock Clock, rate int, first int64, tn Tuning) Segm
 	for i := range runs {
 		r := &runs[i]
 		a := r.anchor()
-		start := runStart(runs, i)
-		end := runEnd(tl, runs, i, dur, tn)
+		start := runStart(runs, i, tn)
+		// A run can seem to end before it starts (a seek past the reported
+		// duration): it holds no audio, and must not shorten Covered.
+		end := max(runEnd(tl, runs, i, dur, tn), start)
 		if i == 0 {
 			seg.Anchor = int64(math.Round(a))
 			if start > tn.StartSlack.Seconds() {
@@ -270,18 +272,9 @@ func splitRuns(tl Timeline, clock Clock, f, dur float64, tn Tuning) []run {
 			prevAt = o.At
 			continue
 		}
-		if o.Position == 0 {
+		if rejected(o, cur, accepted, tl.Before, tn) {
 			prevAt = o.At
-			continue // Spotify reports exactly 0 while it buffers the start
-		}
-		if !accepted && !tl.Before.IsZero() &&
-			o.Position > o.At.Sub(tl.Before).Seconds()+tn.StaleSlack.Seconds() {
-			prevAt = o.At
-			continue // the previous track's position, reported under the new ID
-		}
-		if cur != nil && o.Position == cur.samples[len(cur.samples)-1].pos {
-			prevAt = o.At
-			continue // a held value carries no new timing information
+			continue
 		}
 		accepted = true
 		s := sample{
@@ -303,25 +296,43 @@ func splitRuns(tl Timeline, clock Clock, f, dur float64, tn Tuning) []run {
 	return runs
 }
 
+// rejected reports a playing observation that carries no timing for the
+// song. accepted tells whether one was taken already; cur is the run being
+// built, if any.
+func rejected(o Obs, cur *run, accepted bool, before time.Time, tn Tuning) bool {
+	switch {
+	case o.Position == 0:
+		return true // Spotify reports exactly 0 while it buffers the start
+	case !accepted && !reachable(before, o.At, o.Position, tn):
+		return true // the previous track's position, reported under the new ID
+	case cur != nil && o.Position == cur.samples[len(cur.samples)-1].pos:
+		return true // a held value carries no new timing information
+	}
+	return false
+}
+
+// recentSamples is how many of a run's last samples recentAnchor uses.
+const recentSamples = 5
+
 // recentAnchor is the median anchor of a run's last few samples, the
-// reference a new sample is compared with to detect a seek.
+// reference a new sample is compared with to detect a seek. It runs for
+// every observation, so it works in a buffer on the stack.
 func recentAnchor(r *run) float64 {
-	n := len(r.samples)
-	from := max(n-5, 0)
-	a := make([]float64, 0, n-from)
-	for _, s := range r.samples[from:] {
+	var buf [recentSamples]float64
+	a := buf[:0]
+	for _, s := range r.samples[max(len(r.samples)-recentSamples, 0):] {
 		a = append(a, s.anchor)
 	}
-	return median(a)
+	return medianInPlace(a)
 }
 
 // runStart is the song position where run i began.
-func runStart(runs []run, i int) float64 {
+func runStart(runs []run, i int, tn Tuning) float64 {
 	r := runs[i]
 	s0 := r.samples[0]
-	if i > 0 && runs[i-1].pauseAt >= 0 && !runs[i-1].seekEnd {
+	if p := runs[max(i-1, 0)]; i > 0 && p.pauseAt >= 0 && !p.seekEnd && resumedInPlace(p.pauseAt, s0, r.before, tn) {
 		// Resumed after a pause: playback continues from the paused position.
-		return runs[i-1].pauseAt
+		return p.pauseAt
 	}
 	start := s0.pos
 	if !r.before.IsZero() {
@@ -331,6 +342,20 @@ func runStart(runs []run, i int) float64 {
 		start = s0.pos - s0.at.Sub(runs[i-1].samples[len(runs[i-1].samples)-1].at).Seconds()
 	}
 	return max(start, 0)
+}
+
+// resumedInPlace reports whether playback after a pause picked up where it
+// paused: the first position is the paused one, plus at most the time
+// since the observation before it (and a little slack either way).
+// Anywhere else, the listener moved the slider while paused, and the run
+// starts where its own positions say.
+func resumedInPlace(pauseAt float64, s0 sample, before time.Time, tn Tuning) bool {
+	elapsed := 0.0
+	if !before.IsZero() {
+		elapsed = s0.at.Sub(before).Seconds()
+	}
+	d := s0.pos - pauseAt
+	return d >= -tn.Gap.Seconds() && d <= elapsed+tn.Gap.Seconds()
 }
 
 // runEnd is the song position where run i ended.
@@ -355,15 +380,18 @@ func runEnd(tl Timeline, runs []run, i int, dur float64, tn Tuning) float64 {
 	return min(last.pos+tl.EndAt.Sub(last.at).Seconds(), dur)
 }
 
-func median(v []float64) float64 {
-	if len(v) == 0 {
+// median is the median of v (0 for none); v is left as it was.
+func median(v []float64) float64 { return medianInPlace(slices.Clone(v)) }
+
+// medianInPlace is the median of v (0 for none), sorting v to find it.
+func medianInPlace(v []float64) float64 {
+	n := len(v)
+	if n == 0 {
 		return 0
 	}
-	s := slices.Clone(v)
-	slices.Sort(s)
-	n := len(s)
+	slices.Sort(v)
 	if n%2 == 1 {
-		return s[n/2]
+		return v[n/2]
 	}
-	return (s[n/2-1] + s[n/2]) / 2
+	return (v[n/2-1] + v[n/2]) / 2
 }

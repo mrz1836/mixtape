@@ -2,29 +2,29 @@ package cli
 
 import (
 	"context"
-	"crypto/sha256"
 	"encoding/binary"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
 
-	"github.com/stretchr/testify/require"
-
 	"github.com/mrz1836/mixtape/internal/capture"
 	"github.com/mrz1836/mixtape/internal/capture/device"
-	"github.com/mrz1836/mixtape/internal/library"
 	"github.com/mrz1836/mixtape/internal/permission"
 	"github.com/mrz1836/mixtape/internal/spotify"
+	"github.com/mrz1836/mixtape/internal/testutil"
 )
 
-// fakePlayer answers polls with a fixed snapshot and records commands.
+// fakePlayer answers polls with the scripted snapshots in polls, then with
+// snap, and records commands.
 type fakePlayer struct {
 	mu       sync.Mutex
 	snap     spotify.Snapshot
+	polls    []spotify.Snapshot
 	commands []string
 }
 
@@ -44,6 +44,11 @@ func (p *fakePlayer) Commands() []string {
 func (p *fakePlayer) Poll(context.Context) spotify.Snapshot {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if len(p.polls) > 0 {
+		s := p.polls[0]
+		p.polls = p.polls[1:]
+		return s
+	}
 	return p.snap
 }
 
@@ -56,7 +61,7 @@ func (p *fakePlayer) Watch(ctx context.Context, _ time.Duration) <-chan spotify.
 	return ch
 }
 
-func (p *fakePlayer) PlayTrack(context.Context, string, string) error { return p.cmd("play") }
+func (p *fakePlayer) PlayTrack(context.Context, string, string) error { return p.cmd("playtrack") }
 func (p *fakePlayer) Play(context.Context) error                      { return p.cmd("play") }
 func (p *fakePlayer) Pause(context.Context) error                     { return p.cmd("pause") }
 func (p *fakePlayer) Next(context.Context) error                      { return p.cmd("next") }
@@ -66,15 +71,14 @@ func (p *fakePlayer) SetShuffle(context.Context, bool) error          { return p
 func (p *fakePlayer) SetRepeat(context.Context, bool) error           { return p.cmd("repeat") }
 func (p *fakePlayer) SetVolume(context.Context, int) error            { return p.cmd("volume") }
 
-// fakeCatalog resolves refs from a map.
+// fakeCatalog resolves refs from a map; err, when set, fails every lookup.
 type fakeCatalog struct {
-	cols  map[spotify.Ref]spotify.Collection
-	err   error
-	dates map[string]string // track ID → release date
+	cols map[spotify.Ref]spotify.Collection
+	err  error
 }
 
-func (c *fakeCatalog) ReleaseDate(_ context.Context, id string) (string, error) {
-	return c.dates[id], nil
+func (c *fakeCatalog) ReleaseDate(context.Context, string) (string, error) {
+	return "", c.err
 }
 
 func (c *fakeCatalog) Resolve(_ context.Context, ref spotify.Ref) (spotify.Collection, error) {
@@ -88,8 +92,12 @@ func (c *fakeCatalog) Resolve(_ context.Context, ref spotify.Ref) (spotify.Colle
 	return col, nil
 }
 
-// nopSource is a capture source that never delivers audio.
-type nopSource struct{ events chan capture.Event }
+// nopSource is a capture source that never delivers audio. It counts
+// how often it is closed.
+type nopSource struct {
+	events chan capture.Event
+	closes atomic.Int32
+}
 
 func (s *nopSource) Name() string           { return "fake device" }
 func (s *nopSource) Method() capture.Method { return capture.MethodDevice }
@@ -98,29 +106,7 @@ func (s *nopSource) Start(context.Context, func(capture.Block)) error {
 	return nil
 }
 func (s *nopSource) Events() <-chan capture.Event { return s.events }
-func (s *nopSource) Close() error                 { return nil }
-
-// syntheticEncoder writes a minimal M4A whose audio is a hash of the WAV.
-type syntheticEncoder struct{}
-
-func (syntheticEncoder) Encode(_ context.Context, wavPath, m4aPath string) error {
-	data, err := os.ReadFile(wavPath)
-	if err != nil {
-		return err
-	}
-	sum := sha256.Sum256(data)
-	out := box("ftyp", []byte("M4A \x00\x00\x02\x00M4A mp42isom"))
-	out = append(out, box("moov", box("mvhd", make([]byte, 100)))...)
-	out = append(out, box("mdat", sum[:])...)
-	return os.WriteFile(m4aPath, out, 0o600)
-}
-
-func box(typ string, payload []byte) []byte {
-	b := make([]byte, 8, 8+len(payload))
-	binary.BigEndian.PutUint32(b, uint32(8+len(payload)))
-	copy(b[4:], typ)
-	return append(b, payload...)
-}
+func (s *nopSource) Close() error                 { s.closes.Add(1); return nil }
 
 // fakeWorld is the simulated machine behind the harness services.
 type fakeWorld struct {
@@ -129,6 +115,8 @@ type fakeWorld struct {
 	catalog    *fakeCatalog
 	installed  bool
 	running    bool
+	runningErr error // the process list could not be read
+	devicesErr error
 	prefs      spotify.Prefs
 	tap        capture.TapStatus
 	devices    []device.Info
@@ -185,19 +173,21 @@ func newFakeWorld(t *testing.T) *fakeWorld {
 // services wires the fake world into the CLI.
 func (w *fakeWorld) services(h *harness) services {
 	return services{
-		player:         func() player { return w.player },
-		catalog:        func() catalog { return w.catalog },
-		openCapture:    func(captureRequest) (capture.Source, error) { return &nopSource{events: make(chan capture.Event)}, nil },
+		player:  func() player { return w.player },
+		catalog: func() catalog { return w.catalog },
+		openCapture: func(context.Context, captureRequest) (capture.Source, error) {
+			return &nopSource{events: make(chan capture.Event)}, nil
+		},
 		tapStatus:      func() capture.TapStatus { return w.tap },
-		devices:        func() ([]device.Info, error) { return w.devices, nil },
+		devices:        func() ([]device.Info, error) { return w.devices, w.devicesErr },
 		defaultOutput:  func() (device.Info, error) { return w.output, nil },
-		spotifyRunning: func() (bool, error) { return w.running, nil },
+		spotifyRunning: func() (bool, error) { return w.running, w.runningErr },
 		spotifyApp:     func(string) (string, bool) { return "/Applications/Spotify.app", w.installed },
 		prefs:          func(string) (spotify.Prefs, error) { return w.prefs, nil },
 		lockPath:       func() (string, error) { return w.lockPath, nil },
 		executable:     os.Executable,
 		lookPath:       func(string) (string, error) { return "/usr/bin/afconvert", nil },
-		encoder:        syntheticEncoder{},
+		encoder:        &testutil.Encoder{},
 		signals:        func() (<-chan os.Signal, func()) { return make(chan os.Signal), func() {} },
 		spawn:          func(string, []string, []string, string) (*os.Process, error) { return nil, os.ErrInvalid },
 		keepAwake: func() func() {
@@ -254,22 +244,6 @@ func (w *fakeWorld) addPlaylist(name string, tracks ...spotify.CatalogTrack) spo
 		Ref: ref, Name: name, Owner: "tester", Tracks: tracks, Complete: true, Source: spotify.SourceEmbed,
 	}
 	return ref
-}
-
-// recordDone stores a finished recording of t in the collection for spec.
-func recordDone(t *testing.T, root string, spec library.Spec, tr library.Track) {
-	t.Helper()
-	lib, err := library.Open(root, library.Options{Encoder: syntheticEncoder{}, WorkDir: t.TempDir()})
-	require.NoError(t, err)
-	unlock, err := lib.Lock()
-	require.NoError(t, err)
-	defer unlock()
-	c, err := lib.Collection(spec)
-	require.NoError(t, err)
-	wavPath := filepath.Join(t.TempDir(), "in.wav")
-	require.NoError(t, os.WriteFile(wavPath, make([]byte, 64), 0o600))
-	_, err = lib.Commit(t.Context(), c, tr, wavPath, library.CommitOptions{RecordedMS: tr.DurationMS})
-	require.NoError(t, err)
 }
 
 // loudSource is a capture source that delivers one audible block on Start.

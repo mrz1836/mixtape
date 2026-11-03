@@ -3,6 +3,8 @@ package session
 import (
 	"bytes"
 	"context"
+	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,6 +15,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/mrz1836/mixtape/internal/spotify"
+	"github.com/mrz1836/mixtape/internal/testutil"
 )
 
 func TestLockAcquireInspectRelease(t *testing.T) {
@@ -159,20 +162,18 @@ func (f *fakeRestorer) SetVolume(_ context.Context, v int) error {
 	return nil
 }
 
-func ptr[T any](v T) *T { return &v }
-
 func TestRestoreCompareAndSet(t *testing.T) {
 	t.Parallel()
 	st := SpotifyState{
-		Original: PlayerSettings{Shuffle: ptr(true), Repeat: ptr(false), Volume: ptr(40)},
-		Set:      PlayerSettings{Shuffle: ptr(false), Repeat: ptr(true), Volume: ptr(100)},
+		Original: PlayerSettings{Shuffle: testutil.Ptr(true), Repeat: testutil.Ptr(false), Volume: testutil.Ptr(40)},
+		Set:      PlayerSettings{Shuffle: testutil.Ptr(false), Repeat: testutil.Ptr(true), Volume: testutil.Ptr(100)},
 	}
 	assert.True(t, st.NeedsRestore())
 
 	// Shuffle and volume still hold what we set; the user turned repeat
 	// off again themselves, so it is left alone.
 	p := &fakeRestorer{snap: spotify.Snapshot{Shuffle: false, Repeat: false, Volume: 100}}
-	restored, err := Restore(t.Context(), p, st)
+	restored, err := restore(t.Context(), p, st, 0)
 	require.NoError(t, err)
 	assert.Equal(t, []string{"shuffle", "volume"}, restored)
 	assert.Equal(t, []string{"shuffle=on", "volume", "volume"}, p.calls, "the volume is nudged once")
@@ -183,10 +184,57 @@ func TestRestoreCompareAndSet(t *testing.T) {
 	assert.False(t, (*SpotifyState)(nil).NeedsRestore())
 }
 
+func TestRestoreReportsWhatFailed(t *testing.T) {
+	t.Parallel()
+	st := SpotifyState{
+		Original: PlayerSettings{Shuffle: testutil.Ptr(true), Volume: testutil.Ptr(40)},
+		Set:      PlayerSettings{Shuffle: testutil.Ptr(false), Volume: testutil.Ptr(100)},
+	}
+	p := &failingRestorer{fakeRestorer: fakeRestorer{snap: spotify.Snapshot{Volume: 100}}}
+	restored, err := restore(t.Context(), p, st, 0)
+	require.ErrorIs(t, err, errSetFailed)
+	assert.Contains(t, err.Error(), "restore shuffle: ")
+	assert.Equal(t, []string{"volume"}, restored, "one failure does not stop the others")
+}
+
+func TestRestoreWaitsForTheVolumeOnlyWhileTheContextLives(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	st := SpotifyState{Original: PlayerSettings{Volume: testutil.Ptr(47)}, Set: PlayerSettings{Volume: testutil.Ptr(100)}}
+	p := &fakeRestorer{snap: spotify.Snapshot{Volume: 100}}
+	start := time.Now()
+	restored, err := restore(ctx, p, st, time.Hour)
+	require.NoError(t, err, "the volume was set; only the read-back was cut short")
+	assert.Equal(t, []string{"volume"}, restored)
+	assert.Less(t, time.Since(start), time.Minute, "a canceled restore does not wait out the settle")
+	assert.Equal(t, []string{"volume"}, p.calls, "no nudging without time to check")
+}
+
+func TestToRestore(t *testing.T) {
+	t.Parallel()
+	v, ok := toRestore(testutil.Ptr(40), testutil.Ptr(100), 100)
+	assert.True(t, ok)
+	assert.Equal(t, 40, v)
+	_, ok = toRestore(testutil.Ptr(40), testutil.Ptr(100), 70)
+	assert.False(t, ok, "the listener changed it since: theirs wins")
+	_, ok = toRestore(testutil.Ptr(true), testutil.Ptr(true), true)
+	assert.False(t, ok, "nothing was changed")
+	_, ok = toRestore(nil, testutil.Ptr(true), true)
+	assert.False(t, ok, "the original is unknown")
+}
+
+var errSetFailed = errors.New("spotify did not answer")
+
+// failingRestorer fails to change shuffle.
+type failingRestorer struct{ fakeRestorer }
+
+func (*failingRestorer) SetShuffle(context.Context, bool) error { return errSetFailed }
+
 func TestRestorePollError(t *testing.T) {
 	t.Parallel()
 	p := &fakeRestorer{snap: spotify.Snapshot{Err: spotify.ErrNotRunning}}
-	_, err := Restore(t.Context(), p, SpotifyState{Set: PlayerSettings{Volume: ptr(1)}})
+	_, err := Restore(t.Context(), p, SpotifyState{Set: PlayerSettings{Volume: testutil.Ptr(1)}})
 	require.ErrorIs(t, err, spotify.ErrNotRunning)
 }
 
@@ -227,4 +275,66 @@ func TestSpawn(t *testing.T) {
 
 	_, err = Spawn(filepath.Join(t.TempDir(), "missing"), nil, nil, logPath)
 	require.Error(t, err)
+}
+
+func TestDefaultLockPathIsPerUser(t *testing.T) {
+	t.Parallel()
+	path, err := DefaultLockPath()
+	require.NoError(t, err)
+	cache, err := os.UserCacheDir()
+	require.NoError(t, err)
+	assert.Equal(t, filepath.Join(cache, "mixtape", "recorder.lock"), path)
+}
+
+func TestSessionFilesUnderAPlainFileFail(t *testing.T) {
+	t.Parallel()
+	file := filepath.Join(t.TempDir(), "plain")
+	require.NoError(t, os.WriteFile(file, nil, 0o600))
+	under := filepath.Join(file, "inside")
+
+	err := WriteState(under, State{ID: "s1"})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "write session state: ")
+
+	_, err = OpenEventLog(filepath.Join(under, "events.ndjson"))
+	require.ErrorContains(t, err, "open event log: ")
+
+	_, err = Acquire(filepath.Join(under, "recorder.lock"), LockInfo{})
+	require.ErrorContains(t, err, "open the recorder lock: ")
+	_, _, err = Inspect(filepath.Join(under, "recorder.lock"))
+	require.ErrorContains(t, err, "open the recorder lock: ")
+
+	_, err = Follow(filepath.Join(under, "events.ndjson"), 0, io.Discard, func() bool { return false })
+	require.ErrorContains(t, err, "follow the event log: ")
+
+	_, err = Spawn("/bin/sh", nil, nil, filepath.Join(under, "child.log"))
+	require.ErrorContains(t, err, "open session log: ")
+}
+
+func TestReadStateOfAFolderIsAnError(t *testing.T) {
+	t.Parallel()
+	home := t.TempDir()
+	require.NoError(t, os.Mkdir(StatePath(home), 0o700))
+	_, err := ReadState(home)
+	require.Error(t, err)
+	require.NotErrorIs(t, err, ErrNoSession, "a session.json that cannot be read is not a missing one")
+	assert.Contains(t, err.Error(), "read session state: ")
+}
+
+func TestEventLogRejectsWhatJSONCannotHold(t *testing.T) {
+	t.Parallel()
+	log, err := OpenEventLog(filepath.Join(t.TempDir(), "events.ndjson"))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = log.Close() })
+	require.ErrorContains(t, log.Write(func() {}), "encode event: ")
+}
+
+func TestWaitEndsWithTheContext(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(t.Context())
+	assert.True(t, wait(ctx, 0), "no wait while the context lives")
+	cancel()
+	assert.False(t, wait(ctx, 0))
+	assert.False(t, wait(ctx, time.Hour), "a canceled wait returns at once")
+	assert.True(t, wait(t.Context(), time.Millisecond))
 }

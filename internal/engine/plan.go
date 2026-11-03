@@ -72,7 +72,8 @@ type Item struct {
 
 	state       itemState
 	attempts    int
-	falseStarts int // takes that ended before the song really began
+	falseStarts int  // takes that ended before the song really began
+	retake      bool // live mode: a take was cut short; record the song if it plays again
 	reason      string
 }
 
@@ -246,7 +247,7 @@ func Prepare(lib *library.Library, p *Plan) error {
 		complete := g.Spotify.Complete && g.Spec.Kind != library.KindSingles && g.Spec.Kind != library.KindFolder
 		c.Sync(tracks, complete)
 		if err := lib.Save(c); err != nil {
-			return err
+			return fmt.Errorf("prepare %s: %w", g.Spec.Name, err)
 		}
 		g.Collection = c
 	}
@@ -263,7 +264,7 @@ func (p *Plan) Summary() []PlanItem {
 		}
 		switch {
 		case it.From != nil:
-			pi.From = it.From.Collection.Folder() + "/" + it.From.Entry.File
+			pi.From = it.From.RelPath()
 		case it.Twin != nil:
 			pi.From = it.Twin.Group.Spec.Name
 		}
@@ -284,6 +285,13 @@ func (p *Plan) Count(a Action) int {
 }
 
 // position is the item's 1-based place in its collection.
+// unbusy puts a song whose save failed back to pending.
+func (it *Item) unbusy() {
+	if it.state == itemBusy {
+		it.state = itemPending
+	}
+}
+
 func (it *Item) position() int {
 	for i, x := range it.Group.Items {
 		if x == it {

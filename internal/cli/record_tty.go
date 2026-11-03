@@ -7,11 +7,11 @@ import (
 	"strings"
 	"sync"
 	"time"
-	"unicode/utf8"
 
 	"golang.org/x/term"
 
 	"github.com/mrz1836/mixtape/internal/engine"
+	"github.com/mrz1836/mixtape/internal/session"
 	"github.com/mrz1836/mixtape/internal/spotify"
 )
 
@@ -66,8 +66,8 @@ func (u *ttyUI) readKeys(controls chan<- engine.Control, force context.CancelFun
 	interrupts := 0
 	for {
 		n, err := u.a.deps.stdin.Read(buf)
-		if err != nil {
-			return
+		if err != nil || u.closed() {
+			return // a key pressed after the session ended is not a control
 		}
 		for _, b := range buf[:n] {
 			var c engine.Control
@@ -122,23 +122,35 @@ func (u *ttyUI) width() int {
 	return 100
 }
 
+// closed reports whether close has run.
+func (u *ttyUI) closed() bool {
+	select {
+	case <-u.done:
+		return true
+	default:
+		return false
+	}
+}
+
 func (u *ttyUI) setStatus(line string) {
 	u.mu.Lock()
 	defer u.mu.Unlock()
-	select {
-	case <-u.done:
+	if u.closed() {
 		return
-	default:
 	}
 	u.status = line
 	_, _ = io.WriteString(u.out, "\r\x1b[K"+line)
 }
 
 // log prints a line above the status line. Raw mode disables output
-// post-processing, so lines end in \r\n.
+// post-processing, so lines end in \r\n. After close it prints nothing:
+// the terminal is back in normal mode and the summary has the last word.
 func (u *ttyUI) log(line string) {
 	u.mu.Lock()
 	defer u.mu.Unlock()
+	if u.closed() {
+		return
+	}
 	line = strings.ReplaceAll(line, "\n", "\r\n")
 	_, _ = io.WriteString(u.out, "\r\x1b[K"+line+"\r\n"+u.status)
 }
@@ -149,7 +161,7 @@ func (u *ttyUI) log(line string) {
 func statusLine(p engine.Progress, o *Output, width int) string {
 	var indicator string
 	switch {
-	case p.Phase == "stopping":
+	case p.Phase == session.PhaseStopping:
 		indicator = o.paint(colorYellow, "■ STOP")
 	case p.State == spotify.StatePlaying && p.Recording:
 		indicator = o.paint(colorRed, "⏺ REC ")
@@ -222,7 +234,8 @@ func planLine(items []engine.PlanItem) string {
 	if len(items) == 0 {
 		return "recording whatever Spotify plays"
 	}
-	return fmt.Sprintf("plan: %d to record, %d to copy, %d already done", n["record"], n["copy"], n["skip"])
+	return fmt.Sprintf("plan: %d to record, %d to copy, %d already done",
+		n[string(engine.ActionRecord)], n[string(engine.ActionCopy)], n[string(engine.ActionSkip)])
 }
 
 // summaryLine is the last line of a text session.
@@ -290,8 +303,7 @@ func deref(f *float64) float64 {
 // truncateDisplay shortens s to at most width visible characters,
 // ignoring SGR color sequences.
 func truncateDisplay(s string, width int) string {
-	visible := utf8.RuneCountInString(ansiSGR.ReplaceAllString(s, ""))
-	if visible <= width {
+	if visibleWidth(s) <= width {
 		return s
 	}
 	plain := []rune(ansiSGR.ReplaceAllString(s, ""))

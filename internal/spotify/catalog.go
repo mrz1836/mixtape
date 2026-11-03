@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"strings"
@@ -64,26 +65,44 @@ type Catalog struct {
 
 // NewCatalog returns a Catalog for the live Spotify endpoints.
 func NewCatalog() *Catalog {
-	return &Catalog{
-		Client:     &http.Client{Timeout: catalogTimeout},
-		EmbedBase:  defaultEmbedBase,
-		OEmbedBase: defaultOEmbedBase,
-		UserAgent:  defaultUserAgent,
+	c := new(Catalog).withDefaults()
+	return &c
+}
+
+// withDefaults returns a copy of c with each unset field at its live
+// default, so a zero Catalog works too. Resolve and ReleaseDate work on
+// such a copy, which embed, oembedTitle and get expect, and every request
+// of one lookup goes through the same http.Client.
+func (c *Catalog) withDefaults() Catalog {
+	d := *c
+	if d.Client == nil {
+		d.Client = &http.Client{Timeout: catalogTimeout}
 	}
+	if d.EmbedBase == "" {
+		d.EmbedBase = defaultEmbedBase
+	}
+	if d.OEmbedBase == "" {
+		d.OEmbedBase = defaultOEmbedBase
+	}
+	if d.UserAgent == "" {
+		d.UserAgent = defaultUserAgent
+	}
+	return d
 }
 
 // Resolve returns the collection ref points at. A link Spotify does not
 // know is ErrNotFound; when both the embed page and oEmbed fail the error
 // wraps ErrCatalog.
 func (c *Catalog) Resolve(ctx context.Context, ref Ref) (Collection, error) {
-	col, err := c.embed(ctx, ref)
+	d := c.withDefaults()
+	col, err := d.embed(ctx, ref)
 	if err == nil {
 		return col, nil
 	}
 	if errors.Is(err, ErrNotFound) {
 		return Collection{}, err
 	}
-	name, oerr := c.oembedTitle(ctx, ref)
+	name, oerr := d.oembedTitle(ctx, ref)
 	if oerr != nil {
 		if errors.Is(oerr, ErrNotFound) {
 			return Collection{}, oerr
@@ -127,11 +146,9 @@ type embedEntity struct {
 }
 
 type embedImage struct {
-	URL       string `json:"url"`
-	Width     *int   `json:"width"`
-	MaxWidth  *int   `json:"maxWidth"`
-	Height    *int   `json:"height"`
-	MaxHeight *int   `json:"maxHeight"`
+	URL      string `json:"url"`
+	Width    *int   `json:"width"`
+	MaxWidth *int   `json:"maxWidth"`
 }
 
 type embedPage struct {
@@ -149,7 +166,7 @@ type embedPage struct {
 
 // embed fetches and parses the embed page for ref.
 func (c *Catalog) embed(ctx context.Context, ref Ref) (Collection, error) {
-	endpoint := strings.TrimRight(c.embedBase(), "/") + "/" + string(ref.Kind) + "/" + ref.ID
+	endpoint := strings.TrimRight(c.EmbedBase, "/") + "/" + string(ref.Kind) + "/" + ref.ID
 	body, status, err := c.get(ctx, endpoint, maxEmbedBody)
 	if err != nil {
 		return Collection{}, err
@@ -205,29 +222,39 @@ func collectionFromEntity(ref Ref, e *embedEntity) (Collection, error) {
 	if col.Name == "" {
 		return Collection{}, fmt.Errorf("%w: entity has no name", errEmbed)
 	}
-
 	if ref.Kind == KindTrack {
-		artists := make([]string, 0, len(e.Artists))
-		for _, a := range e.Artists {
-			if a.Name != "" {
-				artists = append(artists, a.Name)
-			}
-		}
-		col.Tracks = []CatalogTrack{{
-			ID:       ref.ID,
-			Title:    col.Name,
-			Artist:   strings.Join(artists, ", "),
-			Duration: time.Duration(e.Duration) * time.Millisecond,
-			Playable: boolOr(e.IsPlayable, true),
-			Position: 1,
-		}}
-		if e.ReleaseDate != nil {
-			col.Tracks[0].ReleaseDate = isoDate(e.ReleaseDate.ISOString)
-		}
-		col.Complete = true
-		return col, nil
+		return trackCollection(col, e), nil
 	}
+	return listCollection(col, e)
+}
 
+// trackCollection completes the collection of a track link: the entity
+// is the track itself, so the collection is that one song, complete.
+func trackCollection(col Collection, e *embedEntity) Collection {
+	artists := make([]string, 0, len(e.Artists))
+	for _, a := range e.Artists {
+		if a.Name != "" {
+			artists = append(artists, a.Name)
+		}
+	}
+	col.Tracks = []CatalogTrack{{
+		ID:       col.Ref.ID,
+		Title:    col.Name,
+		Artist:   strings.Join(artists, ", "),
+		Duration: msDuration(e.Duration),
+		Playable: boolOr(e.IsPlayable, true),
+		Position: 1,
+	}}
+	if e.ReleaseDate != nil {
+		col.Tracks[0].ReleaseDate = isoDate(e.ReleaseDate.ISOString)
+	}
+	col.Complete = true
+	return col
+}
+
+// listCollection completes the collection of an album or playlist link
+// from the entity's track list, keeping only the entries that are tracks.
+func listCollection(col Collection, e *embedEntity) (Collection, error) {
 	if len(e.TrackList) == 0 {
 		// An album always has songs, and a playlist page without any is far
 		// more likely a changed page than an empty playlist: never take it
@@ -244,22 +271,32 @@ func collectionFromEntity(ref Ref, e *embedEntity) (Collection, error) {
 			ID:       id,
 			Title:    t.Title,
 			Artist:   t.Subtitle,
-			Duration: time.Duration(t.Duration) * time.Millisecond,
+			Duration: msDuration(t.Duration),
 			Playable: boolOr(t.IsPlayable, true),
 			Position: len(col.Tracks) + 1,
 		})
 	}
-	col.Truncated = ref.Kind == KindPlaylist && len(e.TrackList) >= embedTrackCap
+	if len(col.Tracks) == 0 {
+		// Entries, but none a track: the page changed shape (or lists only
+		// episodes and local files). Either way it is no empty list.
+		return Collection{}, fmt.Errorf("%w: no tracks in the track list", errEmbed)
+	}
+	col.Truncated = col.Ref.Kind == KindPlaylist && len(e.TrackList) >= embedTrackCap
 	col.Complete = !col.Truncated
 	return col, nil
 }
 
 // ReleaseDate looks a track's release date up on its embed page; it returns
-// YYYY-MM-DD, or "" when the page does not name one.
+// YYYY-MM-DD, or "" when the page does not name one. A track Spotify does
+// not know is ErrNotFound; any other failure wraps ErrCatalog.
 func (c *Catalog) ReleaseDate(ctx context.Context, trackID string) (string, error) {
-	col, err := c.embed(ctx, Ref{Kind: KindTrack, ID: trackID})
-	if err != nil {
+	d := c.withDefaults()
+	col, err := d.embed(ctx, Ref{Kind: KindTrack, ID: trackID})
+	if errors.Is(err, ErrNotFound) {
 		return "", err
+	}
+	if err != nil {
+		return "", fmt.Errorf("%w: %w", ErrCatalog, err)
 	}
 	if len(col.Tracks) == 0 {
 		return "", nil
@@ -282,11 +319,7 @@ func isoDate(s string) string {
 
 // oembedTitle resolves ref's name via the oEmbed endpoint.
 func (c *Catalog) oembedTitle(ctx context.Context, ref Ref) (string, error) {
-	base := c.OEmbedBase
-	if base == "" {
-		base = defaultOEmbedBase
-	}
-	body, status, err := c.get(ctx, base+"?url="+url.QueryEscape(ref.URL()), maxOEmbedBody)
+	body, status, err := c.get(ctx, c.OEmbedBase+"?url="+url.QueryEscape(ref.URL()), maxOEmbedBody)
 	if err != nil {
 		return "", err
 	}
@@ -312,36 +345,20 @@ func (c *Catalog) oembedTitle(ctx context.Context, ref Ref) (string, error) {
 func (c *Catalog) get(ctx context.Context, endpoint string, limit int64) ([]byte, int, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
-		return nil, 0, fmt.Errorf("%w: %w", ErrCatalog, err)
+		return nil, 0, err
 	}
-	ua := c.UserAgent
-	if ua == "" {
-		ua = defaultUserAgent
-	}
-	req.Header.Set("User-Agent", ua)
+	req.Header.Set("User-Agent", c.UserAgent)
 	req.Header.Set("Accept-Language", "en")
-
-	client := c.Client
-	if client == nil {
-		client = &http.Client{Timeout: catalogTimeout}
-	}
-	resp, err := client.Do(req)
+	resp, err := c.Client.Do(req)
 	if err != nil {
-		return nil, 0, fmt.Errorf("%w: %w", ErrCatalog, err)
+		return nil, 0, err
 	}
 	defer func() { _ = resp.Body.Close() }()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, limit))
 	if err != nil {
-		return nil, 0, fmt.Errorf("%w: read body: %w", ErrCatalog, err)
+		return nil, 0, fmt.Errorf("read %s: %w", endpoint, err)
 	}
 	return body, resp.StatusCode, nil
-}
-
-func (c *Catalog) embedBase() string {
-	if c.EmbedBase == "" {
-		return defaultEmbedBase
-	}
-	return c.EmbedBase
 }
 
 // largestImage returns the URL of the widest image; images without a size
@@ -364,6 +381,15 @@ func largestImage(imgs []embedImage) string {
 		}
 	}
 	return best
+}
+
+// msDuration converts a page's duration in milliseconds; a negative one,
+// or one too large for a time.Duration, is unknown (0).
+func msDuration(ms int64) time.Duration {
+	if ms <= 0 || ms > math.MaxInt64/int64(time.Millisecond) {
+		return 0
+	}
+	return time.Duration(ms) * time.Millisecond
 }
 
 func boolOr(b *bool, def bool) bool {

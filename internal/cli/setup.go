@@ -50,41 +50,45 @@ whether the Core Audio process tap can be used on this Mac (macOS 14.2+).`,
 		Args:    cobra.NoArgs,
 		RunE: func(_ *cobra.Command, _ []string) error {
 			svc := a.deps.services
-			doc := devicesDoc{Tap: svc.tapStatus(), Devices: []deviceDoc{}}
 			devs, err := svc.devices()
 			if err != nil {
 				return err
 			}
-			var b strings.Builder
-			tap := "available"
-			if !doc.Tap.Supported {
-				tap = "unavailable: " + doc.Tap.Reason
-			}
-			fmt.Fprintf(&b, "%s %s", a.out.paint(colorBold, "process tap:"), tap)
+			doc := devicesDoc{Tap: svc.tapStatus(), Devices: []deviceDoc{}}
 			for _, d := range devs {
-				dd := deviceDoc{Name: d.Name, Input: d.Input, Output: d.Output, DefaultInput: d.DefaultInput, DefaultOutput: d.DefaultOutput}
-				doc.Devices = append(doc.Devices, dd)
+				doc.Devices = append(doc.Devices, deviceDoc{
+					Name: d.Name, Input: d.Input, Output: d.Output, DefaultInput: d.DefaultInput, DefaultOutput: d.DefaultOutput,
+				})
 				if d.DefaultOutput {
 					doc.DefaultOutput = d.Name
 				}
-				var tags []string
-				if d.Input {
-					tags = append(tags, "input")
-				}
-				if d.Output {
-					tags = append(tags, "output")
-				}
-				if d.DefaultInput {
-					tags = append(tags, "default input")
-				}
-				if d.DefaultOutput {
-					tags = append(tags, "default output")
-				}
-				fmt.Fprintf(&b, "\n  %-32s %s", d.Name, a.out.paint(colorDim, strings.Join(tags, ", ")))
 			}
-			return a.out.Result(b.String(), doc)
+			return a.out.Result(a.devicesText(doc), doc)
 		},
 	}
+}
+
+// devicesText renders `devices` for people.
+func (a *app) devicesText(doc devicesDoc) string {
+	var b strings.Builder
+	tap := "available"
+	if !doc.Tap.Supported {
+		tap = "unavailable: " + doc.Tap.Reason
+	}
+	fmt.Fprintf(&b, "%s %s", a.out.paint(colorBold, "process tap:"), tap)
+	for _, d := range doc.Devices {
+		var tags []string
+		for _, t := range []struct {
+			on   bool
+			name string
+		}{{d.Input, "input"}, {d.Output, "output"}, {d.DefaultInput, "default input"}, {d.DefaultOutput, "default output"}} {
+			if t.on {
+				tags = append(tags, t.name)
+			}
+		}
+		fmt.Fprintf(&b, "\n  %-32s %s", d.Name, a.out.paint(colorDim, strings.Join(tags, ", ")))
+	}
+	return b.String()
 }
 
 func newSetupCmd(a *app) *cobra.Command {
@@ -100,7 +104,7 @@ func newSetupCmd(a *app) *cobra.Command {
      Multi-Output Device; setup can install BlackHole with Homebrew and
      opens Audio MIDI Setup with the steps.
   2. A short test capture while Spotify plays proves the method works.
-  3. The Spotify Automation prompt, crossfade and volume.
+  3. The Spotify Automation prompt, crossfade, automix and volume.
   4. The library folder.
 
 Only a verified capture method is saved to the config. --yes accepts every
@@ -133,14 +137,13 @@ func (a *app) setupNonInteractive(ctx context.Context) error {
 		return err
 	}
 	if !doc.Ready {
-		return newError(ExitNotReady, errNotReady, "run 'mixtape setup' in a terminal, or follow the steps above",
-			"not ready: %d check(s) failed", failed(doc.Checks))
+		return notReady(failed(doc.Checks), "run 'mixtape setup' in a terminal, or follow the steps above")
 	}
 	return nil
 }
 
 const setupSteps = `Manual setup:
-  1. Spotify: Settings → Playback → turn off "Crossfade songs"; set Spotify's volume to the maximum.
+  1. Spotify: Settings → Playback → turn off "Crossfade songs" and "Automix"; set Spotify's volume to the maximum.
   2. Capture, either:
      a. Process tap (macOS 14.2+): mixtape config set capture tap — the first recording asks
         macOS for audio-recording permission for your terminal app.
@@ -215,8 +218,12 @@ func (s *setupFlow) run(ctx context.Context) error {
 	if _, ok := svc.spotifyApp(a.deps.userHome); !ok {
 		return spotify.ErrNotInstalled
 	}
-	if running, _ := svc.spotifyRunning(); !running {
+	switch proc, err := a.spotifyStatus(); proc {
+	case spotifyStopped:
 		s.pause("Open Spotify, then press Enter.")
+	case spotifyUnknown:
+		s.say("%s could not check Spotify: %v", a.out.paint(colorYellow, "!"), err)
+	case spotifyRunning:
 	}
 	s.say("Checking that mixtape can control Spotify (macOS may ask you to allow it)…")
 	if !s.ensure(ctx, permission.Automation) {
@@ -238,7 +245,7 @@ func (s *setupFlow) run(ctx context.Context) error {
 
 	if c := a.checkCrossfade(); c.Status == checkFail {
 		s.say("%s %s\n  %s", a.out.paint(colorRed, "✗"), c.Detail, c.Fix)
-		s.pause("Turn crossfade off, then press Enter.")
+		s.pause("Turn it off, then press Enter.")
 	}
 
 	path := config.Path(a.home)
@@ -253,8 +260,7 @@ func (s *setupFlow) run(ctx context.Context) error {
 	doc := a.diagnose(ctx)
 	s.say("\n%s", a.doctorText(doc))
 	if !doc.Ready {
-		return newError(ExitNotReady, errNotReady, "fix the failed checks above and run 'mixtape doctor'",
-			"setup finished, but %d check(s) still fail", failed(doc.Checks))
+		return notReady(failed(doc.Checks), "fix the failed checks above, then run 'mixtape doctor'")
 	}
 	s.say("\nTry it: mixtape record <a Spotify track link>")
 	return nil
@@ -293,7 +299,10 @@ func (s *setupFlow) chooseCapture(ctx context.Context, settings config.Settings)
 func (s *setupFlow) setupDevice(ctx context.Context, settings config.Settings) (capture.Method, error) {
 	a := s.a
 	svc := a.deps.services
-	devs, _ := svc.devices()
+	devs, err := svc.devices()
+	if err != nil {
+		return "", fmt.Errorf("list audio devices: %w", err)
+	}
 	if findDevice(devs, settings.Device) == nil {
 		if !s.ask("BlackHole 2ch is not installed. Install it with Homebrew now (brew install blackhole-2ch)?", true) {
 			return "", fmt.Errorf("%w: no capture device", errNotReady)
@@ -345,23 +354,25 @@ func (s *setupFlow) ensure(ctx context.Context, k permission.Kind) bool {
 	_ = svc.runScript(ctx, "open", permission.SettingsURL(k))
 	s.say("  Waiting for the switch (up to %s; Ctrl-C to stop)…", permissionWait)
 	start := s.a.deps.now()
-	deadline := start.Add(permissionWait)
 	next := start.Add(waitReminder)
-	for s.a.deps.now().Before(deadline) {
-		if !svc.sleep(ctx, time.Second) {
-			return false
-		}
+	err := s.a.pollUntil(ctx, start.Add(permissionWait), time.Second, func() (bool, error) {
 		if svc.permission(k) == permission.Granted {
-			s.say("%s %s may now %s", s.a.out.paint(colorGreen, "✓"), app, permissionVerb(k))
-			return true
+			return true, nil
 		}
 		if now := s.a.deps.now(); !now.Before(next) {
 			s.say("  still waiting (%s)… %s", mmss(now.Sub(start)), permission.Where(k))
 			next = now.Add(waitReminder)
 		}
+		return false, nil
+	})
+	if err != nil {
+		if errors.Is(err, errDeadline) {
+			s.say("%s still not granted", s.a.out.paint(colorRed, "✗"))
+		}
+		return false
 	}
-	s.say("%s still not granted", s.a.out.paint(colorRed, "✗"))
-	return false
+	s.say("%s %s may now %s", s.a.out.paint(colorGreen, "✓"), app, permissionVerb(k))
+	return true
 }
 
 // waitReminder is how often setup says it is still waiting.
@@ -382,24 +393,12 @@ func systemAudioSteps(app permission.HostApp, listedAbove bool) string {
 	return steps
 }
 
-func permissionVerb(k permission.Kind) string {
-	switch k {
-	case permission.SystemAudio:
-		return "record system audio"
-	case permission.Microphone:
-		return "open the capture device"
-	case permission.Automation:
-		return "control Spotify"
-	}
-	return "go ahead"
-}
-
 // routingCheck is the output-routing check alone.
 func (a *app) routingCheck(s config.Settings) check {
-	s.Capture = string(capture.MethodDevice)
+	s.Capture = capture.MethodDevice
 	_, checks := a.checkCapture(s)
 	for _, c := range checks {
-		if c.ID == "routing" {
+		if c.ID == checkIDRouting {
 			return c
 		}
 	}
@@ -426,7 +425,7 @@ func (s *setupFlow) verify(ctx context.Context, r captureRequest) error {
 		}
 	}
 	s.say("Listening for 4 seconds…")
-	src, err := svc.openCapture(r)
+	src, err := svc.openCapture(ctx, r)
 	if err != nil {
 		return err
 	}

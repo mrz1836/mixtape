@@ -69,9 +69,11 @@ func TestQueueRecordsSinglesAndSkipsThemNextTime(t *testing.T) {
 	// Every cut is the song plus a margin at each edge, within a poll.
 	margin := framesOf(DefaultTuning().Margin)
 	for _, n := range s.enc.totalFrames() {
-		assert.True(t, n == framesOf(songA.dur)+2*margin || n == framesOf(songB.dur)+2*margin ||
-			abs64(n-framesOf(songA.dur)-2*margin) < framesOf(pollDur) ||
-			abs64(n-framesOf(songB.dur)-2*margin) < framesOf(pollDur), "frames %d", n)
+		want := framesOf(songA.dur) + 2*margin
+		if other := framesOf(songB.dur) + 2*margin; abs64(n-other) < abs64(n-want) {
+			want = other
+		}
+		assert.InDelta(t, want, n, float64(framesOf(pollDur)), "the cut of %d frames is one song plus margins", n)
 	}
 	assert.Equal(t, []string{EventTrackStarted, EventTrackSaved, EventTrackStarted, EventTrackSaved},
 		filter(s.types(), EventTrackStarted, EventTrackSaved, EventSessionFinished))
@@ -109,15 +111,9 @@ func TestPlaylistFlowsInContextAndCopiesKnownSongs(t *testing.T) {
 	assert.Equal(t, library.StatusCopied, c.Entry(songB.id).Status)
 	assert.FileExists(t, filepath.Join(c.Dir, c.Folder()+".m3u8"))
 
-	plays := 0
-	for _, cmd := range s.spotify.Commands()[start:] {
-		if len(cmd) > 5 && cmd[:5] == "play " {
-			plays++
-		}
-	}
 	// Alpha starts the context; after it Spotify plays Bravo (copied), so
 	// mixtape moves to Charlie: two requests, no more.
-	assert.Equal(t, 2, plays, "commands: %v", s.spotify.Commands()[start:])
+	assert.Equal(t, 2, s.spotify.plays(start), "commands: %v", s.spotify.Commands()[start:])
 }
 
 func TestHundredsOfCopiesAtTheStartDoNotHang(t *testing.T) {
@@ -126,12 +122,13 @@ func TestHundredsOfCopiesAtTheStartDoNotHang(t *testing.T) {
 	_, res := s.run(singles(songA), Options{}, nil)
 	requireComplete(t, res)
 
-	// Alpha is in 135 playlists: 135 copies are queued before the session
-	// loop runs, far more than the worker's result buffer holds.
+	// Alpha is in more playlists than the worker's result buffer holds:
+	// every copy is queued before the session loop takes a result.
+	const lists = resultBuffer + 16
 	s.reopen()
 	s.resetEvents()
-	cols := make([]spotify.Collection, 0, 135)
-	for i := range 135 {
+	cols := make([]spotify.Collection, 0, lists)
+	for i := range lists {
 		cols = append(cols, s.playlist(fmt.Sprintf("pl%020d", i), fmt.Sprintf("List %d", i), true, songA))
 	}
 	done := make(chan Result, 1)
@@ -145,7 +142,7 @@ func TestHundredsOfCopiesAtTheStartDoNotHang(t *testing.T) {
 		t.Fatal("the session hung queueing copies")
 	}
 	requireComplete(t, res)
-	assert.Equal(t, 135, res.Counts.Copied)
+	assert.Equal(t, lists, res.Counts.Copied)
 }
 
 func TestOutputRateChangeReportedAsDeviceChangeKeepsRecording(t *testing.T) {
@@ -178,11 +175,17 @@ func TestUnwritableLibraryEndsTheSession(t *testing.T) {
 	var dirs []string
 	s.at[time.Second] = func(s *sim) {
 		entries, err := os.ReadDir(s.root)
-		require.NoError(t, err)
+		if err != nil {
+			s.actionFailed(err)
+			return
+		}
 		for _, e := range entries {
 			if e.IsDir() {
 				dir := filepath.Join(s.root, e.Name())
-				require.NoError(t, os.Chmod(dir, 0o500))
+				if err := os.Chmod(dir, 0o500); err != nil {
+					s.actionFailed(err)
+					return
+				}
 				dirs = append(dirs, dir)
 			}
 		}
@@ -219,10 +222,8 @@ func TestSpoolWriteErrorEndsTheSession(t *testing.T) {
 
 func TestSilentSongsInARowEndTheSession(t *testing.T) {
 	t.Parallel()
-	long := func(id string) simTrack {
-		return simTrack{id: id, name: "Song " + id[len(id)-3:], artist: "X", dur: 14 * time.Second}
-	}
-	b, c, d := long("0000000000000000000sb1"), long("0000000000000000000sc2"), long("0000000000000000000sd3")
+	const dur = 14 * time.Second
+	b, c, d := longSong("0000000000000000000sb1", dur), longSong("0000000000000000000sc2", dur), longSong("0000000000000000000sd3", dur)
 	s := newSim(t, songA, b, c, d)
 	// Alpha is heard; then the sound goes elsewhere (Spotify Connect, a
 	// muted app) while Spotify keeps playing.
@@ -240,26 +241,33 @@ func TestSilentSongsInARowEndTheSession(t *testing.T) {
 	assert.Positive(t, res.Counts.Remaining, "the session stopped instead of trying every song")
 }
 
-func TestSongsThatNeverStartEndTheSession(t *testing.T) {
+func TestSongsThatNeverStart(t *testing.T) {
 	t.Parallel()
-	s := newSim(t, songA, songB, songC)
-	s.spotify.ignorePlay = true // signed out: "play track" does nothing
-	pl := s.playlist("pl0000000000000000000n", "Nothing", true, songA, songB, songC)
+	for name, tc := range map[string]struct {
+		maxFailures int
+		wantErr     error // nil: every song is tried and fails
+	}{
+		"end the session after max-failures setbacks in a row": {maxFailures: 3, wantErr: ErrNotStarting},
+		"are each tried when max-failures is 0":                {maxFailures: 0},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			s := newSim(t, songA, songB, songC)
+			s.spotify.ignorePlay = true // signed out: "play track" does nothing
+			pl := s.playlist("pl0000000000000000000n", "Nothing", true, songA, songB, songC)
 
-	_, res := s.run([]spotify.Collection{pl}, Options{MaxFailures: 3, StartTimeout: time.Second}, nil)
-	require.ErrorIs(t, res.Err, ErrNotStarting)
-	assert.Equal(t, 0, res.Counts.Recorded)
-}
-
-func TestMaxFailuresZeroNeverStops(t *testing.T) {
-	t.Parallel()
-	s := newSim(t, songA, songB)
-	s.spotify.ignorePlay = true
-	pl := s.playlist("pl0000000000000000000z", "Patient", true, songA, songB)
-
-	_, res := s.run([]spotify.Collection{pl}, Options{StartTimeout: time.Second}, nil)
-	require.NoError(t, res.Err, "without a limit every song is tried")
-	assert.Equal(t, 2, res.Counts.Failed)
+			_, res := s.run([]spotify.Collection{pl}, Options{MaxFailures: tc.maxFailures, StartTimeout: time.Second}, nil)
+			assert.Equal(t, 0, res.Counts.Recorded)
+			if tc.wantErr != nil {
+				require.ErrorIs(t, res.Err, tc.wantErr)
+				assert.Positive(t, res.Counts.Remaining, "the session stopped before trying every song")
+				return
+			}
+			require.NoError(t, res.Err)
+			assert.Equal(t, 3, res.Counts.Failed)
+			assert.Zero(t, res.Counts.Remaining)
+		})
+	}
 }
 
 func TestSpotifyRelaunchingMidSessionIsNotFatal(t *testing.T) {
@@ -593,7 +601,7 @@ func TestDuplicateAcrossPlaylistsIsRecordedOnceAndCopied(t *testing.T) {
 func TestEncodeFailureKeepsTheWAVAndRetriesNextRun(t *testing.T) {
 	t.Parallel()
 	s := newSim(t, songA)
-	s.enc.fail = true
+	s.enc.Fail(errTestEncode)
 	_, res := s.run(singles(songA), Options{}, nil)
 	assert.Equal(t, OutcomeIncomplete, res.Outcome)
 	e := s.collection(singlesSpec()).Entry(songA.id)
@@ -601,7 +609,7 @@ func TestEncodeFailureKeepsTheWAVAndRetriesNextRun(t *testing.T) {
 	_, err := os.Stat(e.PendingWAV)
 	require.NoError(t, err)
 
-	s.enc.fail = false
+	s.enc.Fail(nil)
 	s.reopen()
 	plan, res := s.run(singles(songA), Options{}, nil)
 	requireComplete(t, res)
@@ -624,10 +632,9 @@ func TestDryRunPlanChangesNothing(t *testing.T) {
 
 func TestCrossfadeEndsTheSession(t *testing.T) {
 	t.Parallel()
-	long := func(id string) simTrack {
-		return simTrack{id: id, name: "Song " + id[len(id)-3:], artist: "X", dur: 20 * time.Second}
-	}
-	a, b, c, d := long("0000000000000000000xa1"), long("0000000000000000000xb2"), long("0000000000000000000xc3"), long("0000000000000000000xd4")
+	const dur = 20 * time.Second
+	a, b, c, d := longSong("0000000000000000000xa1", dur), longSong("0000000000000000000xb2", dur),
+		longSong("0000000000000000000xc3", dur), longSong("0000000000000000000xd4", dur)
 	s := newSim(t, a, b, c, d)
 	s.spotify.crossfade = 6 * time.Second
 	pl := s.playlist("pl0000000000000000000x", "Faded", true, a, b, c, d)
@@ -754,13 +761,7 @@ func TestNextTrackBlipIsIgnored(t *testing.T) {
 	requireComplete(t, res)
 	assert.Equal(t, 1, res.Counts.Recorded)
 	assert.Empty(t, s.eventsOf(EventTrackDiscarded), "a one-poll blip is not a track change")
-	plays := 0
-	for _, c := range s.spotify.Commands() {
-		if strings.HasPrefix(c, "play ") {
-			plays++
-		}
-	}
-	assert.Equal(t, 1, plays, "the song is requested once")
+	assert.Equal(t, 1, s.spotify.plays(0), "the song is requested once")
 }
 
 func TestPreviousTrackBlipBeforeTheSongStartsIsIgnored(t *testing.T) {
@@ -780,11 +781,28 @@ func TestPreviousTrackBlipBeforeTheSongStartsIsIgnored(t *testing.T) {
 
 func TestRelinkMatching(t *testing.T) {
 	t.Parallel()
-	want := library.Track{Title: "Time - 2011 Remaster", Artist: "Pink Floyd", DurationMS: 413000}
-	assert.True(t, relinked(want, spotify.Track{Name: "Time - 2011 remaster", Artist: "Pink Floyd", Duration: 412 * time.Second}))
-	assert.False(t, relinked(want, spotify.Track{Name: "Time", Artist: "Pink Floyd", Duration: 413 * time.Second}))
-	assert.False(t, relinked(want, spotify.Track{Name: "Time - 2011 Remaster", Artist: "Pink Floyd", Duration: 420 * time.Second}))
-	assert.True(t, relinked(library.Track{Title: "X", Artist: "A, B"}, spotify.Track{Name: "x", Artist: "A"}))
+	timeTrack := library.Track{Title: "Time - 2011 Remaster", Artist: "Pink Floyd", DurationMS: 413000}
+	for name, tc := range map[string]struct {
+		want   library.Track
+		played spotify.Track
+		match  bool
+	}{
+		"same song, other case, a second off": {
+			timeTrack, spotify.Track{Name: "Time - 2011 remaster", Artist: "Pink Floyd", Duration: 412 * time.Second}, true,
+		},
+		"another title": {timeTrack, spotify.Track{Name: "Time", Artist: "Pink Floyd", Duration: 413 * time.Second}, false},
+		"another length": {
+			timeTrack, spotify.Track{Name: "Time - 2011 Remaster", Artist: "Pink Floyd", Duration: 420 * time.Second}, false,
+		},
+		"first of several artists, no duration": {
+			library.Track{Title: "X", Artist: "A, B"}, spotify.Track{Name: "x", Artist: "A"}, true,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			assert.Equal(t, tc.match, relinked(tc.want, tc.played))
+		})
+	}
 }
 
 func filter(types []string, keep ...string) []string {
@@ -804,4 +822,41 @@ func abs64(v int64) int64 {
 		return -v
 	}
 	return v
+}
+
+func TestCaptureStoppedWithoutDetail(t *testing.T) {
+	t.Parallel()
+	s := newSim(t, songA)
+	s.at[2*time.Second] = func(s *sim) { s.source.events <- capture.Event{Kind: capture.EventStopped} }
+	_, res := s.run(singles(songA), Options{}, nil)
+	require.ErrorIs(t, res.Err, ErrCaptureStopped)
+	assert.Equal(t, ErrCaptureStopped.Error(), res.Err.Error(), "no dangling separator")
+}
+
+func TestWarnOnceIsKeyed(t *testing.T) {
+	t.Parallel()
+	var got []string
+	e, err := New(Config{Player: &fakeSpotify{}, Library: &library.Library{}, Emit: func(ev Event) { got = append(got, ev.Message) }})
+	require.NoError(t, err)
+	e.warnOnce("prune", "could not delete a.pcm")
+	e.warnOnce("prune", "could not delete b.pcm")
+	e.warn("same")
+	e.warn("same")
+	assert.Equal(t, []string{"could not delete a.pcm", "same"}, got)
+}
+
+func TestTheTrackSpotifyLeavesIsNotTakenForASkip(t *testing.T) {
+	t.Parallel()
+	s := newSim(t, songA, songB, songC)
+	pl := s.playlist("pl0000000000000000000j", "Resumed", true, songA, songB, songC)
+	// As seen live: Spotify sits paused on the playlist's last song when
+	// the session starts, and reports it once more after "play track" for
+	// the first one. That is no sign Spotify jumped past the first song.
+	s.spotify.queue, s.spotify.idx, s.spotify.pos = []string{songA.id, songB.id, songC.id}, 2, 3*time.Second
+	s.spotify.oldTrackOnPlay = 1
+
+	_, res := s.run([]spotify.Collection{pl}, Options{}, nil)
+	requireComplete(t, res)
+	assert.Equal(t, 3, res.Counts.Recorded)
+	assert.Empty(t, s.eventsOf(EventTrackFailed))
 }

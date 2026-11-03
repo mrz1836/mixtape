@@ -1,6 +1,7 @@
 package library
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -10,13 +11,14 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/mrz1836/mixtape/internal/fileutil"
 	"github.com/mrz1836/mixtape/internal/mp4tag"
+	"github.com/mrz1836/mixtape/internal/testutil"
 )
 
 // verifyFixture is a playlist of two recorded songs.
 func verifyFixture(t *testing.T) (*fixture, *Collection) {
 	t.Helper()
-	requireAAC(t)
 	f := newFixture(t, nil)
 	c := f.collection(playlistSpec())
 	c.Sync([]Track{trackTime(), trackMoney()}, true)
@@ -79,17 +81,8 @@ func TestVerifyTagAndAudioProblems(t *testing.T) {
 	timePath := c.Path(c.Entry(idTime))
 	moneyPath := c.Path(c.Entry(idMoney))
 
-	require.NoError(t, mp4tag.Write(timePath, mp4tag.Tags{Freeform: map[string]string{TagSpotifyID: "someoneElse"}}))
-	// Swap Money's audio for other audio with mixtape's tags intact.
-	other := f.wav(880)
-	m4a := filepath.Join(t.TempDir(), "other.m4a")
-	require.NoError(t, AFConvert{}.Encode(t.Context(), other, m4a))
-	tags := f.tags(moneyPath)
-	data, err := os.ReadFile(m4a)
-	require.NoError(t, err)
-	retagged, err := mp4tag.Tag(data, tags)
-	require.NoError(t, err)
-	require.NoError(t, os.WriteFile(moneyPath, retagged, 0o600))
+	retag(t, timePath, mp4tag.Tags{Freeform: map[string]string{TagSpotifyID: "someoneElse"}})
+	swapAudio(t, moneyPath)
 
 	r, err := f.lib.Verify(t.Context(), true, false)
 	require.NoError(t, err)
@@ -123,6 +116,10 @@ func TestVerifyGuardsAgainstUnmountedLibrary(t *testing.T) {
 	r, err = f.lib.Verify(t.Context(), false, false)
 	require.NoError(t, err)
 	assert.Equal(t, []string{ProblemMissing}, kinds(r.Problems))
+	assert.Contains(t, r.Problems[0].Detail, f.root)
+	r, err = f.lib.Verify(t.Context(), true, true)
+	require.NoError(t, err, "--force on a missing folder only reports it")
+	assert.Empty(t, r.Fixed)
 }
 
 func TestVerifyStatusMismatch(t *testing.T) {
@@ -136,27 +133,9 @@ func TestVerifyStatusMismatch(t *testing.T) {
 	assert.Equal(t, StatusRecorded, c.Entry(idTime).Status)
 }
 
-func TestAFConvert(t *testing.T) {
-	t.Parallel()
-	requireAAC(t)
-	f := newFixture(t, nil)
-	out := filepath.Join(t.TempDir(), "out.m4a")
-	require.NoError(t, AFConvert{}.Encode(t.Context(), f.wav(440), out))
-	hash, err := mp4tag.HashFile(out)
-	require.NoError(t, err)
-	assert.Len(t, hash, 64)
-
-	bad := filepath.Join(t.TempDir(), "bad.wav")
-	require.NoError(t, os.WriteFile(bad, []byte("not a wav"), 0o600))
-	err = AFConvert{Bitrate: 128000}.Encode(t.Context(), bad, filepath.Join(t.TempDir(), "x.m4a"))
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "afconvert")
-}
-
 func TestArtwork(t *testing.T) {
 	t.Parallel()
-	requireAAC(t)
-	jpeg := []byte{0xFF, 0xD8, 0xFF, 0xE0, 'c', 'o', 'v', 'e', 'r'}
+	jpeg := testutil.JPEG()
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/cover.jpg":
@@ -189,9 +168,234 @@ func TestArtwork(t *testing.T) {
 		e := f.commit(c, tr, freq, CommitOptions{Artwork: true})
 		assert.Equal(t, tc.cover, f.tags(filepath.Join(c.Dir, e.File)).Cover, name)
 	}
-	assert.Len(t, f.warns, 3, "each failed download is a warning, never an error")
+	assert.Len(t, f.warnings(), 3, "each failed download is a warning, never an error")
 
 	e := f.commit(c, Track{ID: "noArtwork000000000000", Title: "off", Artist: "A", ArtworkURL: srv.URL + "/cover.jpg"},
 		999, CommitOptions{})
 	assert.Nil(t, f.tags(filepath.Join(c.Dir, e.File)).Cover, "artwork is opt-in")
+}
+
+func TestVerifySafetyGateCountsOnlyLostSongs(t *testing.T) {
+	t.Parallel()
+	t.Run("songs found under other names", func(t *testing.T) {
+		t.Parallel()
+		f, c := verifyFixture(t)
+		for _, e := range c.Manifest.Tracks {
+			require.NoError(t, os.Rename(c.Path(&e), filepath.Join(c.Dir, "renamed-"+e.File)))
+		}
+		r, err := f.lib.Verify(t.Context(), true, false)
+		require.NoError(t, err, "a drive whose songs were all found is mounted")
+		assert.Equal(t, []string{ProblemMoved, ProblemMoved}, kinds(r.Fixed))
+		assert.Equal(t, "renamed-Pink-Floyd-Time.m4a", c.Entry(idTime).File)
+		assert.True(t, c.Done(idTime))
+	})
+	t.Run("half the songs missing", func(t *testing.T) {
+		t.Parallel()
+		f, c := verifyFixture(t)
+		require.NoError(t, os.Remove(c.Path(c.Entry(idTime))))
+		r, err := f.lib.Verify(t.Context(), true, false)
+		require.NoError(t, err, "only more than half looks unmounted")
+		assert.Equal(t, []string{ProblemMissing}, kinds(r.Fixed))
+		e := c.Entry(idTime)
+		assert.Equal(t, StatusPending, e.Status)
+		assert.Empty(t, e.File)
+		assert.Empty(t, e.AudioSHA256)
+		assert.Equal(t, "file missing (verify)", e.FailReason)
+		assert.True(t, c.Done(idMoney))
+	})
+}
+
+func TestVerifyReportsSongsMovedOutOfTheirFolder(t *testing.T) {
+	t.Parallel()
+	f, c := verifyFixture(t)
+	singles := f.collection(Spec{Kind: KindSingles})
+	require.NoError(t, os.Rename(c.Path(c.Entry(idTime)), filepath.Join(singles.Dir, "Time.m4a")))
+	require.NoError(t, os.Rename(c.Path(c.Entry(idMoney)), filepath.Join(f.root, "Money.m4a")))
+
+	r, err := f.lib.Verify(t.Context(), true, false)
+	require.NoError(t, err)
+	assert.Equal(t, 2, r.Collections)
+	require.Equal(t, []string{ProblemMoved, ProblemMoved}, kinds(r.Problems), "found by hash, so not orphans")
+	assert.Equal(t, "found at Money.m4a (outside its folder; move it back to fix)", r.Problems[0].Detail)
+	assert.Equal(t, "found at "+filepath.Join("Singles", "Time.m4a")+" (outside its folder; move it back to fix)",
+		r.Problems[1].Detail)
+	assert.Empty(t, r.Fixed, "moving a file back is left to the owner")
+	assert.Equal(t, "Pink-Floyd-Time.m4a", c.Entry(idTime).File)
+	assert.Equal(t, StatusRecorded, c.Entry(idTime).Status)
+}
+
+// TestVerifyPicksTheSameMovedFileEveryRun: when several unreferenced files
+// hold a missing song's audio, the song moved to the first of them by
+// path, on every run, and the others are orphans.
+func TestVerifyPicksTheSameMovedFileEveryRun(t *testing.T) {
+	t.Parallel()
+	f, c := verifyFixture(t)
+	timePath := c.Path(c.Entry(idTime))
+	data, err := os.ReadFile(timePath)
+	require.NoError(t, err)
+	for _, name := range []string{"c-copy.m4a", "a-copy.m4a", "b-copy.m4a"} {
+		require.NoError(t, os.WriteFile(filepath.Join(c.Dir, name), data, 0o600))
+	}
+	require.NoError(t, os.Remove(timePath))
+
+	orphan := func(name string) Problem {
+		return Problem{Collection: c.Folder(), File: name, Kind: ProblemOrphan, Detail: "no manifest entry mentions this file"}
+	}
+	want := []Problem{
+		{
+			Collection: c.Folder(), File: "Pink-Floyd-Time.m4a", TrackID: idTime, Kind: ProblemMoved,
+			Detail: "found at " + filepath.Join(c.Folder(), "a-copy.m4a"),
+		},
+		orphan("b-copy.m4a"),
+		orphan("c-copy.m4a"),
+	}
+	for range 20 {
+		r, verifyErr := f.lib.Verify(t.Context(), false, false)
+		require.NoError(t, verifyErr)
+		require.Equal(t, want, r.Problems)
+	}
+
+	r, err := f.lib.Verify(t.Context(), true, false)
+	require.NoError(t, err)
+	assert.Equal(t, want[:1], r.Fixed)
+	assert.Equal(t, "a-copy.m4a", c.Entry(idTime).File)
+}
+
+func TestVerifyUnreadableSongIsRecordedAgain(t *testing.T) {
+	t.Parallel()
+	f, c := verifyFixture(t)
+	require.NoError(t, os.WriteFile(c.Path(c.Entry(idTime)), []byte("not an mp4"), 0o600))
+
+	r, err := f.lib.Verify(t.Context(), true, false)
+	require.NoError(t, err)
+	assert.Equal(t, []string{ProblemUnreadable}, kinds(r.Fixed))
+	assert.Equal(t, 1, r.OK)
+	assert.Equal(t, StatusPending, c.Entry(idTime).Status)
+	assert.Equal(t, "unreadable file (verify)", c.Entry(idTime).FailReason)
+}
+
+// TestSongsVerifySendsBackStayPending: the file of a song verify --fix
+// sends back for changed or truncated audio still names its entry, but
+// must not be taken back, by the next Open or by a second --fix.
+func TestSongsVerifySendsBackStayPending(t *testing.T) {
+	t.Parallel()
+	f, c := verifyFixture(t)
+	swapAudio(t, c.Path(c.Entry(idMoney)))
+	truncate(t, c.Path(c.Entry(idTime)))
+	r, err := f.lib.Verify(t.Context(), true, false)
+	require.NoError(t, err)
+	assert.ElementsMatch(t, []string{ProblemHashMismatch, ProblemUnreadable}, kinds(r.Fixed))
+
+	lib, c2 := f.reopen(playlistSpec())
+	assert.Equal(t, StatusPending, c2.Entry(idMoney).Status)
+	assert.Equal(t, StatusPending, c2.Entry(idTime).Status)
+	r, err = lib.Verify(t.Context(), true, false)
+	require.NoError(t, err)
+	assert.Empty(t, r.Problems)
+	assert.Empty(t, r.Fixed)
+	assert.Equal(t, StatusPending, c2.Entry(idMoney).Status)
+
+	// Recording it again settles it, in place.
+	again, err := lib.Commit(t.Context(), c2, trackMoney(), testutil.SineWAV(t, 660), CommitOptions{})
+	require.NoError(t, err)
+	assert.Equal(t, "Pink-Floyd-Money.m4a", again.File)
+	r, err = lib.Verify(t.Context(), false, false)
+	require.NoError(t, err)
+	assert.Equal(t, 1, r.OK)
+}
+
+// TestVerifyRefreshesAStaleManifestHash: a redo replaced the file but its
+// manifest write was lost, so the manifest still holds the old take's hash.
+func TestVerifyRefreshesAStaleManifestHash(t *testing.T) {
+	t.Parallel()
+	f, c := verifyFixture(t)
+	oldManifest, err := os.ReadFile(filepath.Join(c.Dir, ManifestName))
+	require.NoError(t, err)
+	redo := f.commit(c, trackTime(), 660, CommitOptions{})
+	require.NoError(t, os.WriteFile(filepath.Join(c.Dir, ManifestName), oldManifest, 0o600))
+
+	lib, c2 := f.reopen(playlistSpec())
+	require.NotEqual(t, redo.AudioSHA256, c2.Entry(idTime).AudioSHA256)
+	r, err := lib.Verify(t.Context(), true, false)
+	require.NoError(t, err)
+	require.Len(t, r.Fixed, 1)
+	assert.Equal(t, ProblemHashMismatch, r.Fixed[0].Kind)
+	assert.Equal(t, "manifest hash is stale", r.Fixed[0].Detail)
+	assert.Equal(t, redo.AudioSHA256, c2.Entry(idTime).AudioSHA256)
+	assert.Equal(t, StatusRecorded, c2.Entry(idTime).Status)
+}
+
+func TestVerifyScansOnlyCollectionAudio(t *testing.T) {
+	t.Parallel()
+	f, c := verifyFixture(t)
+	// Time's file went to the trash: hidden folders are never searched.
+	trash := filepath.Join(f.root, ".Trashes")
+	require.NoError(t, os.Mkdir(trash, 0o750))
+	require.NoError(t, os.Rename(c.Path(c.Entry(idTime)), filepath.Join(trash, "Time.m4a")))
+	writeSong(t, c.Dir, "EXTRA.M4A", "an orphan, whatever its case", nil)
+	writeSong(t, c.Dir, fileutil.TempPrefix+"1.m4a", "a crashed write", nil)
+	writeSong(t, f.root, "loose.m4a", "outside every collection", nil)
+	other := filepath.Join(f.root, "Not a collection")
+	require.NoError(t, os.Mkdir(other, 0o750))
+	writeSong(t, other, "song.m4a", "in a folder without a manifest", nil)
+	require.NoError(t, os.WriteFile(filepath.Join(c.Dir, "cover.jpg"), testutil.JPEG(), 0o600))
+
+	r, err := f.lib.Verify(t.Context(), false, false)
+	require.NoError(t, err)
+	require.Equal(t, []string{ProblemOrphan, ProblemMissing}, kinds(r.Problems))
+	assert.Equal(t, "EXTRA.M4A", r.Problems[0].File)
+	assert.Equal(t, "Pink-Floyd-Time.m4a", r.Problems[1].File)
+}
+
+func TestVerifyChecksOnlyDoneSongs(t *testing.T) {
+	t.Parallel()
+	f, c := verifyFixture(t)
+	rick := Track{ID: idRick, Title: "Never Gonna Give You Up", Artist: "Rick Astley"}
+	c.Sync([]Track{trackTime(), rick}, true) // Money left the playlist; its file stays
+
+	r, err := f.lib.Verify(t.Context(), true, false)
+	require.NoError(t, err)
+	assert.Equal(t, 1, r.Files)
+	assert.Equal(t, 1, r.OK)
+	assert.Empty(t, r.Problems, "a removed song's file is neither checked nor an orphan")
+	assert.Equal(t, StatusRemoved, c.Entry(idMoney).Status)
+	assert.Equal(t, StatusPending, c.Entry(idRick).Status)
+}
+
+func TestVerifyStopsWhenCanceled(t *testing.T) {
+	t.Parallel()
+	f, _ := verifyFixture(t)
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	_, err := f.lib.Verify(ctx, false, false)
+	require.ErrorIs(t, err, context.Canceled)
+}
+
+func TestVerifySkipsAFolderItCannotRead(t *testing.T) {
+	t.Parallel()
+	if os.Geteuid() == 0 {
+		t.Skip("root reads any folder")
+	}
+	f, c := verifyFixture(t)
+	require.NoError(t, os.Chmod(c.Dir, 0o000))
+	t.Cleanup(func() { _ = os.Chmod(c.Dir, 0o700) })
+
+	r, err := f.lib.Verify(t.Context(), false, false)
+	require.NoError(t, err)
+	assert.Equal(t, []string{ProblemMissing, ProblemMissing}, kinds(r.Problems))
+	_, err = f.lib.Verify(t.Context(), true, false)
+	require.ErrorIs(t, err, ErrUnsafeFix, "the safety gate keeps --fix from resetting them")
+}
+
+func TestVerifyFixReportsAManifestItCannotSave(t *testing.T) {
+	t.Parallel()
+	if os.Geteuid() == 0 {
+		t.Skip("root writes into read-only folders")
+	}
+	f, c := verifyFixture(t)
+	require.NoError(t, os.Chmod(c.Dir, 0o500))
+	t.Cleanup(func() { _ = os.Chmod(c.Dir, 0o700) })
+
+	_, err := f.lib.Verify(t.Context(), true, false)
+	require.ErrorContains(t, err, "save manifest")
 }

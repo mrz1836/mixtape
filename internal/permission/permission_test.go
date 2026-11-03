@@ -57,3 +57,14 @@ func TestChecksAnswer(t *testing.T) {
 	}
 	t.Logf("host app: %+v", App())
 }
+
+func TestAKindWithoutItsOwnListPointsAtPrivacy(t *testing.T) {
+	t.Parallel()
+	// ScreenRecording is only ever checked, never asked for: its fix
+	// points at the Privacy & Security pane as a whole.
+	assert.Equal(t, settingsBase+"Privacy", SettingsURL(ScreenRecording))
+	assert.Equal(t, "System Settings → Privacy & Security", Where(ScreenRecording))
+	assert.Equal(t, "allow iTerm under System Settings → Privacy & Security",
+		Instructions(ScreenRecording, HostApp{Name: "iTerm"}))
+	assert.Equal(t, "the app that runs mixtape", HostApp{}.String())
+}

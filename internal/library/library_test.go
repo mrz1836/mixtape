@@ -2,7 +2,7 @@ package library
 
 import (
 	"context"
-	"encoding/json"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,6 +12,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/mrz1836/mixtape/internal/mp4tag"
+	"github.com/mrz1836/mixtape/internal/testutil"
 )
 
 func TestOpenCreatesRoot(t *testing.T) {
@@ -171,12 +172,11 @@ func TestSyncMatchesRelinkedIDs(t *testing.T) {
 
 func TestCommitPlaylist(t *testing.T) {
 	t.Parallel()
-	requireAAC(t)
 	f := newFixture(t, nil)
 	c := f.collection(playlistSpec())
 	c.Sync([]Track{trackTime()}, true)
 
-	wavPath := f.wav(440)
+	wavPath := testutil.SineWAV(t, 440)
 	e, err := f.lib.Commit(t.Context(), c, trackTime(), wavPath, CommitOptions{RecordedMS: 413100})
 	require.NoError(t, err)
 	assert.NoFileExists(t, wavPath, "the WAV is removed")
@@ -216,24 +216,14 @@ func TestCommitPlaylist(t *testing.T) {
 	assert.Empty(t, f.lib.Find(""))
 	assert.Empty(t, f.lib.FindHash(""))
 
-	keep := f.wav(330)
+	keep := testutil.SineWAV(t, 330)
 	_, err = f.lib.Commit(t.Context(), c, trackMoney(), keep, CommitOptions{KeepWAV: true})
 	require.NoError(t, err)
 	assert.FileExists(t, keep, "--keep-wav keeps it")
 }
 
-func readManifest(t *testing.T, dir string) Manifest {
-	t.Helper()
-	data, err := os.ReadFile(filepath.Join(dir, ManifestName))
-	require.NoError(t, err)
-	var m Manifest
-	require.NoError(t, json.Unmarshal(data, &m))
-	return m
-}
-
 func TestCommitAlbumNumbers(t *testing.T) {
 	t.Parallel()
-	requireAAC(t)
 	f := newFixture(t, nil)
 	c := f.collection(albumSpec())
 	assert.Equal(t, "Pink-Floyd-The-Dark-Side-of-the-Moon", c.Folder())
@@ -248,7 +238,6 @@ func TestCommitAlbumNumbers(t *testing.T) {
 
 func TestCommitRelinked(t *testing.T) {
 	t.Parallel()
-	requireAAC(t)
 	f := newFixture(t, nil)
 	c := f.collection(playlistSpec())
 	tr := trackTime()
@@ -266,7 +255,6 @@ func TestCommitRelinked(t *testing.T) {
 
 func TestCommitNameCollisionAndRedo(t *testing.T) {
 	t.Parallel()
-	requireAAC(t)
 	f := newFixture(t, nil)
 	c := f.collection(Spec{Kind: KindSingles})
 
@@ -285,7 +273,6 @@ func TestCommitNameCollisionAndRedo(t *testing.T) {
 
 func TestCommitLooksUpTheReleaseDate(t *testing.T) {
 	t.Parallel()
-	requireAAC(t)
 	f := newFixture(t, nil)
 	asked := []string{}
 	f.lib.opts.ReleaseDate = func(_ context.Context, id string) (string, error) {
@@ -307,12 +294,11 @@ func TestCommitLooksUpTheReleaseDate(t *testing.T) {
 
 func TestPartialNeverReplacesACompleteRecording(t *testing.T) {
 	t.Parallel()
-	requireAAC(t)
 	f := newFixture(t, nil)
 	c := f.collection(Spec{Kind: KindSingles})
 	good := f.commit(c, trackTime(), 440, CommitOptions{})
 
-	wav := f.wav(550)
+	wav := testutil.SineWAV(t, 550)
 	got, err := f.lib.Commit(t.Context(), c, trackTime(), wav, CommitOptions{Partial: true})
 	require.ErrorIs(t, err, ErrKeptComplete)
 	assert.Equal(t, good.AudioSHA256, got.AudioSHA256, "the complete entry is reported back unchanged")
@@ -329,14 +315,13 @@ func TestCommitIntoAnUnwritableFolderIsAStoreError(t *testing.T) {
 	if os.Geteuid() == 0 {
 		t.Skip("root writes into read-only folders")
 	}
-	requireAAC(t)
 	f := newFixture(t, nil)
 	c := f.collection(Spec{Kind: KindSingles})
 	require.NoError(t, f.lib.Save(c))
 	require.NoError(t, os.Chmod(c.Dir, 0o500))
 	t.Cleanup(func() { _ = os.Chmod(c.Dir, 0o700) })
 
-	wav := f.wav(440)
+	wav := testutil.SineWAV(t, 440)
 	_, err := f.lib.Commit(t.Context(), c, trackTime(), wav, CommitOptions{})
 	require.ErrorIs(t, err, ErrStore)
 	assert.NoFileExists(t, wav, "the WAV is not leaked")
@@ -344,7 +329,6 @@ func TestCommitIntoAnUnwritableFolderIsAStoreError(t *testing.T) {
 
 func TestPartialIsNotDone(t *testing.T) {
 	t.Parallel()
-	requireAAC(t)
 	f := newFixture(t, nil)
 	c := f.collection(playlistSpec())
 
@@ -365,11 +349,12 @@ func TestPartialIsNotDone(t *testing.T) {
 
 func TestEncodeFailureKeepsWAVAndRetries(t *testing.T) {
 	t.Parallel()
-	requireAAC(t)
-	f := newFixture(t, failEncoder{})
+	enc := &testutil.Encoder{}
+	enc.Fail(errFakeEncode)
+	f := newFixture(t, enc)
 	c := f.collection(playlistSpec())
 
-	wavPath := f.wav(440)
+	wavPath := testutil.SineWAV(t, 440)
 	e, err := f.lib.Commit(t.Context(), c, trackTime(), wavPath, CommitOptions{})
 	require.ErrorIs(t, err, ErrEncode)
 	require.ErrorIs(t, err, errFakeEncode)
@@ -380,21 +365,46 @@ func TestEncodeFailureKeepsWAVAndRetries(t *testing.T) {
 	assert.Contains(t, e.FailReason, "fake encoder failure")
 	assert.Equal(t, StatusEncodeFailed, readManifest(t, c.Dir).Tracks[0].Status)
 
-	// The next run (a fresh Open) finishes the job without recording.
-	lib := f.open(nil)
-	c2, ok := lib.Lookup(playlistSpec())
-	require.True(t, ok)
+	// The next run (a fresh Open) tries again; failing again keeps the WAV
+	// where it already is.
+	lib, c2 := f.reopen(playlistSpec())
+	again, err := lib.RetryEncode(t.Context(), c2, idTime, CommitOptions{})
+	require.ErrorIs(t, err, ErrEncode)
+	assert.Equal(t, e.PendingWAV, again.PendingWAV)
+	assert.FileExists(t, again.PendingWAV)
+
+	// Once encoding works, the job finishes without recording.
+	enc.Fail(nil)
 	done, err := lib.RetryEncode(t.Context(), c2, idTime, CommitOptions{})
 	require.NoError(t, err)
 	assert.Equal(t, StatusRecorded, done.Status)
 	assert.Empty(t, done.PendingWAV)
+	assert.Empty(t, done.FailReason)
 	assert.NoFileExists(t, e.PendingWAV)
 	assert.True(t, c2.Done(idTime))
+	assert.Equal(t, 3, enc.Runs(), "one encode per attempt")
 
 	_, err = lib.RetryEncode(t.Context(), c2, idTime, CommitOptions{})
 	require.ErrorIs(t, err, errNoPendingWAV)
 	_, err = lib.RetryEncode(t.Context(), c2, idRick, CommitOptions{})
 	require.ErrorIs(t, err, errNoEntry)
+}
+
+func TestRetryEncodeNeedsTheKeptWAV(t *testing.T) {
+	t.Parallel()
+	enc := &testutil.Encoder{}
+	enc.Fail(errFakeEncode)
+	f := newFixture(t, enc)
+	c := f.collection(playlistSpec())
+	e, err := f.lib.Commit(t.Context(), c, trackTime(), testutil.SineWAV(t, 440), CommitOptions{})
+	require.ErrorIs(t, err, ErrEncode)
+
+	require.NoError(t, os.Remove(e.PendingWAV)) // cleaned up by hand, or a wiped temp folder
+	enc.Fail(nil)
+	_, err = f.lib.RetryEncode(t.Context(), c, idTime, CommitOptions{})
+	require.ErrorIs(t, err, errNoPendingWAV)
+	require.ErrorIs(t, err, fs.ErrNotExist)
+	assert.Equal(t, 1, enc.Runs(), "nothing is encoded without the WAV")
 }
 
 func TestCommitRejectsTrackWithoutID(t *testing.T) {
@@ -409,7 +419,6 @@ func TestCommitRejectsTrackWithoutID(t *testing.T) {
 
 func TestCopyRetagsAndKeepsHash(t *testing.T) {
 	t.Parallel()
-	requireAAC(t)
 	f := newFixture(t, nil)
 	singles := f.collection(Spec{Kind: KindSingles})
 	src := f.commit(singles, trackTime(), 440, CommitOptions{RecordedMS: 413000})
@@ -463,56 +472,81 @@ func TestLock(t *testing.T) {
 	unlock, err := f.lib.Lock()
 	require.NoError(t, err)
 	assert.NoFileExists(t, stale, "taking the lock removes temp files of a crashed write")
-	assert.NotEmpty(t, f.warns)
+	assert.NotEmpty(t, f.warnings())
 
-	_, err = f.open(nil).Lock()
+	_, err = f.open().Lock()
 	require.ErrorIs(t, err, ErrLocked)
 
 	unlock()
-	unlock2, err := f.open(nil).Lock()
+	unlock2, err := f.open().Lock()
 	require.NoError(t, err)
 	unlock2()
 }
 
-func TestReconcileAfterCrash(t *testing.T) {
+// TestLockKeepsTheWAVWhenTheRepairCannotBeSaved: a kept WAV is removed
+// only once the manifest that points at it is rewritten.
+func TestLockKeepsTheWAVWhenTheRepairCannotBeSaved(t *testing.T) {
 	t.Parallel()
-	requireAAC(t)
+	if os.Geteuid() == 0 {
+		t.Skip("root writes into read-only folders")
+	}
 	f := newFixture(t, nil)
 	c := f.collection(playlistSpec())
-	c.Sync([]Track{trackTime(), trackMoney()}, true)
-	timeEntry := f.commit(c, trackTime(), 440, CommitOptions{})
-	moneyEntry := f.commit(c, trackMoney(), 550, CommitOptions{})
+	c.Sync([]Track{trackTime()}, true)
+	f.commit(c, trackTime(), 440, CommitOptions{})
+	kept := testutil.WriteFile(t, "kept.wav", []byte("RIFF"))
+	crash(t, c.Dir, func(m *Manifest) {
+		forget(&m.Tracks[0])
+		m.Tracks[0].Status, m.Tracks[0].PendingWAV = StatusEncodeFailed, kept
+	})
+	lib, _ := f.reopen(playlistSpec())
+	require.NoError(t, os.Chmod(c.Dir, 0o500))
+	t.Cleanup(func() { _ = os.Chmod(c.Dir, 0o700) })
 
-	// Simulate crashes after the file landed but before the manifest did:
-	// one file under its expected name, one renamed by hand.
-	require.NoError(t, os.Rename(filepath.Join(c.Dir, moneyEntry.File), filepath.Join(c.Dir, "renamed.m4a")))
-	m := readManifest(t, c.Dir)
-	for i := range m.Tracks {
-		m.Tracks[i].Status, m.Tracks[i].File, m.Tracks[i].AudioSHA256 = StatusPending, "", ""
-	}
-	// Time had been kept as a WAV for a re-encode before it was stored.
-	kept := filepath.Join(f.work, "failed", "kept.wav")
-	require.NoError(t, os.MkdirAll(filepath.Dir(kept), 0o750))
-	require.NoError(t, os.WriteFile(kept, []byte("RIFF"), 0o600))
-	m.Tracks[0].Status, m.Tracks[0].PendingWAV = StatusEncodeFailed, kept
-	data, err := json.Marshal(m)
-	require.NoError(t, err)
-	require.NoError(t, os.WriteFile(filepath.Join(c.Dir, ManifestName), data, 0o600))
+	_, err := lib.Lock()
+	require.ErrorContains(t, err, "save manifest")
+	assert.FileExists(t, kept, "the manifest on disk still needs it")
 
-	lib := f.open(nil)
-	c2, ok := lib.Lookup(playlistSpec())
-	require.True(t, ok)
-	assert.True(t, c2.Done(idTime))
-	assert.Equal(t, timeEntry.AudioSHA256, c2.Entry(idTime).AudioSHA256)
-	assert.Equal(t, "renamed.m4a", c2.Entry(idMoney).File)
-	assert.Equal(t, StatusEncodeFailed, readManifest(t, c.Dir).Tracks[0].Status, "Open itself never writes")
-	assert.FileExists(t, kept, "a read-only Open deletes nothing")
-
+	require.NoError(t, os.Chmod(c.Dir, 0o700))
 	unlock, err := lib.Lock()
-	require.NoError(t, err)
-	defer unlock()
-	assert.Equal(t, StatusRecorded, readManifest(t, c.Dir).Tracks[0].Status, "Lock persists the repair")
-	assert.NoFileExists(t, kept, "the writer removes the WAV the repair made unnecessary")
+	require.NoError(t, err, "the failed Lock released the lock")
+	unlock()
+	assert.Equal(t, StatusRecorded, readManifest(t, c.Dir).Tracks[0].Status)
+	assert.NoFileExists(t, kept)
+}
+
+func TestStatusDoneAndFailed(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		status       Status
+		done, failed bool
+	}{
+		{StatusPending, false, false},
+		{StatusRecorded, true, false},
+		{StatusCopied, true, false},
+		{StatusUnavailable, false, true},
+		{StatusFailed, false, true},
+		{StatusEncodeFailed, false, true},
+		{StatusRemoved, false, false},
+		{"from_a_newer_mixtape", false, false},
+	}
+	for _, tc := range cases {
+		assert.Equal(t, tc.done, tc.status.Done(), "%s: done", tc.status)
+		assert.Equal(t, tc.failed, tc.status.Failed(), "%s: failed", tc.status)
+	}
+}
+
+func TestLocationRelPath(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t, nil)
+	c := f.collection(albumSpec())
+	c.Sync([]Track{trackMoney(), trackTime()}, true)
+	f.commit(c, trackTime(), 440, CommitOptions{})
+
+	locs := f.lib.Find(idTime)
+	require.Len(t, locs, 1)
+	assert.Equal(t, "Pink-Floyd-The-Dark-Side-of-the-Moon/02-Pink-Floyd-Time.m4a", locs[0].RelPath())
+	assert.Equal(t, f.lib.rel(locs[0].Path), locs[0].RelPath(), "the path under the root, as a copy records its source")
 }
 
 func TestUnreadableManifestIsSkipped(t *testing.T) {
@@ -526,9 +560,9 @@ func TestUnreadableManifestIsSkipped(t *testing.T) {
 	require.NoError(t, os.Mkdir(future, 0o750))
 	require.NoError(t, os.WriteFile(filepath.Join(future, ManifestName), []byte(`{"schema":99}`), 0o600))
 
-	lib := f.open(nil)
+	lib := f.open()
 	require.Len(t, lib.Collections(), 1)
-	joined := strings.Join(f.warns, "\n")
+	joined := strings.Join(f.warnings(), "\n")
 	assert.Contains(t, joined, "skipping Broken")
 	assert.Contains(t, joined, "schema 99")
 }

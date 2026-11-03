@@ -3,13 +3,14 @@ package engine
 import (
 	"cmp"
 	"context"
-	"crypto/sha256"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -21,6 +22,7 @@ import (
 	"github.com/mrz1836/mixtape/internal/library"
 	"github.com/mrz1836/mixtape/internal/session"
 	"github.com/mrz1836/mixtape/internal/spotify"
+	"github.com/mrz1836/mixtape/internal/testutil"
 	"github.com/mrz1836/mixtape/internal/wav"
 )
 
@@ -79,6 +81,23 @@ type fakeSpotify struct {
 	hold     time.Duration // position frozen at 0 while it re-buffers
 	// ignorePlay makes "play track" do nothing (signed out, offline).
 	ignorePlay bool
+	// oldTrackOnPlay replays Spotify reporting the track it is leaving, as
+	// it was, for this many observations after "play track" (seen live:
+	// paused on a later album track when the session started).
+	oldTrackOnPlay int
+	oldTrack       spotify.Snapshot
+	oldTrackLeft   int
+	// cutEarly lists tracks Spotify moves on from this long before their
+	// end without reporting a shorter duration first: a blend the duration
+	// check cannot see.
+	cutEarly map[string]time.Duration
+	// adBreak is an ad Spotify plays before the next requested track.
+	adBreak string
+	// refuse makes the next command of each name ("play", "pause") fail.
+	refuse map[string]error
+	// hungUp: the observation stream ended, as when the osascript watcher
+	// dies; the driver delivers nothing more.
+	hungUp bool
 	// failNext makes the next observations fail with failErr.
 	failNext int
 	failErr  error
@@ -101,10 +120,16 @@ type resumeSpot struct {
 	moving bool
 }
 
+// longSong is a song long enough for setbacks to be measured.
+func longSong(id string, dur time.Duration) simTrack {
+	return simTrack{id: id, name: "Song " + id[len(id)-3:], artist: "X", dur: dur}
+}
+
 func newFakeSpotify(now func() time.Time, tracks ...simTrack) *fakeSpotify {
 	f := &fakeSpotify{
 		tracks: map[string]simTrack{}, contexts: map[string][]string{},
 		unplayable: map[string]bool{}, relink: map[string]string{}, volume: 50, now: now,
+		cutEarly: map[string]time.Duration{}, refuse: map[string]error{},
 	}
 	for _, t := range tracks {
 		f.tracks[t.id] = t
@@ -137,7 +162,7 @@ func (f *fakeSpotify) advance(d time.Duration) {
 		f.glitched, f.pos, f.hold = true, 0, 400*time.Millisecond
 		return
 	}
-	if f.pos < t.dur-f.crossfade {
+	if f.pos < t.dur-f.crossfade-f.cutEarly[t.id] {
 		return
 	}
 	f.pos = 0
@@ -168,6 +193,12 @@ func (f *fakeSpotify) snapshot() spotify.Snapshot {
 	if f.failNext > 0 {
 		f.failNext--
 		return spotify.Snapshot{At: f.now(), Err: f.failErr}
+	}
+	if f.oldTrackLeft > 0 {
+		f.oldTrackLeft--
+		old := f.oldTrack
+		old.At = f.now()
+		return old
 	}
 	s := spotify.Snapshot{At: f.now(), State: spotify.StatePaused, Volume: f.volume, Shuffle: f.shuffle, Repeat: f.repeat}
 	if f.playing {
@@ -236,6 +267,17 @@ func (f *fakeSpotify) Commands() []string {
 	return append([]string(nil), f.commands...)
 }
 
+// plays counts the "play track" commands from the from'th command on.
+func (f *fakeSpotify) plays(from int) int {
+	n := 0
+	for _, c := range f.Commands()[from:] {
+		if strings.HasPrefix(c, "play ") {
+			n++
+		}
+	}
+	return n
+}
+
 func (f *fakeSpotify) Poll(context.Context) spotify.Snapshot { return f.snapshot() }
 
 func (f *fakeSpotify) Watch(ctx context.Context, _ time.Duration) <-chan spotify.Snapshot {
@@ -249,6 +291,15 @@ func (f *fakeSpotify) PlayTrack(_ context.Context, uri, ctxURI string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.log("play " + uri + " in " + ctxURI)
+	if err := f.refused("play"); err != nil {
+		return err
+	}
+	if f.oldTrackOnPlay > 0 {
+		f.mu.Unlock()
+		f.oldTrack = f.snapshot()
+		f.mu.Lock()
+		f.oldTrackLeft = f.oldTrackOnPlay
+	}
 	if f.ignorePlay {
 		return nil
 	}
@@ -283,6 +334,10 @@ func (f *fakeSpotify) PlayTrack(_ context.Context, uri, ctxURI string) error {
 		if to, ok := f.relink[f.queue[f.idx]]; ok {
 			f.queue[f.idx] = to
 		}
+		if f.adBreak != "" {
+			f.queue = slices.Insert(f.queue, f.idx, f.adBreak)
+			f.adBreak = ""
+		}
 	}
 	f.pos, f.playing = 0, f.idx < len(f.queue)
 	f.glitched = false
@@ -292,20 +347,33 @@ func (f *fakeSpotify) PlayTrack(_ context.Context, uri, ctxURI string) error {
 	return nil
 }
 
-func (f *fakeSpotify) Play(context.Context) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.log("play")
-	f.playing = true
-	return nil
-}
-
 func (f *fakeSpotify) Pause(context.Context) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.log("pause")
+	if err := f.refused("pause"); err != nil {
+		return err
+	}
 	f.playing = false
 	return nil
+}
+
+// refused returns, once, the failure set for the command name.
+func (f *fakeSpotify) refused(name string) error {
+	err := f.refuse[name]
+	delete(f.refuse, name)
+	return err
+}
+
+// hangUp ends the observation stream, as the osascript watcher dying
+// would.
+func (f *fakeSpotify) hangUp() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.watch != nil && !f.hungUp {
+		close(f.watch)
+	}
+	f.hungUp = true
 }
 
 func (f *fakeSpotify) PlayPause(context.Context) error {
@@ -372,19 +440,27 @@ func (f *fakeSpotify) user(fn func(f *fakeSpotify)) {
 	fn(f)
 }
 
-// fakeSource is a capture source the driver feeds.
+// fakeSource is a capture source the test feeds: the simulator's driver,
+// or a golden trace's audio slices.
 type fakeSource struct {
 	mu     sync.Mutex
 	sink   func(capture.Block)
 	events chan capture.Event
 	silent bool
 	rate   int // capture rate; 0 is testRate
+	// method is the backend it poses as ("" is a capture device).
+	method capture.Method
+	// startErr makes Start fail.
+	startErr error
 }
+
+// loudLevel is the sample level of the audio a playing song delivers.
+const loudLevel = 3000
 
 func newFakeSource() *fakeSource { return &fakeSource{events: make(chan capture.Event, 4)} }
 
 func (s *fakeSource) Name() string           { return "fake" }
-func (s *fakeSource) Method() capture.Method { return capture.MethodDevice }
+func (s *fakeSource) Method() capture.Method { return cmp.Or(s.method, capture.MethodDevice) }
 func (s *fakeSource) Format() capture.Format {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -396,60 +472,77 @@ func (s *fakeSource) Close() error                 { return nil }
 func (s *fakeSource) Start(_ context.Context, sink func(capture.Block)) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.startErr != nil {
+		return s.startErr
+	}
 	s.sink = sink
 	return nil
 }
 
-// emit delivers frames captured at t; loud frames carry a constant level.
+// emit delivers frames captured at t; loud frames carry loudLevel.
 func (s *fakeSource) emit(frames int, t time.Time, loud bool) {
+	level := 0
+	if loud {
+		level = loudLevel
+	}
+	s.emitLevel(frames, level, t)
+}
+
+// emitLevel delivers frames captured at t whose every sample is level
+// (silence while the source is silent). Before Start it does nothing.
+func (s *fakeSource) emitLevel(frames, level int, t time.Time) {
 	s.mu.Lock()
 	sink, silent := s.sink, s.silent
 	s.mu.Unlock()
 	if sink == nil {
 		return
 	}
-	pcm := make([]byte, frames*4)
-	if loud && !silent {
-		for i := 0; i < len(pcm); i += 2 {
-			binary.LittleEndian.PutUint16(pcm[i:], 3000)
+	pcm := make([]byte, frames*s.Format().BytesPerFrame())
+	if level > 0 && !silent {
+		v := uint16(min(level, math.MaxInt16))
+		for i := 0; i+1 < len(pcm); i += 2 {
+			binary.LittleEndian.PutUint16(pcm[i:], v)
 		}
 	}
 	sink(capture.Block{PCM: pcm, Frames: frames, At: t})
 }
 
-// fakeEncoder writes a minimal valid M4A whose audio payload is derived
-// from the WAV, and records how many frames each WAV held.
-type fakeEncoder struct {
-	mu     sync.Mutex
-	frames map[string]int64 // output base name → frames
-	fail   bool
+// started reports whether the engine started the capture.
+func (s *fakeSource) started() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.sink != nil
 }
 
-func (e *fakeEncoder) Encode(_ context.Context, wavPath, m4aPath string) error {
-	data, err := os.ReadFile(wavPath)
+// stereoBytesPerFrame is the frame size of every WAV the tests render.
+const stereoBytesPerFrame = 4
+
+// fakeEncoder stands in for afconvert (see testutil.Encoder) and records
+// how many frames each WAV held.
+type fakeEncoder struct {
+	testutil.Encoder
+
+	mu     sync.Mutex
+	frames map[string]int64 // output base name → frames
+}
+
+func newFakeEncoder() *fakeEncoder { return &fakeEncoder{frames: map[string]int64{}} }
+
+func (e *fakeEncoder) Encode(ctx context.Context, wavPath, m4aPath string) error {
+	info, err := os.Stat(wavPath)
 	if err != nil {
 		return err
 	}
-	e.mu.Lock()
-	fail := e.fail
-	e.mu.Unlock()
-	if fail {
-		return errTestEncode
-	}
-	sum := sha256.Sum256(data)
-	out := mp4Box("ftyp", []byte("M4A \x00\x00\x02\x00M4A mp42isom"))
-	out = append(out, mp4Box("moov", mp4Box("mvhd", make([]byte, 100)))...)
-	out = append(out, mp4Box("mdat", sum[:])...)
-	if err := os.WriteFile(m4aPath, out, 0o600); err != nil {
+	if err := e.Encoder.Encode(ctx, wavPath, m4aPath); err != nil {
 		return err
 	}
 	e.mu.Lock()
-	e.frames[filepath.Base(m4aPath)] = int64(len(data)-wav.HeaderSize) / 4
-	e.mu.Unlock()
+	defer e.mu.Unlock()
+	e.frames[filepath.Base(m4aPath)] = (info.Size() - wav.HeaderSize) / stereoBytesPerFrame
 	return nil
 }
 
-// lastFrames is the frame count of the most recent encode.
+// totalFrames is the frame count of every encode, in no order.
 func (e *fakeEncoder) totalFrames() []int64 {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -458,13 +551,6 @@ func (e *fakeEncoder) totalFrames() []int64 {
 		out = append(out, n)
 	}
 	return out
-}
-
-func mp4Box(typ string, payload []byte) []byte {
-	b := make([]byte, 8, 8+len(payload))
-	binary.BigEndian.PutUint32(b, uint32(8+len(payload)))
-	copy(b[4:], typ)
-	return append(b, payload...)
 }
 
 // sim is one simulated session: clock, Spotify, capture and library.
@@ -485,6 +571,14 @@ type sim struct {
 	eng   *Engine // the running engine, for actions that inject faults
 	// pending is an interrupted session's Spotify state to put back.
 	pending *session.SpotifyState
+	// save, when set, is the session's SaveSpotify.
+	save func(session.SpotifyState) error
+	// forceQuit cancels the context Run was given, as a second Ctrl-C does.
+	// Simulated time stops with it.
+	forceQuit context.CancelFunc
+	// actionErrs collects failures of scripted actions, which run on the
+	// driver goroutine and so cannot fail the test themselves.
+	actionErrs []error
 }
 
 func newSim(t *testing.T, tracks ...simTrack) *sim {
@@ -493,7 +587,7 @@ func newSim(t *testing.T, tracks ...simTrack) *sim {
 	s.start = s.clock
 	s.spotify = newFakeSpotify(s.now, tracks...)
 	s.source = newFakeSource()
-	s.enc = &fakeEncoder{frames: map[string]int64{}}
+	s.enc = newFakeEncoder()
 	s.root, s.home = t.TempDir(), t.TempDir()
 	s.reopen()
 	t.Cleanup(func() {
@@ -512,6 +606,7 @@ func newSim(t *testing.T, tracks ...simTrack) *sim {
 
 // reopen opens the library afresh, as a new mixtape process would.
 func (s *sim) reopen() {
+	s.t.Helper()
 	lib, err := library.Open(s.root, library.Options{
 		Encoder: s.enc, WorkDir: filepath.Join(s.home, "work"), Now: s.now,
 	})
@@ -530,7 +625,7 @@ func (s *sim) now() time.Time {
 func (s *sim) run(cols []spotify.Collection, o Options, controls chan Control) (*Plan, Result) {
 	s.t.Helper()
 	s.spotify.mu.Lock()
-	s.spotify.watch, s.spotify.wdone = nil, nil // a new process: no watcher yet
+	s.spotify.watch, s.spotify.wdone, s.spotify.hungUp = nil, nil, false // a new process: no watcher yet
 	s.spotify.mu.Unlock()
 	plan := BuildPlan(s.lib, cols, PlanOptions{Redo: o.Redo})
 	require.NoError(s.t, Prepare(s.lib, plan))
@@ -541,7 +636,7 @@ func (s *sim) run(cols []spotify.Collection, o Options, controls chan Control) (
 	eng, err := New(Config{
 		Player: s.spotify, Source: s.source, Library: s.lib,
 		SpoolDir: filepath.Join(s.home, "spool"), WorkDir: filepath.Join(s.home, "work"),
-		Options: o, Now: s.now, PendingSpotify: s.pending,
+		Options: o, Now: s.now, PendingSpotify: s.pending, SaveSpotify: s.save,
 		Emit: func(ev Event) {
 			s.mu.Lock()
 			s.events = append(s.events, ev)
@@ -550,16 +645,30 @@ func (s *sim) run(cols []spotify.Collection, o Options, controls chan Control) (
 	})
 	require.NoError(s.t, err)
 
-	s.mu.Lock()
-	s.eng = eng
-	s.mu.Unlock()
 	ctx, cancel := context.WithTimeout(s.t.Context(), 30*time.Second)
 	defer cancel()
+	s.mu.Lock()
+	s.eng, s.forceQuit = eng, cancel
+	s.mu.Unlock()
 	done := make(chan struct{})
-	go s.drive(ctx, done, eng)
+	var driver sync.WaitGroup
+	driver.Go(func() { s.drive(ctx, done, eng) })
 	res := eng.Run(ctx, plan, controls)
 	close(done)
+	driver.Wait() // the scripted actions are over: their state is the test's again
+	s.mu.Lock()
+	actionErr := errors.Join(s.actionErrs...)
+	s.mu.Unlock()
+	require.NoError(s.t, actionErr, "a scripted action failed")
 	return plan, res
+}
+
+// actionFailed records the failure of a scripted action; run fails the
+// test with it once the session is over.
+func (s *sim) actionFailed(err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.actionErrs = append(s.actionErrs, err)
 }
 
 // drive advances simulated time in small steps: playback moves, audio is
@@ -604,9 +713,9 @@ func (s *sim) drive(ctx context.Context, done <-chan struct{}, eng *Engine) {
 		}
 		sincePoll = 0
 		s.spotify.mu.Lock()
-		ch, wdone := s.spotify.watch, s.spotify.wdone
+		ch, wdone, hungUp := s.spotify.watch, s.spotify.wdone, s.spotify.hungUp
 		s.spotify.mu.Unlock()
-		if ch == nil {
+		if ch == nil || hungUp {
 			continue
 		}
 		select {

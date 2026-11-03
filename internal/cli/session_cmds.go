@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"strings"
 	"syscall"
 	"time"
@@ -18,13 +19,47 @@ import (
 )
 
 // pollEvery is how often wait, stop and status --follow look again;
-// stopTimeout bounds how long stop waits for the recorder to exit.
+// stopTimeout bounds how long stop waits for the recorder to exit, and
+// lockErrorGrace how long status --follow keeps going while the recorder
+// lock cannot be read.
 const (
-	pollEvery   = 500 * time.Millisecond
-	stopTimeout = 2 * time.Minute
+	pollEvery      = 500 * time.Millisecond
+	stopTimeout    = 2 * time.Minute
+	lockErrorGrace = 30 * time.Second
 )
 
-var errCrashed = errors.New("the session ended without finishing (killed or crashed)")
+var (
+	errCrashed = errors.New("the session ended without finishing (killed or crashed)")
+	// errDeadline reports a pollUntil that ran out of time.
+	errDeadline = errors.New("deadline passed")
+)
+
+// pollUntil calls check every interval until it reports done (or an
+// error), ctx ends, or deadline passes (zero: no deadline), which is
+// errDeadline. check runs first, before any wait.
+func (a *app) pollUntil(ctx context.Context, deadline time.Time, interval time.Duration, check func() (bool, error)) error {
+	for {
+		done, err := check()
+		if done || err != nil {
+			return err
+		}
+		if !deadline.IsZero() && !a.deps.now().Before(deadline) {
+			return errDeadline
+		}
+		if !a.deps.services.sleep(ctx, interval) {
+			return ctx.Err()
+		}
+	}
+}
+
+// inspectSession reads the recorder lock: who holds it, if anyone.
+func (a *app) inspectSession() (session.LockInfo, bool, error) {
+	lockPath, err := a.deps.services.lockPath()
+	if err != nil {
+		return session.LockInfo{}, false, err
+	}
+	return session.Inspect(lockPath)
+}
 
 // statusDoc is the JSON shape of `status`.
 type statusDoc struct {
@@ -36,11 +71,7 @@ type statusDoc struct {
 // current reads the live or most recent session. running reports whether
 // a recorder holds the lock right now.
 func (a *app) current() (session.State, bool, error) {
-	lockPath, err := a.deps.services.lockPath()
-	if err != nil {
-		return session.State{}, false, err
-	}
-	info, held, err := session.Inspect(lockPath)
+	info, held, err := a.inspectSession()
 	if err != nil {
 		return session.State{}, false, err
 	}
@@ -49,16 +80,16 @@ func (a *app) current() (session.State, bool, error) {
 		home = info.Home
 	}
 	st, err := session.ReadState(home)
-	if errors.Is(err, session.ErrNoSession) && held {
-		return session.State{ID: info.SessionID, PID: info.PID, Phase: session.PhaseStarting, StartedAt: info.StartedAt}, true, nil
-	}
-	if err != nil {
+	switch {
+	case held && (errors.Is(err, session.ErrNoSession) || err == nil && st.ID != info.SessionID):
+		// The running session has not written its session.json yet (the one
+		// there, if any, belongs to an older session in this home).
+		return session.State{
+			ID: info.SessionID, PID: info.PID, Phase: session.PhaseStarting, StartedAt: info.StartedAt,
+			Events: session.EventsPath(home, info.SessionID),
+		}, true, nil
+	case err != nil:
 		return session.State{}, held, err
-	}
-	if held && st.ID != info.SessionID {
-		// session.json belongs to an older session in this home; the
-		// running one has not written its own yet.
-		st = session.State{ID: info.SessionID, PID: info.PID, Phase: session.PhaseStarting, StartedAt: info.StartedAt}
 	}
 	return st, held, nil
 }
@@ -146,16 +177,49 @@ func (a *app) follow(ctx context.Context, st session.State) error {
 	if st.Events == "" {
 		return session.ErrNoSession
 	}
-	lockPath, err := a.deps.services.lockPath()
+	// A session that just started holds the lock a moment before it
+	// creates its event log: wait for the log while the session runs.
+	err := a.pollUntil(ctx, a.deps.now().Add(lockErrorGrace), pollEvery, func() (bool, error) {
+		if _, statErr := os.Stat(st.Events); statErr == nil {
+			return true, nil
+		}
+		_, held, _ := a.inspectSession()
+		if !held {
+			return false, session.ErrNoSession // it ended before it logged anything
+		}
+		return false, nil
+	})
+	if errors.Is(err, errDeadline) {
+		err = fmt.Errorf("%w: session %s has not started its event log", session.ErrNoSession, st.ID)
+	}
 	if err != nil {
 		return err
 	}
+	// A lock that cannot be read says nothing about the session: keep
+	// following, and give up only when it stays unreadable.
+	var lockErr error
+	var failingSince time.Time
 	_, err = session.Follow(st.Events, 0, &eventWriter{a: a}, func() bool {
-		if _, held, _ := session.Inspect(lockPath); !held {
+		_, held, inspectErr := a.inspectSession()
+		switch {
+		case inspectErr == nil && !held:
 			return false
+		case inspectErr != nil && !held:
+			if lockErr == nil {
+				failingSince = a.deps.now()
+			}
+			lockErr = inspectErr
+			if a.deps.now().Sub(failingSince) >= lockErrorGrace {
+				return false
+			}
+		default:
+			lockErr = nil
 		}
 		return a.deps.services.sleep(ctx, pollEvery)
 	})
+	if err == nil && lockErr != nil {
+		err = fmt.Errorf("check whether session %s is still running: %w", st.ID, lockErr)
+	}
 	return err
 }
 
@@ -223,23 +287,22 @@ func (a *app) wait(ctx context.Context, timeout time.Duration) error {
 	if timeout > 0 {
 		deadline = a.deps.now().Add(timeout)
 	}
-	for {
-		st, running, err := a.current()
-		if err != nil {
-			return err
-		}
-		if !running {
-			return a.reportEnded(st)
-		}
-		if !deadline.IsZero() && !a.deps.now().Before(deadline) {
-			_ = a.out.Result(a.statusText(st, true), statusDoc{Running: true, Session: &st})
-			return newError(ExitTimeout, errTimeout, "wait again, or 'mixtape stop' it",
-				"session %s is still running after %s", st.ID, timeout)
-		}
-		if !a.deps.services.sleep(ctx, pollEvery) {
-			return ctx.Err()
-		}
+	var st session.State
+	err := a.pollUntil(ctx, deadline, pollEvery, func() (bool, error) {
+		var running bool
+		var err error
+		st, running, err = a.current()
+		return !running, err
+	})
+	switch {
+	case errors.Is(err, errDeadline):
+		_ = a.out.Result(a.statusText(st, true), statusDoc{Running: true, Session: &st})
+		return newError(ExitTimeout, errTimeout, "wait again, or 'mixtape stop' it",
+			"session %s is still running after %s", st.ID, timeout)
+	case err != nil:
+		return err
 	}
+	return a.reportEnded(st)
 }
 
 // reportEnded prints a finished session and returns its exit status.
@@ -291,11 +354,7 @@ type stopDoc struct {
 }
 
 func (a *app) stop(ctx context.Context, noWait bool) error {
-	lockPath, err := a.deps.services.lockPath()
-	if err != nil {
-		return err
-	}
-	info, held, err := session.Inspect(lockPath)
+	info, held, err := a.inspectSession()
 	if err != nil {
 		return err
 	}
@@ -315,17 +374,22 @@ func (a *app) stop(ctx context.Context, noWait bool) error {
 			stopDoc{Stopping: true, SessionID: info.SessionID, PID: info.PID})
 	}
 	a.out.Println("stopping session %s…", info.SessionID)
-	deadline := a.deps.now().Add(stopTimeout)
-	for {
-		if _, stillHeld, _ := session.Inspect(lockPath); !stillHeld {
-			break
+	var lockErr error // the last failed look at the lock: no answer, so keep looking
+	err = a.pollUntil(ctx, a.deps.now().Add(stopTimeout), pollEvery, func() (bool, error) {
+		_, stillHeld, inspectErr := a.inspectSession()
+		lockErr = nil
+		if !stillHeld {
+			lockErr = inspectErr
 		}
-		if a.deps.now().After(deadline) {
-			return fmt.Errorf("%w: session %s did not stop within %s", errTimeout, info.SessionID, stopTimeout)
-		}
-		if !a.deps.services.sleep(ctx, pollEvery) {
-			return ctx.Err()
-		}
+		return inspectErr == nil && !stillHeld, nil
+	})
+	switch {
+	case errors.Is(err, errDeadline) && lockErr != nil:
+		return fmt.Errorf("check whether session %s stopped: %w", info.SessionID, lockErr)
+	case errors.Is(err, errDeadline):
+		return fmt.Errorf("%w: session %s did not stop within %s", errTimeout, info.SessionID, stopTimeout)
+	case err != nil:
+		return err
 	}
 	st, err := session.ReadState(info.Home)
 	if err != nil {

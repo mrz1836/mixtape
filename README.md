@@ -63,9 +63,10 @@ mixtape record https://open.spotify.com/playlist/37i9dQZF1DXcBWIGoYBM5M
   they are recognized even after renames.
 - **Exact cuts, complete songs.** Every song is cut out of a continuous capture
   by matching Spotify's playback position to the audio, to within a few
-  milliseconds. Pauses are cut out. A song that was not captured start to
-  finish (a skip, a seek, a glitch) is never kept as done; it is recorded
-  again.
+  milliseconds. Pauses are cut out (Spotify fades the sound out and back in
+  around a pause, so the spot stays audible). A song that was not captured
+  start to finish (a skip, a seek, a glitch) is never kept as done; it is
+  recorded again.
 - **No accounts, no API keys.** Mixtape drives the Spotify app over
   AppleScript and reads public track lists from Spotify's embed pages.
 - **Two ways to hear Spotify.** A Core Audio process tap (macOS 14.2+, nothing
@@ -163,9 +164,9 @@ mixtape doctor    # every prerequisite, with fixes (exit 3 when not ready)
 A recording sounds exactly as Spotify plays it, so a few Spotify settings
 matter:
 
-- **Crossfade off** (required): Spotify → Settings → Playback → *Crossfade
-  songs*. Crossfaded songs overlap and cannot be cut; Mixtape stops (exit 3)
-  when it sees it.
+- **Crossfade and Automix off** (required): Spotify → Settings → Playback →
+  *Crossfade songs* and *Automix*. Blended songs overlap and cannot be cut;
+  Mixtape stops (exit 3) when it sees either.
 - **Volume at maximum:** recordings are made at Spotify's own volume slider
   (the Mac's volume does not matter). With the process tap, `--mute` does
   this for you and silences the speakers while it records.
@@ -271,10 +272,10 @@ Mixtape is designed to be driven unattended:
 - **Errors explain themselves.** Every failure is
   `{"error":{"code","message","hint","exit_code"}}` on stderr; `hint` says
   what to do.
-- **It stops when nothing can work.** After three songs in a row could not be
-  recorded (`--max-failures`, or `max_failures` in the config; `0` never
-  stops), the session ends with a cause: no sound reaching Mixtape, songs not
-  starting in Spotify, or repeated failures.
+- **It stops when nothing can work.** After three failed attempts in a row
+  (each song is tried twice; `--max-failures`, or `max_failures` in the
+  config; `0` never stops), the session ends with a cause: no sound reaching
+  Mixtape, songs not starting in Spotify, or repeated failures.
 - **Safe to retry.** `record` is idempotent: run the same command again and
   only what is missing happens. `--dry-run` previews it.
 - **Sessions are on disk.** `~/.mixtape/session.json` (live state) and
@@ -285,8 +286,8 @@ Mixtape is designed to be driven unattended:
 ## 🎛️ How it works
 
 Mixtape captures the Mac's audio continuously into a spool on disk while it
-watches Spotify over AppleScript (one long-running `osascript`, about eight
-observations a second). Every observation and every audio block carries a
+watches Spotify over AppleScript (one long-running `osascript`, an
+observation every 150 ms). Every observation and every audio block carries a
 time on the same clock, so each reported position pins the song's start to
 an exact frame; the median over many observations is accurate to
 milliseconds, measured at about 2–4 ms on real sessions. When a song ends, its
@@ -362,7 +363,7 @@ set artwork true`).
 
 | Symptom | Fix |
 |---|---|
-| `crossfade appears to be on` (exit 3) | Spotify → Settings → Playback → turn off *Crossfade songs*. Spotify keeps this setting where it cannot be read directly, so Mixtape detects it from playback. |
+| `spotify crossfade is on` or `crossfade appears to be on` (exit 3) | Spotify → Settings → Playback → turn off *Crossfade songs* and *Automix*. Newer Spotify versions keep crossfade where it cannot be read, so Mixtape also detects it from playback. `--allow-crossfade` records anyway (songs will overlap). |
 | `… may not record system audio yet` or `the process tap is silent` (exit 5) | Run `mixtape setup`, or add your terminal app under *System Audio Recording Only* (see above; not the screen-recording list). If it is already there, quit and reopen the terminal app. Or use `--capture device`. |
 | `the capture device is silent` (exit 3) | Select the Multi-Output Device (with BlackHole) as the Mac's sound output. |
 | `spotify is playing, but no sound reaches mixtape` or `songs keep playing without any sound reaching mixtape` (exit 3) | Spotify is playing somewhere else: click the speaker icon at the bottom right of Spotify and choose this Mac. Also check that Spotify's own volume is not at 0. |
@@ -405,24 +406,74 @@ set artwork true`).
 <details>
 <summary><strong>Development</strong></summary>
 
+Everything goes through [MAGE-X](https://github.com/mrz1836/mage-x) and
+[go-pre-commit](https://github.com/mrz1836/go-pre-commit), as in the other
+mrz1836 Go projects (`magex help` lists every command):
+
 ```bash
-magex format:fix   # gofumpt + goimports
-magex lint         # golangci-lint with the repository's strict config
-magex test:race    # unit tests with the race detector
-magex build        # build ./cmd/mixtape/mixtape
+magex build:dev                              # build this checkout and install it as `mixtape` (~/.local/bin)
+magex format:fix                             # gofumpt, gci and goimports
+go-pre-commit run --all-files --skip lint    # whitespace, EOF, gofumpt, go mod tidy, gitleaks
+magex lint                                   # golangci-lint with the repository's strict config
+magex test                                   # the suite (magex test:race with the race detector)
+magex test:coverage                          # coverage report
+magex test:fuzz                              # the fuzz targets: every parser, the segmenter, MP4 tagging
 ```
+
+Before a commit, run the four checks in order: `magex format:fix`,
+`go-pre-commit run --all-files --skip lint`, `magex lint`, `magex test:race`.
 
 Tests never touch Spotify or Core Audio: the engine runs against a simulated
 Spotify and replays real timing traces (`internal/engine/testdata`), and the
 suite passes on Linux too, where CI runs it. Tests that encode real audio skip
 themselves when the AAC encoder is unavailable (off macOS, or inside a
-sandbox). Live capture checks run only with both `-tags captureintegration`
-and `MIXTAPE_LIVE_CAPTURE=1`, with Spotify playing.
+sandbox).
 
-**Releasing.** Push a `vX.Y.Z` tag: `.github/workflows/release.yml` tests and
-builds both macOS binaries on a macOS runner and publishes the release with
-GoReleaser. From a Mac, `GITHUB_TOKEN=… goreleaser release --clean` does the
-same locally.
+**Live testing** plays Spotify and opens real capture, so it runs only when
+you ask for it, with Spotify playing on this Mac:
+
+```bash
+magex build:dev                              # the build under test, as `mixtape`
+mixtape doctor                               # what this Mac is ready for
+MIXTAPE_LIVE_CAPTURE=1 magex test            # the suite plus the live tap and device captures
+mixtape debug trace --duration 2m            # a timing trace while you play, pause and skip
+
+# keep test recordings out of your real library and session state
+export MIXTAPE_HOME=/tmp/mixtape-test/home MIXTAPE_LIBRARY=/tmp/mixtape-test/lib
+mixtape record spotify:album:4LH4d3cOWNNsVw41Gqt2kv --limit 1 --mute
+```
+
+The device capture test reads `MIXTAPE_TEST_DEVICE` (default `BlackHole`); it
+hears something only when the Mac's output is the Multi-Output Device.
+
+**Benchmarks.** Re-measure after a change to the capture, spool, segmenter or
+tagging paths:
+
+```bash
+magex bench:default time=2s
+magex bench:save time=2s out=bench.txt
+magex bench:compare old=before.txt new=after.txt
+```
+
+Latest baseline — Apple M1 Max · darwin/arm64 · Go 1.26 · `time=2s`:
+
+| Benchmark | ns/op | B/op | allocs/op | Path covered |
+|---|--:|--:|--:|---|
+| `BenchmarkPeak` (`internal/engine`) | 966 | 0 | 0 | loudness check of every 10 ms capture block |
+| `BenchmarkAppend` (`internal/spool`) | 694 | 36 | 0 | spooling one 10 ms block (48 kHz stereo) |
+| `BenchmarkFrameAt` (`internal/spool`) | 81 | 0 | 0 | time → frame in a 10-minute spool |
+| `BenchmarkReadRange` (`internal/spool`) | 3,911,532 | 262,922 | 10 | reading a 3-minute song back out |
+| `BenchmarkSegmentize` (`internal/engine`) | 219,410 | 523,980 | 35 | cutting a 10-minute song with a pause |
+| `BenchmarkTag` (`internal/mp4tag`) | 526,780 | 8,491,856 | 73 | retagging a 7.5 MB song with a cover |
+| `BenchmarkAudioSHA256` (`internal/mp4tag`) | 3,151,502 | 464 | 5 | hashing the same song's audio |
+
+> Local-machine numbers, not targets: compare runs on the same hardware.
+> Last measured: 2026-11-02
+
+**Releasing.** `magex version:bump bump=patch branch=master push` tags
+and pushes the release; `.github/workflows/release.yml` then tests and builds
+both macOS binaries on a macOS runner and publishes them with GoReleaser.
+From a Mac, `GITHUB_TOKEN=… goreleaser release --clean` does the same locally.
 
 </details>
 

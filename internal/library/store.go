@@ -15,6 +15,7 @@ import (
 
 	"github.com/mrz1836/mixtape/internal/fileutil"
 	"github.com/mrz1836/mixtape/internal/mp4tag"
+	"github.com/mrz1836/mixtape/internal/spotify"
 )
 
 // Artwork downloads are capped; real Spotify covers are well under 1 MiB.
@@ -56,8 +57,16 @@ func (a AFConvert) Encode(ctx context.Context, wavPath, m4aPath string) error {
 			return err
 		}
 	}
-	info, statErr := os.Stat(m4aPath)
-	if statErr != nil || info.Size() == 0 {
+	return checkOutput(m4aPath)
+}
+
+// checkOutput makes sure the encoder left a non-empty file at path.
+func checkOutput(path string) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		return fmt.Errorf("afconvert output: %w", err)
+	}
+	if info.Size() == 0 {
 		return errEmptyOutput
 	}
 	return nil
@@ -86,12 +95,12 @@ type CommitOptions struct {
 // file in c, replacing any earlier file for t in place. The manifest and
 // playlist are saved before it returns.
 //
-// If encoding fails the WAV moves to WorkDir/failed, the entry becomes
-// encode_failed with PendingWAV set (so RetryEncode can finish the job
-// without recording again), and the error wraps ErrEncode.
+// If encoding or tagging fails the WAV moves to WorkDir/failed, the entry
+// becomes encode_failed with PendingWAV set (so RetryEncode can finish the
+// job without recording again), and the error wraps ErrEncode.
 func (l *Library) Commit(ctx context.Context, c *Collection, t Track, wavPath string, o CommitOptions) (Entry, error) {
-	if t.ID == "" {
-		return Entry{}, fmt.Errorf("%w: track without an ID", errSpec)
+	if err := requireID(t); err != nil {
+		return Entry{}, err
 	}
 	if o.Partial {
 		// Never trade a complete recording for a partial one (--redo with
@@ -107,42 +116,99 @@ func (l *Library) Commit(ctx context.Context, c *Collection, t Track, wavPath st
 	e.merge(t, true) // metadata captured while recording is authoritative
 	id := e.RequestedID
 
-	if err := os.MkdirAll(l.opts.WorkDir, dirPerm); err != nil {
-		return *e, fmt.Errorf("create work folder: %w", err)
-	}
-	scratch, err := os.MkdirTemp(l.opts.WorkDir, "encode-")
+	scratch, err := l.scratchDir()
 	if err != nil {
-		return *e, fmt.Errorf("create work folder: %w", err)
+		return *e, err
 	}
 	defer func() { _ = os.RemoveAll(scratch) }()
-
-	m4a := filepath.Join(scratch, "out"+m4aExt)
-	if encErr := l.opts.Encoder.Encode(ctx, wavPath, m4a); encErr != nil {
-		return l.encodeFailed(c, id, wavPath, encErr)
-	}
-	data, err := os.ReadFile(filepath.Clean(m4a))
-	if err != nil {
-		return l.encodeFailed(c, id, wavPath, err)
-	}
-	hash, err := mp4tag.AudioSHA256(data)
+	data, hash, err := l.encode(ctx, wavPath, filepath.Join(scratch, "out"+m4aExt))
 	if err != nil {
 		return l.encodeFailed(c, id, wavPath, err)
 	}
 
 	e = c.Entry(id)
-	if e.ReleaseDate == "" && l.opts.ReleaseDate != nil {
-		// Album and playlist pages do not date their songs: ask the song's
-		// own page. Without an answer the file simply has no year.
-		lctx, cancel := context.WithTimeout(ctx, releaseDateTimeout)
-		if d, dErr := l.opts.ReleaseDate(lctx, id); dErr == nil {
-			e.ReleaseDate = d
-		}
-		cancel()
+	l.lookUpReleaseDate(ctx, e, id)
+	tagged, err := l.tagRecording(ctx, c, e, data, hash, o)
+	if err != nil {
+		// The audio is fine but cannot be stored yet: keep the WAV, like a
+		// failed encode, so the next run finishes it without recording.
+		return l.encodeFailed(c, id, wavPath, fmt.Errorf("tag: %w", err))
 	}
+
+	result, err := l.finalize(c, e, tagged, stored{
+		status: StatusRecorded, hash: hash, partial: o.Partial, recordedMS: o.RecordedMS,
+	})
+	if !o.KeepWAV && result.PendingWAV != wavPath {
+		// Stored, or a fresh take the folder cannot take: nothing refers to
+		// it any more, so it must not leak. A kept WAV the entry still
+		// points at (a retry whose write failed) is the only copy of the
+		// recording: it stays for the next retry.
+		_ = os.Remove(wavPath)
+	}
+	return result, err
+}
+
+// requireID rejects a track without an ID, which Commit and Copy cannot
+// store: the ID is what identifies its entry and its file.
+func requireID(t Track) error {
+	if t.ID == "" {
+		return fmt.Errorf("%w: track without an ID", errSpec)
+	}
+	return nil
+}
+
+// scratchDir creates a fresh folder under WorkDir for one encode.
+func (l *Library) scratchDir() (string, error) {
+	if err := os.MkdirAll(l.opts.WorkDir, dirPerm); err != nil {
+		return "", fmt.Errorf("create work folder: %w", err)
+	}
+	dir, err := os.MkdirTemp(l.opts.WorkDir, "encode-")
+	if err != nil {
+		return "", fmt.Errorf("create work folder: %w", err)
+	}
+	return dir, nil
+}
+
+// encode encodes the WAV at wavPath into m4aPath and returns the M4A and
+// the SHA-256 of its audio payload.
+func (l *Library) encode(ctx context.Context, wavPath, m4aPath string) ([]byte, string, error) {
+	if err := l.opts.Encoder.Encode(ctx, wavPath, m4aPath); err != nil {
+		return nil, "", err
+	}
+	data, err := os.ReadFile(filepath.Clean(m4aPath))
+	if err != nil {
+		return nil, "", err
+	}
+	hash, err := mp4tag.AudioSHA256(data)
+	if err != nil {
+		return nil, "", err
+	}
+	return data, hash, nil
+}
+
+// lookUpReleaseDate asks the song's own page for e's release date when e
+// has none. Album and playlist pages do not date their songs; without an
+// answer the file simply has no year.
+func (l *Library) lookUpReleaseDate(ctx context.Context, e *Entry, id string) {
+	if e.ReleaseDate != "" || l.opts.ReleaseDate == nil {
+		return
+	}
+	lctx, cancel := context.WithTimeout(ctx, releaseDateTimeout)
+	defer cancel()
+	if d, err := l.opts.ReleaseDate(lctx, id); err == nil {
+		e.ReleaseDate = d
+	}
+}
+
+// tagRecording tags the encoded M4A for e in c, with its cover art when
+// o.Artwork is set. Cover art is never worth losing a recording over: a
+// cover that cannot be downloaded, or is in a format MP4 cannot hold, is a
+// warning and the file is tagged without it.
+func (l *Library) tagRecording(ctx context.Context, c *Collection, e *Entry, data []byte, hash string, o CommitOptions) ([]byte, error) {
 	tags := l.tags(c, e, hash, o.Partial)
 	if o.Artwork && e.ArtworkURL != "" {
-		if cover, artErr := l.fetchArtwork(ctx, e.ArtworkURL); artErr != nil {
-			l.warn("no artwork for %s: %v", e.Title, artErr)
+		if cover, err := l.fetchArtwork(ctx, e.ArtworkURL); err != nil {
+			l.warn("no artwork for %s: %v", e.Title, err)
 		} else {
 			tags.Cover = cover
 		}
@@ -153,33 +219,41 @@ func (l *Library) Commit(ctx context.Context, c *Collection, t Track, wavPath st
 		tags.Cover = nil
 		tagged, err = mp4tag.Tag(data, tags)
 	}
-	if err != nil {
-		return *e, fmt.Errorf("tag %s: %w", e.Title, err)
-	}
+	return tagged, err
+}
 
+// stored is what finalize records in an entry once its file is in place.
+type stored struct {
+	status     Status
+	hash       string // SHA-256 of the audio payload
+	partial    bool
+	copiedFrom string     // library-relative path of a copy's source
+	recordedMS int64      // length of the captured audio
+	recordedAt *time.Time // nil means now
+}
+
+// finalize writes tagged atomically as e's file in c, records s in e, and
+// saves c's manifest and playlist. It returns the entry as stored.
+//
+// A write failure wraps ErrStore and leaves e as it was. A manifest that
+// cannot be saved also wraps ErrStore, but the file is in place by then
+// and the entry is updated in memory: the next run adopts the file by its
+// tags.
+func (l *Library) finalize(c *Collection, e *Entry, tagged []byte, s stored) (Entry, error) {
 	name := c.fileName(e)
 	if err := fileutil.WriteAtomic(filepath.Join(c.Dir, name), tagged, audioPerm); err != nil {
-		if !o.KeepWAV {
-			_ = os.Remove(wavPath) // nothing will reference it: do not leak it
-		}
 		return *e, fmt.Errorf("%w: %s: %w", ErrStore, name, err)
 	}
-
-	now := l.opts.Now().UTC().Round(0)
-	e.File = name
-	e.Status = StatusRecorded
-	e.Partial = o.Partial
-	e.AudioSHA256 = hash
-	e.RecordedAt = &now
-	e.RecordedMS = o.RecordedMS
-	e.CopiedFrom, e.FailReason, e.PendingWAV = "", "", ""
-	result := *e
-	saveErr := l.Save(c) // the file is in place either way: the next run adopts it by its tags
-	if !o.KeepWAV {
-		_ = os.Remove(wavPath)
+	e.File, e.Status, e.Partial, e.AudioSHA256 = name, s.status, s.partial, s.hash
+	e.CopiedFrom, e.RecordedMS, e.RecordedAt = s.copiedFrom, s.recordedMS, s.recordedAt
+	if e.RecordedAt == nil {
+		now := l.opts.Now().UTC().Round(0)
+		e.RecordedAt = &now
 	}
-	if saveErr != nil {
-		return result, fmt.Errorf("%w: %w", ErrStore, saveErr)
+	e.FailReason, e.PendingWAV = "", ""
+	result := *e
+	if err := l.Save(c); err != nil {
+		return result, fmt.Errorf("%w: %w", ErrStore, err)
 	}
 	return result, nil
 }
@@ -227,8 +301,8 @@ func (l *Library) encodeFailed(c *Collection, id, wavPath string, cause error) (
 // album track numbers). The audio, and so its hash, is unchanged. The
 // manifest and playlist are saved before it returns.
 func (l *Library) Copy(_ context.Context, c *Collection, t Track, src Location) (Entry, error) {
-	if t.ID == "" {
-		return Entry{}, fmt.Errorf("%w: track without an ID", errSpec)
+	if err := requireID(t); err != nil {
+		return Entry{}, err
 	}
 	data, err := os.ReadFile(filepath.Clean(src.Path))
 	if err != nil {
@@ -249,37 +323,16 @@ func (l *Library) Copy(_ context.Context, c *Collection, t Track, src Location) 
 	if played := src.Entry.playedOrRequested(); played != e.RequestedID {
 		e.PlayedID = played
 	}
-	id := e.RequestedID
-
 	tags := l.tags(c, e, hash, false)
 	tags.Cover = old.Cover
 	tagged, err := mp4tag.Tag(data, tags)
 	if err != nil {
 		return *e, fmt.Errorf("tag %s: %w", e.Title, err)
 	}
-	name := c.fileName(e)
-	if err := fileutil.WriteAtomic(filepath.Join(c.Dir, name), tagged, audioPerm); err != nil {
-		return *e, fmt.Errorf("%w: %s: %w", ErrStore, name, err)
-	}
-
-	e = c.Entry(id)
-	e.File = name
-	e.Status = StatusCopied
-	e.Partial = false
-	e.AudioSHA256 = hash
-	e.CopiedFrom = l.rel(src.Path)
-	e.RecordedMS = src.Entry.RecordedMS
-	e.RecordedAt = src.Entry.RecordedAt
-	if e.RecordedAt == nil {
-		now := l.opts.Now().UTC().Round(0)
-		e.RecordedAt = &now
-	}
-	e.FailReason, e.PendingWAV = "", ""
-	result := *e
-	if err := l.Save(c); err != nil {
-		return result, fmt.Errorf("%w: %w", ErrStore, err)
-	}
-	return result, nil
+	return l.finalize(c, e, tagged, stored{
+		status: StatusCopied, hash: hash, copiedFrom: l.rel(src.Path),
+		recordedMS: src.Entry.RecordedMS, recordedAt: src.Entry.RecordedAt,
+	})
 }
 
 // tags returns the full tag set for e in c.
@@ -291,7 +344,7 @@ func (l *Library) tags(c *Collection, e *Entry, hash string, partial bool) mp4ta
 		AlbumArtist: e.AlbumArtist,
 		Album:       e.Album,
 		Grouping:    c.Manifest.Name,
-		Comment:     "https://open.spotify.com/track/" + id,
+		Comment:     spotify.TrackURL(id),
 		TrackNumber: e.TrackNumber,
 		DiscNumber:  e.DiscNumber,
 		Date:        e.ReleaseDate,

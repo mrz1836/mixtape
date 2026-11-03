@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"io"
 	"os/exec"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -23,12 +25,13 @@ const osascriptPath = "/usr/bin/osascript"
 // substitute a fake so nothing ever talks to the Spotify app.
 type Runner interface {
 	// Run executes script once, passing args to its `on run argv`
-	// handler, and returns its trimmed stdout. On failure the error text
-	// includes osascript's stderr.
+	// handler, and returns its trimmed stdout. A failed script is a
+	// *ScriptError whose text includes osascript's stderr.
 	Run(ctx context.Context, script string, args ...string) (string, error)
 	// Start launches a long-running script and streams the lines it logs
 	// (AppleScript `log` writes to stderr), each stamped on arrival. The
-	// final Line carries the process exit error, then the channel closes.
+	// final Line carries the process exit error, a *ScriptError when the
+	// script failed with an error number, then the channel closes.
 	// Canceling ctx kills the process.
 	Start(ctx context.Context, script string, args ...string) (<-chan Line, error)
 }
@@ -53,6 +56,9 @@ var _ Runner = (*OSAScript)(nil)
 // also without being asked to (the loop scripts never return).
 var errNoOutput = errors.New("osascript exited")
 
+// errCodeRe finds the trailing "(-1743)" osascript appends to an error.
+var errCodeRe = regexp.MustCompile(`\((-?\d+)\)\s*$`)
+
 // Run implements Runner.
 func (o *OSAScript) Run(ctx context.Context, script string, args ...string) (string, error) {
 	timeout := o.Timeout
@@ -69,7 +75,13 @@ func (o *OSAScript) Run(ctx context.Context, script string, args ...string) (str
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return "", fmt.Errorf("osascript: %w", ctxErr)
 		}
-		return "", fmt.Errorf("osascript: %w: %s", err, strings.TrimSpace(stderr.String()))
+		msg := strings.TrimSpace(stderr.String())
+		if _, ok := errors.AsType[*exec.ExitError](err); !ok {
+			// osascript never ran, so there is no script error to report.
+			return "", fmt.Errorf("osascript: %w: %s", err, msg)
+		}
+		code, _ := errorCode(msg)
+		return "", &ScriptError{Code: code, Msg: fmt.Sprintf("osascript: %v: %s", err, msg)}
 	}
 	return strings.TrimSpace(stdout.String()), nil
 }
@@ -89,23 +101,13 @@ func (o *OSAScript) Start(ctx context.Context, script string, args ...string) (<
 	out := make(chan Line, 16)
 	go func() {
 		defer close(out)
-		var last string
-		sc := bufio.NewScanner(stderr)
-		sc.Buffer(make([]byte, 0, 4096), 1<<20)
-		for sc.Scan() {
-			text := sc.Text()
-			last = text
-			select {
-			case out <- Line{Text: text, At: time.Now()}:
-			case <-ctx.Done():
-			}
-		}
+		last := streamLines(ctx, stderr, out)
 		waitErr := cmd.Wait()
 		switch {
 		case ctx.Err() != nil:
 			waitErr = ctx.Err()
 		case waitErr != nil:
-			waitErr = fmt.Errorf("osascript: %w: %s", waitErr, last)
+			waitErr = exitError(waitErr, last)
 		default:
 			waitErr = errNoOutput
 		}
@@ -115,6 +117,71 @@ func (o *OSAScript) Start(ctx context.Context, script string, args ...string) (<
 		}
 	}()
 	return out, nil
+}
+
+// exitError describes a streamed script that exited with err after
+// logging last. The last line is osascript's error message only when it
+// ends with an error number: otherwise it may be system log noise, so the
+// error is no ScriptError.
+func exitError(err error, last string) error {
+	if code, ok := errorCode(last); ok {
+		return &ScriptError{Code: code, Msg: fmt.Sprintf("osascript: %v: %s", err, last)}
+	}
+	return fmt.Errorf("osascript: %w: %s", err, last)
+}
+
+// errorCode extracts the trailing error number from osascript output.
+func errorCode(s string) (int, bool) {
+	m := errCodeRe.FindStringSubmatch(s)
+	if m == nil {
+		return 0, false
+	}
+	n, err := strconv.Atoi(m[1])
+	if err != nil {
+		return 0, false
+	}
+	return n, true
+}
+
+// maxLineBytes bounds one streamed line; a longer one (system log noise)
+// is cut, and the lines after it still arrive.
+const maxLineBytes = 1 << 20
+
+// streamLines sends each line of r to out, stamped on arrival, until r
+// ends, and returns the last line. It always reads r to its end, so the
+// script never blocks on a full pipe.
+func streamLines(ctx context.Context, r io.Reader, out chan<- Line) string {
+	br := bufio.NewReader(r)
+	var last string
+	for {
+		text, err := readLine(br, maxLineBytes)
+		if text != "" || err == nil {
+			last = text
+			select {
+			case out <- Line{Text: text, At: time.Now()}:
+			case <-ctx.Done():
+			}
+		}
+		if err != nil {
+			return last
+		}
+	}
+}
+
+// readLine returns the next line of br without its line ending, cut to
+// limit bytes. The error is set only when br has nothing more.
+func readLine(br *bufio.Reader, limit int) (string, error) {
+	var line []byte
+	for {
+		frag, err := br.ReadSlice('\n')
+		if room := limit - len(line); room > 0 {
+			line = append(line, frag[:min(len(frag), room)]...)
+		}
+		if errors.Is(err, bufio.ErrBufferFull) {
+			continue // the rest of a long line
+		}
+		return strings.TrimRight(string(line), "\r\n"), err
+	}
 }
 
 // scriptArgs builds the osascript argument list: the script inline, then

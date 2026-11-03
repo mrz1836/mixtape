@@ -1,20 +1,19 @@
 //go:build captureintegration && darwin && cgo
 
-// These tests open a real process tap on Spotify. They trigger the macOS
-// "record system audio" prompt for the host app the first time, so they
-// run only on request, with Spotify playing:
+// These tests open a real process tap on Spotify. The host app (the
+// terminal that runs them) needs the System Audio Recording permission, so
+// they run only on request, with Spotify playing:
 //
-//	MIXTAPE_LIVE_CAPTURE=1 go test -tags captureintegration -run Integration -v ./internal/capture/...
+//	MIXTAPE_LIVE_CAPTURE=1 magex test
 //
-// The build tag alone is not enough: tools that enable every discovered
-// tag (magex test) must never open live audio, so the environment variable
-// is required too.
+// magex test enables every build tag it finds, captureintegration
+// included, so the tag alone must stay harmless: the environment variable
+// is what opens live audio.
 package tap
 
 import (
 	"context"
 	"encoding/binary"
-	"os"
 	"sync"
 	"testing"
 	"time"
@@ -23,11 +22,12 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/mrz1836/mixtape/internal/capture"
+	"github.com/mrz1836/mixtape/internal/testutil"
 )
 
 func TestIntegrationSpotifyProcesses(t *testing.T) {
 	t.Parallel()
-	requireLive(t)
+	testutil.RequireLive(t)
 	procs, err := SpotifyProcesses()
 	require.NoError(t, err)
 	for _, p := range procs {
@@ -37,8 +37,8 @@ func TestIntegrationSpotifyProcesses(t *testing.T) {
 
 func TestIntegrationTapRecords(t *testing.T) {
 	t.Parallel()
-	requireLive(t)
-	src, err := Open(Options{Wait: 5 * time.Second})
+	testutil.RequireLive(t)
+	src, err := Open(t.Context(), Options{Wait: 5 * time.Second})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = src.Close() })
 	f := src.Format()
@@ -80,13 +80,5 @@ func TestIntegrationTapRecords(t *testing.T) {
 	assert.Positive(t, frames, "the tap delivers audio callbacks")
 	if peak == 0 {
 		t.Log("all zeros: Spotify paused, or the host app lacks the System Audio Recording permission")
-	}
-}
-
-// requireLive skips unless live capture tests were asked for explicitly.
-func requireLive(t *testing.T) {
-	t.Helper()
-	if os.Getenv("MIXTAPE_LIVE_CAPTURE") != "1" {
-		t.Skip("live capture test: set MIXTAPE_LIVE_CAPTURE=1 (needs Spotify playing and the owner present)")
 	}
 }

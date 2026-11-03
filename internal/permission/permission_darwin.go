@@ -10,7 +10,11 @@ package permission
 */
 import "C"
 
-import "unsafe"
+import (
+	"unsafe"
+
+	"github.com/mrz1836/mixtape/internal/spotify"
+)
 
 // requestTimeout bounds how long a system prompt is waited for.
 const requestTimeout = 120
@@ -46,7 +50,7 @@ func Request(k Kind) State {
 }
 
 func automation(ask bool) State {
-	id := C.CString(SpotifyBundleID)
+	id := C.CString(spotify.BundleID)
 	defer C.free(unsafe.Pointer(id))
 	flag := C.int(0)
 	if ask {
