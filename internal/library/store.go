@@ -31,30 +31,56 @@ var (
 	errArtworkSize   = errors.New("artwork is larger than 5 MiB")
 )
 
-// Encoder turns a WAV file into an AAC M4A file.
+// Encoder turns a WAV file into an M4A file.
 type Encoder interface {
 	Encode(ctx context.Context, wavPath, m4aPath string) error
 }
 
-// AFConvert encodes with macOS's built-in afconvert.
+// AFConvert encodes with macOS's built-in afconvert. The zero value
+// encodes AAC at 256 kb/s.
 type AFConvert struct {
-	// Bitrate in bits per second; 0 means 256000.
+	// Codec is what to encode to; "" means AAC.
+	Codec mp4tag.Codec
+	// Bitrate is the AAC bit rate in bits per second; 0 means 256000.
+	// ALAC has none: it keeps every sample, at the WAV's own depth.
 	Bitrate int
+	// Warn receives a note when afconvert would not take Bitrate and the
+	// song was encoded at its default instead; nil discards it.
+	Warn func(msg string)
+
+	run func(ctx context.Context, args ...string) error // nil: afconvert
 }
 
-// Encode runs afconvert -f m4af -d aac -b <bitrate>. If afconvert rejects
-// the bitrate (some low sample rates cannot carry 256 kb/s AAC), it retries
-// once at afconvert's default bitrate.
+// Encode runs afconvert. ALAC is `-f m4af -d alac`: lossless, at the bit
+// depth of the WAV. AAC is `-f m4af -d aac -b <bitrate>`; if afconvert
+// rejects the bitrate (some low sample rates cannot carry it), Encode
+// retries once at afconvert's default bitrate and says so through Warn.
 func (a AFConvert) Encode(ctx context.Context, wavPath, m4aPath string) error {
+	run := a.run
+	if run == nil {
+		run = afconvert
+	}
+	if a.Codec == mp4tag.CodecALAC {
+		if err := run(ctx, "-f", "m4af", "-d", "alac", wavPath, m4aPath); err != nil {
+			_ = os.Remove(m4aPath)
+			return err
+		}
+		return checkOutput(m4aPath)
+	}
 	bitrate := a.Bitrate
 	if bitrate <= 0 {
 		bitrate = defaultBitrate
 	}
-	err := afconvert(ctx, "-f", "m4af", "-d", "aac", "-b", strconv.Itoa(bitrate), wavPath, m4aPath)
+	err := run(ctx, "-f", "m4af", "-d", "aac", "-b", strconv.Itoa(bitrate), wavPath, m4aPath)
 	if err != nil {
 		_ = os.Remove(m4aPath)
-		if retryErr := afconvert(ctx, "-f", "m4af", "-d", "aac", wavPath, m4aPath); retryErr != nil {
+		if retryErr := run(ctx, "-f", "m4af", "-d", "aac", wavPath, m4aPath); retryErr != nil {
+			_ = os.Remove(m4aPath)
 			return err
+		}
+		if a.Warn != nil {
+			a.Warn(fmt.Sprintf("afconvert would not encode AAC at %d kb/s (%v); %s was encoded at its default bit rate",
+				bitrate/1000, err, filepath.Base(wavPath)))
 		}
 	}
 	return checkOutput(m4aPath)
@@ -121,22 +147,24 @@ func (l *Library) Commit(ctx context.Context, c *Collection, t Track, wavPath st
 		return *e, err
 	}
 	defer func() { _ = os.RemoveAll(scratch) }()
-	data, hash, err := l.encode(ctx, wavPath, filepath.Join(scratch, "out"+m4aExt))
+	m4a := filepath.Join(scratch, "out"+m4aExt)
+	enc, err := l.encode(ctx, wavPath, m4a)
 	if err != nil {
 		return l.encodeFailed(c, id, wavPath, err)
 	}
 
 	e = c.Entry(id)
 	l.lookUpReleaseDate(ctx, e, id)
-	tagged, err := l.tagRecording(ctx, c, e, data, hash, o)
+	tagged, err := l.tagRecording(ctx, c, e, m4a, enc.hash, o)
 	if err != nil {
 		// The audio is fine but cannot be stored yet: keep the WAV, like a
 		// failed encode, so the next run finishes it without recording.
 		return l.encodeFailed(c, id, wavPath, fmt.Errorf("tag: %w", err))
 	}
+	defer func() { _ = tagged.Close() }()
 
 	result, err := l.finalize(c, e, tagged, stored{
-		status: StatusRecorded, hash: hash, partial: o.Partial, recordedMS: o.RecordedMS,
+		status: StatusRecorded, hash: enc.hash, codec: enc.codec, partial: o.Partial, recordedMS: o.RecordedMS,
 	})
 	if !o.KeepWAV && result.PendingWAV != wavPath {
 		// Stored, or a fresh take the folder cannot take: nothing refers to
@@ -169,21 +197,28 @@ func (l *Library) scratchDir() (string, error) {
 	return dir, nil
 }
 
-// encode encodes the WAV at wavPath into m4aPath and returns the M4A and
-// the SHA-256 of its audio payload.
-func (l *Library) encode(ctx context.Context, wavPath, m4aPath string) ([]byte, string, error) {
+// encoded describes a freshly encoded M4A.
+type encoded struct {
+	hash  string       // SHA-256 of the audio payload
+	codec mp4tag.Codec // as the file declares it
+}
+
+// encode encodes the WAV at wavPath into m4aPath and reads back the hash of
+// its audio payload and its codec, streaming the file rather than loading
+// it.
+func (l *Library) encode(ctx context.Context, wavPath, m4aPath string) (encoded, error) {
 	if err := l.opts.Encoder.Encode(ctx, wavPath, m4aPath); err != nil {
-		return nil, "", err
+		return encoded{}, err
 	}
-	data, err := os.ReadFile(filepath.Clean(m4aPath))
+	hash, err := mp4tag.HashFile(m4aPath)
 	if err != nil {
-		return nil, "", err
+		return encoded{}, err
 	}
-	hash, err := mp4tag.AudioSHA256(data)
+	codec, err := mp4tag.ReadCodec(m4aPath)
 	if err != nil {
-		return nil, "", err
+		return encoded{}, err
 	}
-	return data, hash, nil
+	return encoded{hash: hash, codec: codec}, nil
 }
 
 // lookUpReleaseDate asks the song's own page for e's release date when e
@@ -200,11 +235,11 @@ func (l *Library) lookUpReleaseDate(ctx context.Context, e *Entry, id string) {
 	}
 }
 
-// tagRecording tags the encoded M4A for e in c, with its cover art when
-// o.Artwork is set. Cover art is never worth losing a recording over: a
-// cover that cannot be downloaded, or is in a format MP4 cannot hold, is a
-// warning and the file is tagged without it.
-func (l *Library) tagRecording(ctx context.Context, c *Collection, e *Entry, data []byte, hash string, o CommitOptions) ([]byte, error) {
+// tagRecording prepares the encoded M4A at path, tagged for e in c, with
+// its cover art when o.Artwork is set. Cover art is never worth losing a
+// recording over: a cover that cannot be downloaded, or is in a format MP4
+// cannot hold, is a warning and the file is tagged without it.
+func (l *Library) tagRecording(ctx context.Context, c *Collection, e *Entry, path, hash string, o CommitOptions) (*mp4tag.Retagged, error) {
 	tags := l.tags(c, e, hash, o.Partial)
 	if o.Artwork && e.ArtworkURL != "" {
 		if cover, err := l.fetchArtwork(ctx, e.ArtworkURL); err != nil {
@@ -213,11 +248,11 @@ func (l *Library) tagRecording(ctx context.Context, c *Collection, e *Entry, dat
 			tags.Cover = cover
 		}
 	}
-	tagged, err := mp4tag.Tag(data, tags)
+	tagged, err := mp4tag.TagFile(path, tags)
 	if errors.Is(err, mp4tag.ErrCoverFormat) {
 		l.warn("no artwork for %s: %v", e.Title, err)
 		tags.Cover = nil
-		tagged, err = mp4tag.Tag(data, tags)
+		tagged, err = mp4tag.TagFile(path, tags)
 	}
 	return tagged, err
 }
@@ -225,26 +260,28 @@ func (l *Library) tagRecording(ctx context.Context, c *Collection, e *Entry, dat
 // stored is what finalize records in an entry once its file is in place.
 type stored struct {
 	status     Status
-	hash       string // SHA-256 of the audio payload
+	hash       string       // SHA-256 of the audio payload
+	codec      mp4tag.Codec // of the file
 	partial    bool
 	copiedFrom string     // library-relative path of a copy's source
 	recordedMS int64      // length of the captured audio
 	recordedAt *time.Time // nil means now
 }
 
-// finalize writes tagged atomically as e's file in c, records s in e, and
-// saves c's manifest and playlist. It returns the entry as stored.
+// finalize streams tagged atomically into place as e's file in c, records
+// s in e, and saves c's manifest and playlist. It returns the entry as
+// stored.
 //
 // A write failure wraps ErrStore and leaves e as it was. A manifest that
 // cannot be saved also wraps ErrStore, but the file is in place by then
 // and the entry is updated in memory: the next run adopts the file by its
 // tags.
-func (l *Library) finalize(c *Collection, e *Entry, tagged []byte, s stored) (Entry, error) {
+func (l *Library) finalize(c *Collection, e *Entry, tagged io.WriterTo, s stored) (Entry, error) {
 	name := c.fileName(e)
-	if err := fileutil.WriteAtomic(filepath.Join(c.Dir, name), tagged, audioPerm); err != nil {
+	if err := fileutil.WriteAtomicFrom(filepath.Join(c.Dir, name), tagged, audioPerm); err != nil {
 		return *e, fmt.Errorf("%w: %s: %w", ErrStore, name, err)
 	}
-	e.File, e.Status, e.Partial, e.AudioSHA256 = name, s.status, s.partial, s.hash
+	e.File, e.Status, e.Partial, e.AudioSHA256, e.Codec = name, s.status, s.partial, s.hash, s.codec
 	e.CopiedFrom, e.RecordedMS, e.RecordedAt = s.copiedFrom, s.recordedMS, s.recordedAt
 	if e.RecordedAt == nil {
 		now := l.opts.Now().UTC().Round(0)
@@ -298,21 +335,21 @@ func (l *Library) encodeFailed(c *Collection, id, wavPath string, cause error) (
 }
 
 // Copy stores the song at src as t's file in c, retagged for c (grouping,
-// album track numbers). The audio, and so its hash, is unchanged. The
-// manifest and playlist are saved before it returns.
+// album track numbers). The audio, and so its hash and codec, is
+// unchanged. The manifest and playlist are saved before it returns.
 func (l *Library) Copy(_ context.Context, c *Collection, t Track, src Location) (Entry, error) {
 	if err := requireID(t); err != nil {
 		return Entry{}, err
 	}
-	data, err := os.ReadFile(filepath.Clean(src.Path))
+	old, err := mp4tag.ReadFile(src.Path)
 	if err != nil {
 		return Entry{}, fmt.Errorf("copy %s: %w", src.Path, err)
 	}
-	old, err := mp4tag.Parse(data)
+	hash, err := mp4tag.HashFile(src.Path)
 	if err != nil {
 		return Entry{}, fmt.Errorf("copy %s: %w", src.Path, err)
 	}
-	hash, err := mp4tag.AudioSHA256(data)
+	codec, err := mp4tag.ReadCodec(src.Path)
 	if err != nil {
 		return Entry{}, fmt.Errorf("copy %s: %w", src.Path, err)
 	}
@@ -325,12 +362,13 @@ func (l *Library) Copy(_ context.Context, c *Collection, t Track, src Location) 
 	}
 	tags := l.tags(c, e, hash, false)
 	tags.Cover = old.Cover
-	tagged, err := mp4tag.Tag(data, tags)
+	tagged, err := mp4tag.TagFile(src.Path, tags)
 	if err != nil {
 		return *e, fmt.Errorf("tag %s: %w", e.Title, err)
 	}
+	defer func() { _ = tagged.Close() }()
 	return l.finalize(c, e, tagged, stored{
-		status: StatusCopied, hash: hash, copiedFrom: l.rel(src.Path),
+		status: StatusCopied, hash: hash, codec: codec, copiedFrom: l.rel(src.Path),
 		recordedMS: src.Entry.RecordedMS, recordedAt: src.Entry.RecordedAt,
 	})
 }

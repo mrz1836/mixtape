@@ -551,13 +551,30 @@ func TestReadFileMoovSizeGuard(t *testing.T) {
 	}
 }
 
-// The tests below run on a real afconvert file and skip where the AAC
-// encoder is unavailable (Linux CI, sandboxes). They check what synthetic
-// files cannot: that real encoder output survives tagging.
+// The tests below run on real afconvert files, AAC and ALAC, and skip
+// where the encoders are unavailable (Linux CI, sandboxes). They check what
+// synthetic files cannot: that real encoder output survives tagging.
+
+// eachRealFile runs fn as a parallel subtest per codec Mixtape encodes
+// to, with a real file.
+func eachRealFile(t *testing.T, fn func(t *testing.T, codec Codec, file []byte)) {
+	t.Helper()
+	for _, name := range []string{"aac", "alac"} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			codec, err := ParseCodec(name)
+			require.NoError(t, err)
+			fn(t, codec, testutil.RealM4A(t, name))
+		})
+	}
+}
 
 func TestRealFileRoundTrip(t *testing.T) {
 	t.Parallel()
-	file := testutil.RealM4A(t)
+	eachRealFile(t, realFileRoundTrip)
+}
+
+func realFileRoundTrip(t *testing.T, _ Codec, file []byte) {
 	orig, err := Parse(file)
 	require.NoError(t, err)
 	require.Contains(t, orig.Freeform, gaplessAtom, "afconvert writes gapless info")
@@ -580,7 +597,10 @@ func TestRealFileRoundTrip(t *testing.T) {
 
 func TestRealFileAudioSHA256StableAcrossTagging(t *testing.T) {
 	t.Parallel()
-	file := testutil.RealM4A(t)
+	eachRealFile(t, realFileHashStable)
+}
+
+func realFileHashStable(t *testing.T, _ Codec, file []byte) {
 	before, err := AudioSHA256(file)
 	require.NoError(t, err)
 	require.Len(t, before, 64)
@@ -603,7 +623,10 @@ func TestRealFileAudioSHA256StableAcrossTagging(t *testing.T) {
 
 func TestRealFileReadFileAndHashFile(t *testing.T) {
 	t.Parallel()
-	file := testutil.RealM4A(t)
+	eachRealFile(t, realFileReadAndHash)
+}
+
+func realFileReadAndHash(t *testing.T, codec Codec, file []byte) {
 	tags := Tags{Title: "T", Artist: "A", Freeform: map[string]string{"SPOTIFY_ID": "id1"}, Cover: testutil.JPEG()}
 	tagged, err := Tag(file, tags)
 	require.NoError(t, err)
@@ -618,4 +641,24 @@ func TestRealFileReadFileAndHashFile(t *testing.T) {
 	hash, err := HashFile(path)
 	require.NoError(t, err)
 	assert.Equal(t, want, hash)
+
+	got2, err := ReadCodec(path)
+	require.NoError(t, err)
+	assert.Equal(t, codec, got2, "the codec reads back from the tagged file")
+}
+
+// TagFile streams a real file to the same bytes Tag returns, and afinfo
+// accepts the result.
+func TestRealFileTagFile(t *testing.T) {
+	t.Parallel()
+	eachRealFile(t, func(t *testing.T, _ Codec, file []byte) {
+		want, err := Tag(file, fullTags())
+		require.NoError(t, err)
+		path := testutil.WriteFile(t, "song.m4a", file)
+		got := tagFileBytes(t, path, fullTags())
+		assert.Equal(t, want, got)
+		out := testutil.WriteFile(t, "tagged.m4a", got)
+		info, err := exec.CommandContext(t.Context(), "afinfo", out).CombinedOutput()
+		require.NoError(t, err, "afinfo rejected the streamed file:\n%s", info)
+	})
 }

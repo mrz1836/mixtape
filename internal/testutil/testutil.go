@@ -22,19 +22,46 @@ const EnvLiveCapture = "MIXTAPE_LIVE_CAPTURE"
 // Ptr returns a pointer to a copy of v.
 func Ptr[T any](v T) *T { return &v }
 
-// RequireAAC skips the test unless afconvert can encode AAC here. The AAC
-// encoder is invisible inside a sandbox, where afconvert reports "aac" as
-// an unknown format; afconvert -hf exits non-zero even on success, so only
-// its listing counts.
-func RequireAAC(t testing.TB) {
+// RequireEncoder skips the test unless afconvert can write codec ("aac"
+// or "alac") into an M4A file here. The encoders are invisible inside a
+// sandbox, where afconvert lists no data formats for M4A files at all;
+// afconvert -hf exits non-zero even on success, so only its listing
+// counts.
+func RequireEncoder(t testing.TB, codec string) {
 	t.Helper()
 	if _, err := exec.LookPath("afconvert"); err != nil {
 		t.Skip("afconvert not available (macOS only)")
 	}
 	out, _ := exec.CommandContext(t.Context(), "afconvert", "-hf").CombinedOutput()
-	if !strings.Contains(string(out), "'aac '") {
-		t.Skip("afconvert cannot encode AAC here (sandboxed?)")
+	if !strings.Contains(m4afFormats(string(out)), "'"+fourCC(codec)+"'") {
+		t.Skipf("afconvert cannot encode %s here (sandboxed?)", codec)
 	}
+}
+
+// fourCC is the afconvert data format of a codec name.
+func fourCC(codec string) string {
+	if codec == "aac" {
+		return "aac "
+	}
+	return codec
+}
+
+// m4afFormats is the data-format listing of the M4A file type in
+// afconvert -hf output: the lines from its "'m4af' =" line up to the
+// next file type.
+func m4afFormats(help string) string {
+	var b strings.Builder
+	in := false
+	for line := range strings.Lines(help) {
+		if strings.Contains(line, "' = ") {
+			in = strings.Contains(line, "'m4af' = ")
+			continue
+		}
+		if in {
+			b.WriteString(line)
+		}
+	}
+	return b.String()
 }
 
 // RequireLive skips the test unless live capture tests were asked for

@@ -42,6 +42,12 @@ type Event struct {
 	Capture string `json:"capture,omitempty"`
 	Library string `json:"library,omitempty"`
 	PID     int    `json:"pid,omitempty"`
+	// Codec, BitDepth and SampleRate describe what the session records:
+	// the codec it encodes to, and the capture's depth and rate (absent
+	// when nothing plays).
+	Codec      string `json:"codec,omitempty"`
+	BitDepth   int    `json:"bit_depth,omitempty"`
+	SampleRate int    `json:"sample_rate,omitempty"`
 
 	// plan
 	Items []PlanItem `json:"items,omitempty"`
@@ -75,6 +81,7 @@ type EventTrack struct {
 	File        string `json:"file,omitempty"`
 	RecordedMS  int64  `json:"recorded_ms,omitempty"`
 	AudioSHA256 string `json:"audio_sha256,omitempty"`
+	Codec       string `json:"codec,omitempty"`
 	CopiedFrom  string `json:"copied_from,omitempty"`
 	Attempt     int    `json:"attempt,omitempty"`
 	Partial     bool   `json:"partial,omitempty"`
@@ -91,6 +98,7 @@ type PlanItem struct {
 	DurationMS int64  `json:"duration_ms,omitempty"`
 	From       string `json:"from,omitempty"`
 	Hint       string `json:"hint,omitempty"`
+	Reason     string `json:"reason,omitempty"` // other_codec: in the library, but not in the codec this session records
 }
 
 // itemTrack describes a planned song for events.

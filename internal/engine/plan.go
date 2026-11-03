@@ -3,6 +3,7 @@ package engine
 import (
 	"fmt"
 	"os"
+	"slices"
 
 	"github.com/mrz1836/mixtape/internal/library"
 	"github.com/mrz1836/mixtape/internal/spotify"
@@ -29,6 +30,11 @@ const (
 // HintUnavailable marks a song the catalog says cannot play here. It is
 // only a hint: playback is still attempted.
 const HintUnavailable = "unavailable"
+
+// ReasonOtherCodec explains a song recorded although the library holds it
+// elsewhere: in another codec than this session records, which the copy
+// policy (copy_codec same) does not copy.
+const ReasonOtherCodec = "other_codec"
 
 // Session modes.
 const (
@@ -69,6 +75,9 @@ type Item struct {
 	From   *library.Location // copy source in the library
 	Twin   *Item             // an earlier item recording the same song; copy from it
 	Hint   string
+	// Reason explains the action when it is not the obvious one: why a song
+	// the library holds is recorded anyway (ReasonOtherCodec).
+	Reason string
 
 	state       itemState
 	attempts    int
@@ -128,7 +137,7 @@ func BuildPlan(lib *library.Library, cols []spotify.Collection, o PlanOptions) *
 			if !ct.Playable && g.Spotify.Source == spotify.SourceEmbed {
 				it.Hint = HintUnavailable
 			}
-			it.Action, it.From, it.Twin = decide(lib, g, ct.ID, seen[ct.ID], o.Redo)
+			it.Action, it.From, it.Twin, it.Reason = decide(lib, g, ct.ID, seen[ct.ID], o.Redo)
 			if it.Action == ActionRecord {
 				seen[ct.ID] = it
 			}
@@ -185,28 +194,48 @@ func groupFor(col spotify.Collection, o PlanOptions, singles **Group) *Group {
 	return nil
 }
 
-// decide picks the action for one song.
-func decide(lib *library.Library, g *Group, id string, twin *Item, redo bool) (Action, *library.Location, *Item) {
+// decide picks the action for one song, and the reason for an action that
+// needs one. A song already done in this folder is skipped whatever its
+// codec: a codec change records new songs, it never redoes old ones
+// (--redo does).
+func decide(lib *library.Library, g *Group, id string, twin *Item, redo bool) (Action, *library.Location, *Item, string) {
 	if twin != nil {
-		return ActionCopy, nil, twin
+		return ActionCopy, nil, twin, ""
 	}
 	if redo {
-		return ActionRecord, nil, nil
+		return ActionRecord, nil, nil, ""
 	}
 	if c := g.Collection; c != nil {
 		if c.Done(id) {
-			return ActionSkip, nil, nil
+			return ActionSkip, nil, nil, ""
 		}
 		if e := c.Entry(id); e != nil && e.Status == library.StatusEncodeFailed && fileExists(e.PendingWAV) {
-			return ActionEncode, nil, nil
+			return ActionEncode, nil, nil, ""
 		}
 	}
-	for _, loc := range lib.Find(id) {
-		if g.Collection == nil || loc.Collection.Dir != g.Collection.Dir {
-			return ActionCopy, &loc, nil
+	from, other := copySource(lib, g.Collection, id)
+	if from != nil {
+		return ActionCopy, from, nil, ""
+	}
+	reason := ""
+	if other {
+		reason = ReasonOtherCodec
+	}
+	return ActionRecord, nil, nil, reason
+}
+
+// copySource finds a copy of song id outside folder c (nil: a folder not
+// created yet) that the library's copy policy allows. other reports a copy
+// it left out for its codec.
+func copySource(lib *library.Library, c *library.Collection, id string) (from *library.Location, other bool) {
+	elsewhere := func(loc library.Location) bool { return c == nil || loc.Collection.Dir != c.Dir }
+	copyable, otherCodec := lib.FindCopy(id)
+	for _, loc := range copyable {
+		if elsewhere(loc) {
+			return &loc, false
 		}
 	}
-	return ActionRecord, nil, nil
+	return nil, slices.ContainsFunc(otherCodec, elsewhere)
 }
 
 // trackFrom builds the library metadata known before recording.
@@ -261,6 +290,7 @@ func (p *Plan) Summary() []PlanItem {
 		pi := PlanItem{
 			Action: string(it.Action), ID: it.Track.ID, Title: it.Track.Title, Artist: it.Track.Artist,
 			Collection: it.Group.Spec.Name, Position: it.position(), DurationMS: it.Track.DurationMS, Hint: it.Hint,
+			Reason: it.Reason,
 		}
 		switch {
 		case it.From != nil:

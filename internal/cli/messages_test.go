@@ -48,7 +48,7 @@ func TestUserFacingMessages(t *testing.T) {
 		},
 		"an unknown setting": {
 			args: []string{"config", "set", "volume", "11"}, exit: ExitUsage,
-			message:     `unknown config key "volume" (known: library, capture, device, artwork, idle_timeout, max_failures)`,
+			message:     `unknown config key "volume" (known: library, capture, device, artwork, idle_timeout, max_failures, codec, aac_bitrate, bit_depth, copy_codec, output_rate)`,
 			hintContain: "mixtape config show",
 		},
 		"a bad setting": {

@@ -130,6 +130,7 @@ func (r *reconciler) adopt(i int, name string, tags mp4tag.Tags) bool {
 		e.PlayedID = played // the relink the lost manifest write held
 	}
 	e.Status, e.File, e.AudioSHA256 = StatusRecorded, name, hash
+	e.Codec, _ = mp4tag.ReadCodec(filepath.Join(c.Dir, name)) // a file whose codec cannot be read keeps none
 	e.Partial = tags.Freeform[TagPartial] == "1"
 	e.FailReason, e.PendingWAV = "", ""
 	r.referenced[strings.ToLower(name)] = true

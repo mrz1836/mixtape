@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/mrz1836/mixtape/internal/fileutil"
+	"github.com/mrz1836/mixtape/internal/mp4tag"
 )
 
 // Freeform tag names Mixtape writes into every file, so a file identifies
@@ -26,7 +27,7 @@ const (
 	// TagRequestedID is the collection's track ID, written only when
 	// Spotify played a relinked track under another ID.
 	TagRequestedID = "SPOTIFY_REQUESTED_ID"
-	// TagAudioSHA256 is the SHA-256 of the AAC audio payload.
+	// TagAudioSHA256 is the SHA-256 of the encoded audio payload.
 	TagAudioSHA256 = "MIXTAPE_AUDIO_SHA256"
 	// TagPartial is "1" on a song kept with --keep-partial.
 	TagPartial = "MIXTAPE_PARTIAL"
@@ -49,8 +50,14 @@ var (
 
 // Options configures a Library.
 type Options struct {
-	// Encoder turns a WAV into an M4A; nil means AFConvert{}.
+	// Encoder turns a WAV into an M4A; nil means AFConvert{Codec: Codec}.
 	Encoder Encoder
+	// Codec is what new recordings are encoded to ("" means AAC). FindCopy
+	// compares songs found elsewhere against it.
+	Codec mp4tag.Codec
+	// CopyPolicy says which songs FindCopy offers for copying; "" means
+	// CopyAny.
+	CopyPolicy CopyPolicy
 	// WorkDir holds encoder scratch files; WAVs that failed to encode are
 	// kept in WorkDir/failed. Empty means a folder in os.TempDir().
 	WorkDir string
@@ -87,7 +94,7 @@ func Open(root string, o Options) (*Library, error) {
 		return nil, fmt.Errorf("create library: %w", err)
 	}
 	if o.Encoder == nil {
-		o.Encoder = AFConvert{}
+		o.Encoder = AFConvert{Codec: o.Codec}
 	}
 	if o.WorkDir == "" {
 		o.WorkDir = filepath.Join(os.TempDir(), "mixtape-work")
@@ -302,6 +309,36 @@ func (l *Library) Find(id string) []Location {
 		return nil
 	}
 	return l.locate(func(e *Entry) bool { return e.RequestedID == id || e.PlayedID == id })
+}
+
+// FindCopy returns the songs Find returns for id that may be copied under
+// the library's copy policy, and the ones left out: with CopySame only a
+// file in the codec new recordings use is copied, so a song recorded in
+// another codec is recorded again. The codec is read from each file (the
+// manifest only caches it), so a plan, a lookup during a session, a dry
+// run and `list` all decide alike.
+func (l *Library) FindCopy(id string) (copyable, otherCodec []Location) {
+	for _, loc := range l.Find(id) {
+		if l.copyable(loc) {
+			copyable = append(copyable, loc)
+		} else {
+			otherCodec = append(otherCodec, loc)
+		}
+	}
+	return copyable, otherCodec
+}
+
+// copyable reports whether the policy lets loc be copied.
+func (l *Library) copyable(loc Location) bool {
+	if l.opts.CopyPolicy != CopySame {
+		return true
+	}
+	want := l.opts.Codec
+	if want == "" {
+		want = mp4tag.CodecAAC
+	}
+	got, err := mp4tag.ReadCodec(loc.Path)
+	return err == nil && got == want
 }
 
 // FindHash returns every complete song whose audio hash is sha.

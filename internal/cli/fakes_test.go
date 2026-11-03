@@ -14,6 +14,7 @@ import (
 
 	"github.com/mrz1836/mixtape/internal/capture"
 	"github.com/mrz1836/mixtape/internal/capture/device"
+	"github.com/mrz1836/mixtape/internal/library"
 	"github.com/mrz1836/mixtape/internal/permission"
 	"github.com/mrz1836/mixtape/internal/spotify"
 	"github.com/mrz1836/mixtape/internal/testutil"
@@ -134,6 +135,10 @@ type fakeWorld struct {
 	perms      map[permission.Kind]permission.State
 	grantAfter map[permission.Kind]int
 	scripts    []string
+	// encoders are the afconvert stand-ins made so far, and encodedAs
+	// the encoder each one stood in for.
+	encoders  []*testutil.Encoder
+	encodedAs []library.AFConvert
 }
 
 func (w *fakeWorld) permission(k permission.Kind) permission.State {
@@ -170,6 +175,18 @@ func newFakeWorld(t *testing.T) *fakeWorld {
 	}
 }
 
+// encoder is the stand-in for afconvert: a testutil.Encoder in the codec
+// the settings ask for. Every one made is kept, so tests can see what was
+// encoded.
+func (w *fakeWorld) encoder(a library.AFConvert) library.Encoder {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	enc := &testutil.Encoder{Codec: string(a.Codec)}
+	w.encoders = append(w.encoders, enc)
+	w.encodedAs = append(w.encodedAs, a)
+	return enc
+}
+
 // services wires the fake world into the CLI.
 func (w *fakeWorld) services(h *harness) services {
 	return services{
@@ -187,9 +204,12 @@ func (w *fakeWorld) services(h *harness) services {
 		lockPath:       func() (string, error) { return w.lockPath, nil },
 		executable:     os.Executable,
 		lookPath:       func(string) (string, error) { return "/usr/bin/afconvert", nil },
-		encoder:        &testutil.Encoder{},
-		signals:        func() (<-chan os.Signal, func()) { return make(chan os.Signal), func() {} },
-		spawn:          func(string, []string, []string, string) (*os.Process, error) { return nil, os.ErrInvalid },
+		encoder:        w.encoder,
+		afconvertHelp: func(context.Context) string {
+			return "    'm4af' = Apple MPEG-4 Audio (.m4a, .m4r)\n               data_formats: 'aac ' 'alac' \n"
+		},
+		signals: func() (<-chan os.Signal, func()) { return make(chan os.Signal), func() {} },
+		spawn:   func(string, []string, []string, string) (*os.Process, error) { return nil, os.ErrInvalid },
 		keepAwake: func() func() {
 			w.mu.Lock()
 			w.awake++

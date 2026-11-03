@@ -451,6 +451,9 @@ func (e *Engine) beginLive(ctx context.Context, t *take, s spotify.Snapshot) {
 // way Spotify moves on. Otherwise recording continues.
 func (e *Engine) onLookup(ctx context.Context, r result) {
 	it := r.item
+	if r.otherCodec && !r.inFolder && r.from == nil {
+		it.Reason = ReasonOtherCodec
+	}
 	if it.state != itemPending || (!r.inFolder && r.from == nil) {
 		return
 	}

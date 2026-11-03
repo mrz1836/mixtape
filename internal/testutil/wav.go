@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -63,13 +64,29 @@ func SineWAV(t testing.TB, freq float64) string {
 }
 
 // Encoder stands in for afconvert: it writes a synthetic M4A (see [M4A])
-// whose audio payload is the SHA-256 of the WAV, so different recordings
-// hash differently and the same recording hashes the same. It satisfies
-// library.Encoder and is safe for concurrent use.
+// whose sound track declares Codec and whose audio payload is the SHA-256
+// of the codec and the WAV, so different recordings hash differently, the
+// same recording hashes the same, and the same recording in two codecs
+// does not. It records every call, satisfies library.Encoder, and is safe
+// for concurrent use.
 type Encoder struct {
-	mu   sync.Mutex
-	err  error
-	runs int
+	// Codec is what the stand-in encodes to: "aac" (the zero value, as
+	// with afconvert) or "alac".
+	Codec string
+
+	mu    sync.Mutex
+	err   error
+	calls []EncodeCall
+}
+
+// EncodeCall is one Encode the stand-in was asked for: the WAV and what
+// its header says.
+type EncodeCall struct {
+	WAV      string
+	Codec    string
+	Rate     int
+	Channels int
+	Bits     int
 }
 
 // Fail makes every later Encode return err (nil: succeed again).
@@ -83,38 +100,59 @@ func (e *Encoder) Fail(err error) {
 func (e *Encoder) Runs() int {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	return e.runs
+	return len(e.calls)
+}
+
+// Calls returns every Encode so far, in order.
+func (e *Encoder) Calls() []EncodeCall {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return slices.Clone(e.calls)
+}
+
+// codec is the codec the stand-in writes.
+func (e *Encoder) codec() string {
+	if e.Codec == "" {
+		return "aac"
+	}
+	return e.Codec
 }
 
 // Encode implements library.Encoder.
 func (e *Encoder) Encode(_ context.Context, wavPath, m4aPath string) error {
+	data, readErr := os.ReadFile(filepath.Clean(wavPath))
+	call := EncodeCall{WAV: wavPath, Codec: e.codec()}
+	if len(data) >= wav.HeaderSize {
+		le := binary.LittleEndian
+		call.Channels, call.Rate, call.Bits = int(le.Uint16(data[22:24])), int(le.Uint32(data[24:28])), int(le.Uint16(data[34:36]))
+	}
 	e.mu.Lock()
-	e.runs++
+	e.calls = append(e.calls, call)
 	err := e.err
 	e.mu.Unlock()
 	if err != nil {
 		return err
 	}
-	data, err := os.ReadFile(filepath.Clean(wavPath))
-	if err != nil {
-		return err
+	if readErr != nil {
+		return readErr
 	}
-	sum := sha256.Sum256(data)
-	return os.WriteFile(m4aPath, M4A(M4AOptions{Audio: sum[:]}), 0o600)
+	sum := sha256.Sum256(append([]byte(call.Codec+"\x00"), data...))
+	return os.WriteFile(m4aPath, M4A(M4AOptions{Audio: sum[:], Codec: call.Codec}), 0o600)
 }
 
-// RealM4A encodes a short silent WAV with afconvert, the way the app does,
-// and returns the M4A. It skips the test where AAC cannot be encoded.
-func RealM4A(t testing.TB) []byte {
+// RealM4A encodes a short WAV with afconvert to codec ("aac" or "alac"),
+// the way the app does, and returns the M4A. It skips the test where
+// afconvert cannot encode it.
+func RealM4A(t testing.TB, codec string) []byte {
 	t.Helper()
-	RequireAAC(t)
-	data, err := WAV(make([]byte, 44100), 44100, 2) // ~0.125 s of silence
+	RequireEncoder(t, codec)
+	data, err := WAV(Sine(440, 44100, 125*time.Millisecond), 44100, 2)
 	if err != nil {
 		t.Fatalf("build WAV: %v", err)
 	}
 	wavPath := WriteFile(t, "in.wav", data)
 	m4a := filepath.Join(filepath.Dir(wavPath), "in.m4a")
-	cmd := exec.CommandContext(t.Context(), "afconvert", wavPath, m4a, "-f", "m4af", "-d", "aac") //nolint:gosec // G204: fixed tool; the paths are the test's own temp files
+	cmd := exec.CommandContext(t.Context(), "afconvert", wavPath, m4a, "-f", "m4af", "-d", codec) //nolint:gosec // G204: fixed tool; the paths are the test's own temp files
 	if out, runErr := cmd.CombinedOutput(); runErr != nil {
 		t.Fatalf("afconvert: %v: %s", runErr, out)
 	}

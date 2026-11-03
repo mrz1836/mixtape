@@ -49,10 +49,11 @@ type job struct {
 type result struct {
 	job
 
-	entry    library.Entry
-	loc      *library.Location
-	inFolder bool
-	err      error
+	entry      library.Entry
+	loc        *library.Location
+	inFolder   bool
+	otherCodec bool // a lookup found the song only in another codec
+	err        error
 }
 
 // jobQueue is the worker's unbounded queue. Submitting never blocks: the
@@ -162,12 +163,7 @@ func (e *Engine) runJob(ctx context.Context, j job) result {
 	case jobLookup:
 		c.Ensure(j.track)
 		r.inFolder = c.Done(j.track.ID)
-		for _, loc := range lib.Find(j.track.ID) {
-			if loc.Collection.Dir != c.Dir {
-				r.from = &loc
-				break
-			}
-		}
+		r.from, r.otherCodec = copySource(lib, c, j.track.ID)
 		if !r.inFolder && r.from == nil {
 			r.err = lib.Save(c) // the new pending entry
 		}
@@ -288,7 +284,7 @@ func (e *Engine) entryEvent(it *Item, en library.Entry) *EventTrack {
 		ev.Title, ev.Artist = en.Title, en.Artist
 	}
 	ev.File = filepath.Join(it.Group.Collection.Folder(), en.File)
-	ev.RecordedMS, ev.AudioSHA256 = en.RecordedMS, en.AudioSHA256
+	ev.RecordedMS, ev.AudioSHA256, ev.Codec = en.RecordedMS, en.AudioSHA256, string(en.Codec)
 	return ev
 }
 

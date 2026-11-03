@@ -4,13 +4,18 @@
 //
 // Identity is the Spotify track ID, both the requested one and the one
 // actually played (Spotify relinks tracks between releases). Every file
-// also carries the SHA-256 of its AAC audio payload, which tagging never
-// changes, so files describe themselves even when moved or renamed.
+// also carries the SHA-256 of its encoded audio payload (ALAC or AAC),
+// which tagging never changes, so files describe themselves even when
+// moved or renamed.
 package library
 
 import (
 	"errors"
+	"fmt"
+	"strings"
 	"time"
+
+	"github.com/mrz1836/mixtape/internal/mp4tag"
 )
 
 // Schema is the manifest schema version this package writes.
@@ -29,6 +34,32 @@ const (
 	KindSingles  Kind = "singles" // individual tracks and live-mode recordings
 	KindFolder   Kind = "folder"  // a user-named folder (--into)
 )
+
+// CopyPolicy decides which songs found elsewhere in the library may be
+// copied instead of recorded.
+type CopyPolicy string
+
+// Copy policies. The zero value copies any, as Mixtape did before it
+// recorded more than one codec.
+const (
+	// CopySame copies only a file in the codec new recordings use; a song
+	// that exists only in another codec is recorded again.
+	CopySame CopyPolicy = "same"
+	// CopyAny copies a file in any codec.
+	CopyAny CopyPolicy = "any"
+)
+
+// ErrCopyPolicy reports a copy policy other than same or any.
+var ErrCopyPolicy = errors.New("unknown copy policy")
+
+// ParseCopyPolicy parses a copy policy name, case-insensitively.
+func ParseCopyPolicy(s string) (CopyPolicy, error) {
+	switch p := CopyPolicy(strings.ToLower(strings.TrimSpace(s))); p {
+	case CopySame, CopyAny:
+		return p, nil
+	}
+	return "", fmt.Errorf("%w %q (want same or any)", ErrCopyPolicy, s)
+}
 
 // Status is the state of one track in a manifest.
 type Status string
@@ -74,28 +105,29 @@ type Track struct {
 
 // Entry is one track in a manifest.
 type Entry struct {
-	Position    int        `json:"position"`
-	RequestedID string     `json:"requested_id"`
-	PlayedID    string     `json:"played_id,omitempty"`
-	Title       string     `json:"title"`
-	Artist      string     `json:"artist"`
-	Album       string     `json:"album,omitempty"`
-	AlbumArtist string     `json:"album_artist,omitempty"`
-	DurationMS  int64      `json:"duration_ms,omitempty"`
-	Status      Status     `json:"status"`
-	File        string     `json:"file,omitempty"`
-	RecordedMS  int64      `json:"recorded_ms,omitempty"`
-	AudioSHA256 string     `json:"audio_sha256,omitempty"`
-	RecordedAt  *time.Time `json:"recorded_at,omitempty"`
-	CopiedFrom  string     `json:"copied_from,omitempty"`
-	ArtworkURL  string     `json:"artwork_url,omitempty"`
-	TrackNumber int        `json:"track_number,omitempty"`
-	DiscNumber  int        `json:"disc_number,omitempty"`
-	Popularity  int        `json:"popularity,omitempty"`
-	ReleaseDate string     `json:"release_date,omitempty"`
-	Partial     bool       `json:"partial,omitempty"`
-	FailReason  string     `json:"fail_reason,omitempty"`
-	PendingWAV  string     `json:"pending_wav,omitempty"`
+	Position    int          `json:"position"`
+	RequestedID string       `json:"requested_id"`
+	PlayedID    string       `json:"played_id,omitempty"`
+	Title       string       `json:"title"`
+	Artist      string       `json:"artist"`
+	Album       string       `json:"album,omitempty"`
+	AlbumArtist string       `json:"album_artist,omitempty"`
+	DurationMS  int64        `json:"duration_ms,omitempty"`
+	Status      Status       `json:"status"`
+	File        string       `json:"file,omitempty"`
+	RecordedMS  int64        `json:"recorded_ms,omitempty"`
+	AudioSHA256 string       `json:"audio_sha256,omitempty"`
+	Codec       mp4tag.Codec `json:"codec,omitempty"` // cached from the file, which FindCopy reads; none before ALAC
+	RecordedAt  *time.Time   `json:"recorded_at,omitempty"`
+	CopiedFrom  string       `json:"copied_from,omitempty"`
+	ArtworkURL  string       `json:"artwork_url,omitempty"`
+	TrackNumber int          `json:"track_number,omitempty"`
+	DiscNumber  int          `json:"disc_number,omitempty"`
+	Popularity  int          `json:"popularity,omitempty"`
+	ReleaseDate string       `json:"release_date,omitempty"`
+	Partial     bool         `json:"partial,omitempty"`
+	FailReason  string       `json:"fail_reason,omitempty"`
+	PendingWAV  string       `json:"pending_wav,omitempty"`
 }
 
 // Manifest is the mixtape.json document of one collection folder.

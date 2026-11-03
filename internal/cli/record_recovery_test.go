@@ -17,7 +17,6 @@ import (
 	"github.com/mrz1836/mixtape/internal/library"
 	"github.com/mrz1836/mixtape/internal/session"
 	"github.com/mrz1836/mixtape/internal/spotify"
-	"github.com/mrz1836/mixtape/internal/testutil"
 )
 
 // interruptedWithShuffleAndRepeat leaves session.json as a session killed
@@ -212,7 +211,7 @@ func TestRecordWaitsForNoOtherLibraryWriter(t *testing.T) {
 	t.Parallel()
 	h := newHarness(t)
 	h.copyOnlyRun()
-	lib, err := library.Open(h.env["MIXTAPE_LIBRARY"], library.Options{Encoder: &testutil.Encoder{}, WorkDir: t.TempDir()})
+	lib, err := library.Open(h.env["MIXTAPE_LIBRARY"], library.Options{Encoder: seedEncoder(), WorkDir: t.TempDir()})
 	require.NoError(t, err)
 	unlock, err := lib.Lock()
 	require.NoError(t, err)

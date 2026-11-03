@@ -28,14 +28,17 @@ var errFakeEncode = errors.New("fake encoder failure")
 
 // fixture is a library in a temp dir with captured warnings.
 type fixture struct {
-	t     *testing.T
-	lib   *Library
-	enc   Encoder // every Open of the fixture encodes with it
-	root  string
-	work  string
-	now   time.Time
-	mu    sync.Mutex
-	warns []string
+	t   *testing.T
+	lib *Library
+	enc Encoder // every Open of the fixture encodes with it
+	// codec and policy are the Options.Codec and CopyPolicy of every Open.
+	codec  mp4tag.Codec
+	policy CopyPolicy
+	root   string
+	work   string
+	now    time.Time
+	mu     sync.Mutex
+	warns  []string
 }
 
 // newFixture opens a library in a temp dir that encodes with enc. Unlike
@@ -52,13 +55,34 @@ func newFixture(t *testing.T, enc Encoder) *fixture {
 	return f
 }
 
+// newCodecFixture opens a library that records codec with a testutil.Encoder
+// and copies under policy.
+func newCodecFixture(t *testing.T, codec mp4tag.Codec, policy CopyPolicy) *fixture {
+	t.Helper()
+	f := newFixture(t, &testutil.Encoder{Codec: string(codec)})
+	f.codec, f.policy = codec, policy
+	f.lib = f.open()
+	return f
+}
+
+// as opens the library again as a run that records codec under policy
+// would: a codec change between two runs.
+func (f *fixture) as(codec mp4tag.Codec, policy CopyPolicy) *Library {
+	f.t.Helper()
+	f.enc, f.codec, f.policy = &testutil.Encoder{Codec: string(codec)}, codec, policy
+	f.lib = f.open()
+	return f.lib
+}
+
 // open opens the library again, as the next run of mixtape would.
 func (f *fixture) open() *Library {
 	f.t.Helper()
 	lib, err := Open(f.root, Options{
-		Encoder: f.enc,
-		WorkDir: f.work,
-		Now:     func() time.Time { return f.now },
+		Encoder:    f.enc,
+		Codec:      f.codec,
+		CopyPolicy: f.policy,
+		WorkDir:    f.work,
+		Now:        func() time.Time { return f.now },
 		Warn: func(msg string) {
 			f.mu.Lock()
 			f.warns = append(f.warns, msg)

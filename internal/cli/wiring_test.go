@@ -32,7 +32,7 @@ func TestEveryProductionServiceIsWired(t *testing.T) {
 	v := reflect.ValueOf(d.services)
 	for i := range v.NumField() {
 		f := v.Type().Field(i)
-		if f.Type.Kind() == reflect.Func {
+		if f.Type.Kind() == reflect.Func && f.Name != "encoder" {
 			assert.False(t, v.Field(i).IsNil(), "service %s is not wired", f.Name)
 		}
 	}

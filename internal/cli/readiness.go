@@ -1,8 +1,12 @@
 package cli
 
 import (
+	"context"
 	"fmt"
+	"strings"
 
+	"github.com/mrz1836/mixtape/internal/config"
+	"github.com/mrz1836/mixtape/internal/mp4tag"
 	"github.com/mrz1836/mixtape/internal/permission"
 	"github.com/mrz1836/mixtape/internal/spotify"
 )
@@ -27,6 +31,8 @@ const (
 	checkIDDevice         = "device"
 	checkIDRouting        = "routing"
 	checkIDAfconvert      = "afconvert"
+	checkIDEncoder        = "encoder"
+	checkIDOutput         = "output"
 	checkIDLibrary        = "library"
 	checkIDSession        = "session"
 )
@@ -36,11 +42,13 @@ const (
 	fixInstallSpotify = "install Spotify from https://www.spotify.com/download"
 	fixOpenSpotify    = "open Spotify (open -a Spotify)"
 	fixAfconvert      = "afconvert ships with macOS; check /usr/bin/afconvert"
-	fixCrossfade      = `Spotify → Settings → Playback → turn off "Crossfade songs"`
-	fixAutomix        = `Spotify → Settings → Playback → turn off "Automix"`
-	fixInstallDevice  = "brew install blackhole-2ch, then 'mixtape setup'"
-	fixRouting        = "create a Multi-Output Device (speakers + BlackHole) in Audio MIDI Setup and select it as the output"
-	fixVolume         = "set Spotify's volume slider to the maximum (the Mac's own volume does not matter)"
+	fixEncoder        = "run mixtape from a normal terminal session (a sandbox hides the encoders); " +
+		"a song that fails to encode keeps its WAV and is encoded on the next run"
+	fixCrossfade     = `Spotify → Settings → Playback → turn off "Crossfade songs"`
+	fixAutomix       = `Spotify → Settings → Playback → turn off "Automix"`
+	fixInstallDevice = "brew install blackhole-2ch, then 'mixtape setup'"
+	fixRouting       = "create a Multi-Output Device (speakers + BlackHole) in Audio MIDI Setup and select it as the output"
+	fixVolume        = "set Spotify's volume slider to the maximum (the Mac's own volume does not matter)"
 )
 
 // spotifyProcess is what a look at the process list found.
@@ -63,6 +71,59 @@ func (a *app) spotifyStatus() (spotifyProcess, error) {
 		return spotifyRunning, nil
 	}
 	return spotifyStopped, nil
+}
+
+// afconvertCodecs lists the codecs afconvert can write into M4A files,
+// from its -hf listing: the data formats under the 'm4af' file type.
+// Inside a sandbox the encoders are hidden and the list is empty.
+func afconvertCodecs(help string) map[mp4tag.Codec]bool {
+	out := map[mp4tag.Codec]bool{}
+	in := false
+	for line := range strings.Lines(help) {
+		if strings.Contains(line, "' = ") {
+			in = strings.Contains(line, "'m4af' = ")
+			continue
+		}
+		if !in {
+			continue
+		}
+		if strings.Contains(line, "'alac'") {
+			out[mp4tag.CodecALAC] = true
+		}
+		if strings.Contains(line, "'aac '") {
+			out[mp4tag.CodecAAC] = true
+		}
+	}
+	return out
+}
+
+// encoderCheck reports whether afconvert lists the encoder for the codec
+// the settings record. A missing one is a warning, not a failure: the
+// listing is a hint (a sandbox empties it), and a song that cannot be
+// encoded keeps its WAV for the next run.
+func (a *app) encoderCheck(ctx context.Context, s config.Settings) check {
+	c := check{ID: checkIDEncoder, Name: "Encoder", Status: checkOK, Detail: encoderDetail(s)}
+	svc := a.deps.services
+	if svc.encoder != nil {
+		return c // a stand-in encodes whatever it is asked
+	}
+	if !a.afconvertFound() {
+		c.Status, c.Detail = checkSkip, "checked once afconvert is found"
+		return c
+	}
+	if !afconvertCodecs(svc.afconvertHelp(ctx))[s.Codec] {
+		c.Status, c.Fix = checkWarn, fixEncoder
+		c.Detail = "afconvert does not list the " + codecLabel(string(s.Codec)) + " encoder here"
+	}
+	return c
+}
+
+// encoderDetail describes what the settings record.
+func encoderDetail(s config.Settings) string {
+	if s.Codec.Lossless() {
+		return fmt.Sprintf("ALAC, lossless (%d-bit capture)", s.Bits())
+	}
+	return fmt.Sprintf("AAC at %d kb/s (%d-bit capture)", s.AACBitrate, s.Bits())
 }
 
 // afconvertFound reports whether songs can be encoded: afconvert is on the

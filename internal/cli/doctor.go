@@ -49,8 +49,9 @@ func newDoctorCmd(a *app) *cobra.Command {
 		Long: `Check every prerequisite for recording and say how to fix what is missing:
 macOS version, the Spotify app (installed, running, Automation permission),
 crossfade and automix (must be off), volume, the capture method (process
-tap, or BlackHole with the output routed through it), afconvert, the library
-folder, the config file, and any running or interrupted session.
+tap, or BlackHole with the output routed through it), afconvert and the
+encoder for the configured codec, the library folder, the config file, and
+any running or interrupted session.
 
 Exits 0 when ready and 3 when a check fails. Warnings do not block.`,
 		Example: `  mixtape doctor
@@ -89,6 +90,7 @@ func (a *app) diagnose(ctx context.Context) doctorDoc {
 			ID: checkIDAfconvert, Name: "afconvert", Status: checkFail, Detail: "not found", Fix: fixAfconvert,
 		})
 	}
+	checks = append(checks, a.encoderCheck(ctx, settings))
 	checks = append(checks, checkLibrary(settings.Library), a.checkSession())
 	return doctorDoc{Ready: failed(checks) == 0, Capture: string(method), Checks: checks}
 }

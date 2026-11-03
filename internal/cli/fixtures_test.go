@@ -9,7 +9,6 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/mrz1836/mixtape/internal/library"
-	"github.com/mrz1836/mixtape/internal/testutil"
 )
 
 // playlistSpec is the library collection of the test playlist (plID).
@@ -42,7 +41,7 @@ func (h *harness) warnings() []string {
 func (h *harness) editLibrary(spec library.Spec, edit func(c *library.Collection)) {
 	h.t.Helper()
 	t := h.t
-	lib, err := library.Open(h.env["MIXTAPE_LIBRARY"], library.Options{Encoder: &testutil.Encoder{}, WorkDir: t.TempDir()})
+	lib, err := library.Open(h.env["MIXTAPE_LIBRARY"], library.Options{Encoder: seedEncoder(), WorkDir: t.TempDir()})
 	require.NoError(t, err)
 	unlock, err := lib.Lock()
 	require.NoError(t, err)

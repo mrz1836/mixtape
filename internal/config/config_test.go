@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -10,6 +11,8 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/mrz1836/mixtape/internal/capture"
+	"github.com/mrz1836/mixtape/internal/library"
+	"github.com/mrz1836/mixtape/internal/mp4tag"
 	"github.com/mrz1836/mixtape/internal/testutil"
 )
 
@@ -233,6 +236,175 @@ func TestLoadNamesTheKeyOfAWrongType(t *testing.T) {
 	_, _, err := Load(path)
 	require.ErrorIs(t, err, ErrDecode)
 	assert.Contains(t, err.Error(), "artwork")
+}
+
+func TestLosslessDefaults(t *testing.T) {
+	t.Parallel()
+	s, err := Resolve(File{}, env(nil), Overrides{}, testHome)
+	require.NoError(t, err)
+	assert.Equal(t, mp4tag.CodecALAC, s.Codec)
+	assert.Equal(t, 256, s.AACBitrate)
+	assert.Zero(t, s.BitDepth, "auto")
+	assert.Equal(t, 24, s.Bits(), "auto records ALAC at 24 bits")
+	assert.Equal(t, library.CopySame, s.CopyCodec)
+	assert.Zero(t, s.OutputRate, "keep")
+	for key, want := range map[string]string{
+		KeyCodec: "alac", KeyAACBitrate: "256", KeyBitDepth: "auto", KeyCopyCodec: "same", KeyOutputRate: "keep",
+	} {
+		assert.Equal(t, want, s.Value(key), key)
+	}
+}
+
+func TestSettingsBits(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		codec mp4tag.Codec
+		depth int
+		want  int
+	}{
+		{mp4tag.CodecALAC, 0, 24},
+		{mp4tag.CodecAAC, 0, 16},
+		{mp4tag.CodecALAC, 16, 16},
+		{mp4tag.CodecAAC, 24, 24},
+		{"", 0, 16},
+	} {
+		assert.Equal(t, tc.want, Settings{Codec: tc.codec, BitDepth: tc.depth}.Bits(), "%s at %d", tc.codec, tc.depth)
+	}
+}
+
+func TestLosslessPrecedence(t *testing.T) {
+	t.Parallel()
+	f := File{
+		Codec: testutil.Ptr("aac"), AACBitrate: testutil.Ptr(128), BitDepth: testutil.Ptr(Text("16")),
+		CopyCodec: testutil.Ptr("any"), OutputRate: testutil.Ptr(Text("48000")),
+	}
+	s, err := Resolve(f, env(nil), Overrides{}, testHome)
+	require.NoError(t, err)
+	assert.Equal(t, Settings{
+		Library: s.Library, Capture: s.Capture, Device: s.Device, IdleTimeout: s.IdleTimeout, MaxFailures: s.MaxFailures,
+		Codec: mp4tag.CodecAAC, AACBitrate: 128, BitDepth: 16, CopyCodec: library.CopyAny, OutputRate: 48000,
+		Sources: s.Sources,
+	}, s)
+	for _, k := range []string{KeyCodec, KeyAACBitrate, KeyBitDepth, KeyCopyCodec, KeyOutputRate} {
+		assert.Equal(t, SourceFile, s.Sources[k], k)
+	}
+
+	e := env(map[string]string{
+		EnvCodec: "ALAC", EnvAACBitrate: "320", EnvBitDepth: "auto", EnvCopyCodec: "SAME", EnvOutputRate: "44100",
+	})
+	s, err = Resolve(f, e, Overrides{}, testHome)
+	require.NoError(t, err)
+	assert.Equal(t, mp4tag.CodecALAC, s.Codec, "env beats file, case-folded")
+	assert.Equal(t, 320, s.AACBitrate)
+	assert.Zero(t, s.BitDepth, "auto from the env overrides 16 from the file")
+	assert.Equal(t, library.CopySame, s.CopyCodec)
+	assert.Equal(t, 44100, s.OutputRate)
+	assert.Equal(t, SourceEnv, s.Sources[KeyOutputRate])
+
+	o := Overrides{
+		Codec: testutil.Ptr("aac"), AACBitrate: testutil.Ptr(64), BitDepth: testutil.Ptr("24"),
+		CopyCodec: testutil.Ptr("any"), OutputRate: testutil.Ptr("keep"),
+	}
+	s, err = Resolve(f, e, o, testHome)
+	require.NoError(t, err)
+	assert.Equal(t, mp4tag.CodecAAC, s.Codec, "a flag beats both")
+	assert.Equal(t, 64, s.AACBitrate)
+	assert.Equal(t, 24, s.Bits(), "24 bits even for AAC, when asked")
+	assert.Equal(t, library.CopyAny, s.CopyCodec)
+	assert.Zero(t, s.OutputRate)
+	assert.Equal(t, SourceFlag, s.Sources[KeyOutputRate])
+}
+
+func TestLosslessInvalidValues(t *testing.T) {
+	t.Parallel()
+	for envName, values := range map[string][]string{
+		EnvCodec:      {"mp3", "flac", "lossless"},
+		EnvAACBitrate: {"63", "321", "256k", "-1", "0"},
+		EnvBitDepth:   {"20", "32", "8", "auto-ish"},
+		EnvCopyCodec:  {"some", "never"},
+		EnvOutputRate: {"0", "7999", "768001", "44.1k", "44100.0"},
+	} {
+		for _, v := range values {
+			_, err := Resolve(File{}, env(map[string]string{envName: v}), Overrides{}, testHome)
+			require.ErrorIs(t, err, ErrInvalidValue, "%s=%q", envName, v)
+			assert.Contains(t, err.Error(), "(from env)", "%s=%q", envName, v)
+		}
+	}
+}
+
+// bit_depth and output_rate mix words and numbers: config.json may hold
+// either, and Set writes numbers as numbers.
+func TestNumberOrStringSettings(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	load := func(body string) (File, error) {
+		path := filepath.Join(dir, "config.json")
+		require.NoError(t, os.WriteFile(path, []byte(body), 0o600))
+		f, _, err := Load(path)
+		return f, err
+	}
+	for body, want := range map[string][2]int{
+		`{"bit_depth": 24, "output_rate": 44100}`:       {24, 44100},
+		`{"bit_depth": "16", "output_rate": "48000"}`:   {16, 48000},
+		`{"bit_depth": "auto", "output_rate": "keep"}`:  {0, 0},
+		`{"bit_depth": "AUTO", "output_rate": " KEEP"}`: {0, 0},
+	} {
+		f, err := load(body)
+		require.NoError(t, err, body)
+		s, err := Resolve(f, env(nil), Overrides{}, testHome)
+		require.NoError(t, err, body)
+		assert.Equal(t, want, [2]int{s.BitDepth, s.OutputRate}, body)
+	}
+	for _, body := range []string{`{"bit_depth": true}`, `{"output_rate": [44100]}`, `{"output_rate": {"hz": 1}}`} {
+		_, err := load(body)
+		require.ErrorIs(t, err, ErrDecode, body)
+		var typeErr *json.UnmarshalTypeError
+		require.ErrorAs(t, err, &typeErr, "a value of the wrong type, as encoding/json reports it: %s", body)
+	}
+
+	path := filepath.Join(dir, "set.json")
+	for key, tc := range map[string]struct{ value, stored string }{
+		KeyBitDepth:   {"24", `"bit_depth": 24`},
+		KeyOutputRate: {"44100", `"output_rate": 44100`},
+		KeyCodec:      {"AAC", `"codec": "aac"`},
+		KeyCopyCodec:  {"Any", `"copy_codec": "any"`},
+		KeyAACBitrate: {"320", `"aac_bitrate": 320`},
+	} {
+		require.NoError(t, Set(path, key, tc.value, testHome), key)
+		data, err := os.ReadFile(path)
+		require.NoError(t, err)
+		assert.Contains(t, string(data), tc.stored, key)
+	}
+	require.NoError(t, Set(path, KeyBitDepth, "auto", testHome))
+	require.NoError(t, Set(path, KeyOutputRate, "Keep", testHome))
+	data, err := os.ReadFile(path)
+	require.NoError(t, err)
+	assert.Contains(t, string(data), `"bit_depth": "auto"`)
+	assert.Contains(t, string(data), `"output_rate": "keep"`)
+	f, _, err := Load(path)
+	require.NoError(t, err)
+	s, err := Resolve(f, env(nil), Overrides{}, testHome)
+	require.NoError(t, err)
+	assert.Equal(t, mp4tag.CodecAAC, s.Codec)
+	assert.Equal(t, 16, s.Bits(), "auto again, for AAC")
+	require.ErrorIs(t, Set(path, KeyBitDepth, "20", testHome), ErrInvalidValue)
+	require.ErrorIs(t, Set(path, KeyCodec, "mp3", testHome), ErrInvalidValue)
+}
+
+func TestTextUnmarshal(t *testing.T) {
+	t.Parallel()
+	var v Text
+	require.NoError(t, json.Unmarshal([]byte(`44100`), &v))
+	assert.Equal(t, Text("44100"), v)
+	require.NoError(t, json.Unmarshal([]byte(`"keep"`), &v))
+	assert.Equal(t, Text("keep"), v)
+	for raw, kind := range map[string]string{`true`: "bool", `{}`: "object", `[1]`: "array"} {
+		var typeErr *json.UnmarshalTypeError
+		require.ErrorAs(t, v.UnmarshalJSON([]byte(raw)), &typeErr, raw)
+		assert.Equal(t, kind, typeErr.Value, raw)
+	}
+	assert.Equal(t, "nothing", jsonKind(nil))
+	assert.Equal(t, "value", jsonKind([]byte("nul")))
 }
 
 func TestEverySettingIsDescribedOnce(t *testing.T) {

@@ -1,6 +1,8 @@
 package fileutil
 
 import (
+	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"testing"
@@ -33,6 +35,43 @@ func TestWriteAtomicErrors(t *testing.T) {
 
 	missing := filepath.Join(t.TempDir(), "no", "such", "dir", "f")
 	require.Error(t, WriteAtomic(missing, []byte("x"), 0o600))
+}
+
+// writerTo writes its bytes, then fails with err.
+type writerTo struct {
+	data []byte
+	err  error
+}
+
+func (w writerTo) WriteTo(dst io.Writer) (int64, error) {
+	n, err := dst.Write(w.data)
+	if err == nil {
+		err = w.err
+	}
+	return int64(n), err
+}
+
+var errSource = errors.New("source broke")
+
+func TestWriteAtomicFrom(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "song.m4a")
+	require.NoError(t, WriteAtomicFrom(path, writerTo{data: []byte("tagged audio")}, 0o644))
+	got, err := os.ReadFile(path)
+	require.NoError(t, err)
+	assert.Equal(t, "tagged audio", string(got))
+	info, err := os.Stat(path)
+	require.NoError(t, err)
+	assert.Equal(t, os.FileMode(0o644), info.Mode().Perm())
+
+	// A source that fails halfway leaves the old file and no temp file.
+	err = WriteAtomicFrom(path, writerTo{data: []byte("half"), err: errSource}, 0o644)
+	require.ErrorIs(t, err, errSource)
+	got, err = os.ReadFile(path)
+	require.NoError(t, err)
+	assert.Equal(t, "tagged audio", string(got))
+	assertNoTemps(t, dir)
 }
 
 func TestCopyFile(t *testing.T) {

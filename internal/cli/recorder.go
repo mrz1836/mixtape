@@ -135,10 +135,15 @@ func (r *recorder) run(ctx context.Context, run *recordRun) error {
 	}
 	r.eng = eng
 
-	r.emit(engine.Event{
+	started := engine.Event{
 		Type: engine.EventSessionStarted, Mode: plan.Mode, Capture: r.state.Capture,
-		Library: s.Library, PID: os.Getpid(),
-	})
+		Library: s.Library, PID: os.Getpid(), Codec: string(s.Codec),
+	}
+	if run.source != nil {
+		f := run.source.Format()
+		started.BitDepth, started.SampleRate = s.Bits(), f.Rate
+	}
+	r.emit(started)
 	r.emit(engine.Event{Type: engine.EventPlan, Items: plan.Summary()})
 
 	runCtx, force := context.WithCancel(context.WithoutCancel(ctx))

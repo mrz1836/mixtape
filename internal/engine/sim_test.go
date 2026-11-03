@@ -20,6 +20,7 @@ import (
 
 	"github.com/mrz1836/mixtape/internal/capture"
 	"github.com/mrz1836/mixtape/internal/library"
+	"github.com/mrz1836/mixtape/internal/mp4tag"
 	"github.com/mrz1836/mixtape/internal/session"
 	"github.com/mrz1836/mixtape/internal/spotify"
 	"github.com/mrz1836/mixtape/internal/testutil"
@@ -571,9 +572,12 @@ type sim struct {
 	source  *fakeSource
 	enc     *fakeEncoder
 	lib     *library.Library
-	root    string
-	home    string
-	events  []Event
+	// codec and policy are what every reopen records and copies by.
+	codec  mp4tag.Codec
+	policy library.CopyPolicy
+	root   string
+	home   string
+	events []Event
 	// at runs scripted user actions keyed by simulated time offset.
 	at    map[time.Duration]func(*sim)
 	start time.Time
@@ -613,11 +617,20 @@ func newSim(t *testing.T, tracks ...simTrack) *sim {
 	return s
 }
 
+// recordAs reopens the library as a process that records codec and copies
+// under policy would.
+func (s *sim) recordAs(codec mp4tag.Codec, policy library.CopyPolicy) {
+	s.t.Helper()
+	s.codec, s.policy = codec, policy
+	s.reopen()
+}
+
 // reopen opens the library afresh, as a new mixtape process would.
 func (s *sim) reopen() {
 	s.t.Helper()
+	s.enc.Codec = string(s.codec) // the stand-in encodes what the library records
 	lib, err := library.Open(s.root, library.Options{
-		Encoder: s.enc, WorkDir: filepath.Join(s.home, "work"), Now: s.now,
+		Encoder: s.enc, Codec: s.codec, CopyPolicy: s.policy, WorkDir: filepath.Join(s.home, "work"), Now: s.now,
 	})
 	require.NoError(s.t, err)
 	s.lib = lib

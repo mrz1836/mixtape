@@ -15,8 +15,10 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/mrz1836/mixtape/internal/capture"
+	"github.com/mrz1836/mixtape/internal/config"
 	"github.com/mrz1836/mixtape/internal/engine"
 	"github.com/mrz1836/mixtape/internal/library"
+	"github.com/mrz1836/mixtape/internal/mp4tag"
 	"github.com/mrz1836/mixtape/internal/session"
 	"github.com/mrz1836/mixtape/internal/spotify"
 	"github.com/mrz1836/mixtape/internal/testutil"
@@ -120,12 +122,23 @@ func (h *harness) errDoc() map[string]any {
 	return v.Error
 }
 
+// seedEncoder encodes like a session with the default settings: ALAC.
+func seedEncoder() *testutil.Encoder { return &testutil.Encoder{Codec: string(config.DefaultCodec)} }
+
 // seedLibrary stores finished recordings of tracks in the collection for
-// spec, as an earlier session would have.
+// spec, as an earlier session with the default settings would have.
 func (h *harness) seedLibrary(spec library.Spec, tracks ...spotify.CatalogTrack) {
 	h.t.Helper()
+	h.seedLibraryAs(config.DefaultCodec, spec, tracks...)
+}
+
+// seedLibraryAs is seedLibrary for a session that recorded codec.
+func (h *harness) seedLibraryAs(codec mp4tag.Codec, spec library.Spec, tracks ...spotify.CatalogTrack) {
+	h.t.Helper()
 	t := h.t
-	lib, err := library.Open(h.env["MIXTAPE_LIBRARY"], library.Options{Encoder: &testutil.Encoder{}, WorkDir: t.TempDir()})
+	lib, err := library.Open(h.env["MIXTAPE_LIBRARY"], library.Options{
+		Encoder: &testutil.Encoder{Codec: string(codec)}, WorkDir: t.TempDir(),
+	})
 	require.NoError(t, err)
 	unlock, err := lib.Lock()
 	require.NoError(t, err)

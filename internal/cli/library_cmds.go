@@ -11,6 +11,7 @@ import (
 	"github.com/mrz1836/mixtape/internal/config"
 	"github.com/mrz1836/mixtape/internal/engine"
 	"github.com/mrz1836/mixtape/internal/library"
+	"github.com/mrz1836/mixtape/internal/mp4tag"
 )
 
 var errVerify = errors.New("the library has problems")
@@ -42,7 +43,9 @@ type trackDoc struct {
 	Artist     string `json:"artist,omitempty"`
 	Status     string `json:"status"`
 	Action     string `json:"next_action"`
+	Reason     string `json:"reason,omitempty"` // why next_action, when it is not the obvious one (other_codec)
 	File       string `json:"file,omitempty"`
+	Codec      string `json:"codec,omitempty"` // of the file in this folder
 	FailReason string `json:"fail_reason,omitempty"`
 }
 
@@ -147,11 +150,12 @@ func (a *app) listLink(cmd *cobra.Command, lib *library.Library, link string) er
 	for i, it := range g.Items {
 		td := trackDoc{
 			Position: i + 1, ID: it.Track.ID, Title: it.Track.Title, Artist: it.Track.Artist,
-			Status: "new", Action: string(it.Action),
+			Status: "new", Action: string(it.Action), Reason: it.Reason,
 		}
 		if g.Collection != nil {
 			if e := g.Collection.Entry(it.Track.ID); e != nil {
 				td.Status, td.File, td.FailReason = string(e.Status), e.File, e.FailReason
+				td.Codec = string(entryCodec(g.Collection, e))
 				if e.Partial {
 					td.Status = "partial"
 				}
@@ -162,18 +166,37 @@ func (a *app) listLink(cmd *cobra.Command, lib *library.Library, link string) er
 	return a.out.Result(a.linkText(doc, g.Spec.Name), doc)
 }
 
+// entryCodec is the codec of e's file: the manifest's, or, for a song
+// stored before manifests recorded it, the file's own.
+func entryCodec(c *library.Collection, e *library.Entry) mp4tag.Codec {
+	if e.Codec != "" || !e.Status.Done() {
+		return e.Codec
+	}
+	codec, _ := mp4tag.ReadCodec(c.Path(e))
+	return codec
+}
+
 // linkText renders `list LINK` for people, under the folder's name.
 func (a *app) linkText(doc listLinkDoc, folder string) string {
 	var b strings.Builder
 	b.WriteString(a.out.paint(colorBold, folder))
 	for _, td := range doc.Tracks {
 		fmt.Fprintf(&b, "\n  %3d  %-13s %s", td.Position, a.statusMark(td.Status), songLabel(td.Artist, td.Title))
+		if td.Codec != "" {
+			b.WriteString(a.out.paint(colorDim, "  ["+codecLabel(td.Codec)+"]"))
+		}
+		if td.Reason == engine.ReasonOtherCodec {
+			b.WriteString(a.out.paint(colorDim, "  (next run records it: the library has it only in another codec)"))
+		}
 		if td.FailReason != "" {
 			b.WriteString(a.out.paint(colorDim, "  ("+td.FailReason+")"))
 		}
 	}
 	return b.String()
 }
+
+// codecLabel names a codec for people: ALAC, AAC, or another tool's type.
+func codecLabel(c string) string { return strings.ToUpper(c) }
 
 // statusMark colors a song status for the terminal.
 func (a *app) statusMark(status string) string {
