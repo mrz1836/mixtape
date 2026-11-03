@@ -378,6 +378,7 @@ func TestDevicesAndSetupWithoutTerminal(t *testing.T) {
 	h := newHarness(t)
 	require.Equal(t, ExitOK, h.run("devices"))
 	doc := h.json()
+	assert.Equal(t, map[string]any{"supported": true}, doc["tap"], "the documented field names")
 	assert.Equal(t, "MacBook Pro Speakers", doc["default_output"])
 	assert.Len(t, doc["devices"], 2)
 
@@ -386,6 +387,10 @@ func TestDevicesAndSetupWithoutTerminal(t *testing.T) {
 	h.world.running = false
 	require.Equal(t, ExitNotReady, h.run("setup", "-o", "text"))
 	assert.Contains(t, h.stdout.String(), "Manual setup:")
+
+	h.world.tap = capture.TapStatus{Reason: "needs macOS 14.2 or later"}
+	require.Equal(t, ExitOK, h.run("devices"))
+	assert.Equal(t, map[string]any{"supported": false, "reason": "needs macOS 14.2 or later"}, h.json()["tap"])
 }
 
 // TestExitCodeTable checks every rule of the public exit-code contract:

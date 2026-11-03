@@ -348,7 +348,8 @@ launches it.
 ## devices
 
 `{"tap": {"supported": bool, "reason": "…"}, "default_output": "…",
-"devices": [{name, input, output, default_input, default_output}]}`.
+"devices": [{name, input, output, default_input, default_output}]}`. `reason`
+says why the tap is unsupported; it is absent when the tap is supported.
 
 ## config
 
