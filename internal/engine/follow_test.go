@@ -76,6 +76,32 @@ func TestFollowStartsPastTheLastKnownSongWhenItDidNotJustPlay(t *testing.T) {
 	assert.True(t, s.collection(playlistSpec(pl)).Done(songC.id))
 }
 
+// TestFollowMovesOnOnceFromASongPastTheListItHas covers Spotify reporting a
+// song once more after mixtape moved on from it with next, for a song past
+// the known list that the library already has: no new take of it.
+func TestFollowMovesOnOnceFromASongPastTheListItHas(t *testing.T) {
+	t.Parallel()
+	s := newSim(t, songA, songB, songC)
+	_, res := s.run(singles(songC), Options{}, nil)
+	requireComplete(t, res)
+
+	s.reopen()
+	s.resetEvents()
+	pl := s.playlist("pl0000000000000000000w", "Long", false, songA)
+	s.spotify.contexts[pl.Ref.URI()] = []string{songA.id, songC.id, songB.id}
+	s.spotify.user(func(f *fakeSpotify) { f.oldTrackOnNext = 1 })
+
+	_, res = s.run([]spotify.Collection{pl}, Options{IdleTimeout: time.Hour}, nil)
+	requireComplete(t, res)
+	assert.Equal(t, 1, res.Counts.Copied, "Charlie, past the list, is copied from Singles")
+	assert.Equal(t, 2, res.Counts.Recorded, "Alpha and Bravo")
+	assert.Zero(t, res.Counts.Discarded, "Charlie reported again is no take")
+	c := s.collection(playlistSpec(pl))
+	for _, id := range []string{songA.id, songB.id, songC.id} {
+		assert.True(t, c.Done(id), id)
+	}
+}
+
 func TestFollowEndsWhenThePlaylistDoesNotPlay(t *testing.T) {
 	t.Parallel()
 	s := newSim(t, songA)

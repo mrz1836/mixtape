@@ -81,12 +81,13 @@ type fakeSpotify struct {
 	hold     time.Duration // position frozen at 0 while it re-buffers
 	// ignorePlay makes "play track" do nothing (signed out, offline).
 	ignorePlay bool
-	// oldTrackOnPlay replays Spotify reporting the track it is leaving, as
-	// it was, for this many observations after "play track" (seen live:
-	// paused on a later album track when the session started).
-	oldTrackOnPlay int
-	oldTrack       spotify.Snapshot
-	oldTrackLeft   int
+	// oldTrackOnPlay and oldTrackOnNext replay Spotify reporting the track
+	// it is leaving, as it was, for this many observations after "play
+	// track" or "next" (seen live after play track, even paused on a later
+	// album track when the session started).
+	oldTrackOnPlay, oldTrackOnNext int
+	oldTrack                       spotify.Snapshot
+	oldTrackLeft                   int
 	// cutEarly lists tracks Spotify moves on from this long before their
 	// end without reporting a shorter duration first: a blend the duration
 	// check cannot see.
@@ -294,12 +295,7 @@ func (f *fakeSpotify) PlayTrack(_ context.Context, uri, ctxURI string) error {
 	if err := f.refused("play"); err != nil {
 		return err
 	}
-	if f.oldTrackOnPlay > 0 {
-		f.mu.Unlock()
-		f.oldTrack = f.snapshot()
-		f.mu.Lock()
-		f.oldTrackLeft = f.oldTrackOnPlay
-	}
+	f.leaving(f.oldTrackOnPlay)
 	if f.ignorePlay {
 		return nil
 	}
@@ -384,10 +380,23 @@ func (f *fakeSpotify) PlayPause(context.Context) error {
 	return nil
 }
 
+// leaving keeps the track Spotify reports now, to report it n more times
+// after a command moves it on (see oldTrackOnPlay). f.mu is held.
+func (f *fakeSpotify) leaving(n int) {
+	if n <= 0 {
+		return
+	}
+	f.mu.Unlock()
+	old := f.snapshot()
+	f.mu.Lock()
+	f.oldTrack, f.oldTrackLeft = old, n
+}
+
 func (f *fakeSpotify) Next(context.Context) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.log("next")
+	f.leaving(f.oldTrackOnNext)
 	f.pos = 0
 	f.idx++
 	f.skipUnplayable()
