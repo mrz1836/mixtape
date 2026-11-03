@@ -29,6 +29,7 @@ updates:
       semver-major-days: 14
       exclude:
         - "github.com/mrz1836/*"
+        - "golang.org/x/*"
 
   # GitHub Actions workflows
   - package-ecosystem: "github-actions"
