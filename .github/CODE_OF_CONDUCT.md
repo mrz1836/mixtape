@@ -1,6 +1,6 @@
 # 🏗️ How We Build Together
 
-Welcome to Mixtape, a small open-source command-line tool. We value good ideas, clear communication, and contributions from people who care about great code. This document sets the tone for how we collaborate.
+Welcome to our humble Go library. We value good ideas, clear communication, and contributions from people who care about great code. This document sets the tone for how we collaborate.
 
 <br/>
 

@@ -1,5 +1,5 @@
 name: Bug report
-description: Report something Mixtape got wrong (a song cut short, a wrong error, a crash)
+description: Report incorrect behavior, test failure, or unexpected output in this Go library
 title: "[Bug] <brief description of the issue>"
 labels: ["bug-P3"]
 assignees:
@@ -8,15 +8,14 @@ body:
   - type: markdown
     attributes:
       value: |
-        **⚠️ Do not include personal data.** Logs can contain your home folder path and the names of
-        your playlists; redact what you would rather not share.
+        **⚠️ Do not include secrets.** Redact API keys, tokens, passwords, and personal data from logs, queries, request/response bodies, and configuration before submitting.
 
   - type: textarea
     id: bug_description
     attributes:
-      label: What went wrong
-      description: A clear summary of the problem.
-      placeholder: The second song of the playlist was discarded with "the song did not play to its end".
+      label: Describe the bug
+      description: Provide a clear and concise summary of the problem or unexpected behavior.
+      placeholder: The custom function strips the plus sign from numbers...
     validations:
       required: true
 
@@ -24,10 +23,10 @@ body:
     id: reproduction_steps
     attributes:
       label: Steps to reproduce
-      description: The command you ran, and what Spotify was doing at the time.
+      description: Provide minimal steps or code snippets to reproduce the issue.
       placeholder: |
-        1. mixtape record https://open.spotify.com/playlist/... --mute
-        2. Spotify was paused on another song when the command started
+        1. Call package.Func("input")
+        2. Observe that the result is "input" (missing 'symbol')
     validations:
       required: true
 
@@ -35,32 +34,30 @@ body:
     id: expected_behavior
     attributes:
       label: Expected behavior
-      description: What you expected to happen instead.
-      placeholder: Every song in the playlist is recorded once, start to finish.
+      description: Describe what you expected to happen instead.
+      placeholder: I expected the result to be "symbol+input" since the plus sign is allowed.
     validations:
       required: true
 
   - type: textarea
     id: environment
     attributes:
-      label: Environment
-      description: Paste the output of these commands.
+      label: Environment details
+      description: Provide version information and your Go setup to help debug.
       placeholder: |
-        - mixtape version
-        - mixtape doctor -o json
-        - macOS version (Apple menu → About This Mac) and Spotify version (Spotify → About Spotify)
-        - capture method: tap or device (BlackHole)
-      render: text
+        - Go version: output of `go version`
+        - OS: macOS 14.5 (arm64)
+        - Library version/commit: v1.3.4 or commit 88aef9c
     validations:
-      required: true
+      required: false
 
   - type: textarea
     id: additional_context
     attributes:
-      label: Session events
-      description: |
-        The session's event log helps most: `~/.mixtape/sessions/<session-id>.ndjson`
-        (`mixtape status` names it). Rerunning with `-v` adds timing details.
-      render: text
+      label: Additional context
+      description: Add any logs, test output, or relevant code here.
+      placeholder: |
+        Output from `go test -v ./...`
+        Any relevant stack traces, links to code, or affected functions.
     validations:
       required: false

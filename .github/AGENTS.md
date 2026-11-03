@@ -46,8 +46,4 @@ Our technical standards are organized into focused, portable documents in the `.
 | `.github/tech-conventions/` | Technical conventions and standards for development     |
 | `.github/workflows/`        | GitHub Actions workflows for CI/CD                      |
 | `.vscode/`                  | VS Code settings and extensions for development         |
-| `cmd/mixtape/`              | The `mixtape` binary's entry point                      |
-| `docs/`                     | CLI reference and architecture                          |
-| `internal/`                 | All packages (see [CLAUDE.md](CLAUDE.md) for the map)   |
-| `internal/engine/testdata/` | Golden traces of real Spotify sessions                  |
-| `.` (root)                  | Module files, build and lint configuration              |
+| `.` (root)                  | Source files and tests for the local package            |

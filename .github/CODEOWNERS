@@ -16,9 +16,12 @@
 
 # Documentation files
 *.md @mrz1836
+CITATION.cff @mrz1836
 
-# Build and release
-.goreleaser.yml @mrz1836
+# Build and makefiles
+Makefile @mrz1836
+.make/*.mk @mrz1836
+*.mk @mrz1836
 
 # Go module dependencies
 go.mod @mrz1836
@@ -29,6 +32,7 @@ codecov.yml @mrz1836
 
 # Linter configuration
 .golangci.json @mrz1836
+.golangci.yml @mrz1836
 
 # AI Config Files
 .github/AGENTS.md @mrz1836
@@ -37,6 +41,7 @@ codecov.yml @mrz1836
 
 # Security and configuration files
 .github/SECURITY.md @mrz1836
+.gitleaksignore @mrz1836
 
 # Repository configuration
 .github/labels.yml @mrz1836
@@ -46,6 +51,7 @@ codecov.yml @mrz1836
 .github/tech-conventions/* @mrz1836
 
 # Devcontainer configuration
+.devcontainer/* @mrz1836
 .devcontainer.json @mrz1836
 
 # Gitpod configuration
