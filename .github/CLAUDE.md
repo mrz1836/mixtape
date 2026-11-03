@@ -121,13 +121,11 @@ The same applies repo-wide: files delivered by go-broadcast (workflows, actions,
 tech-conventions, community docs, `.vscode/`, editor configs) are edited in the
 go-broadcast source, not here.
 
-**Releases** are the one exception. GoFortress runs on Linux runners (the
-module builds and tests there), which cannot build the macOS cgo binaries, so
-`fortress.yml` has no tag trigger in this repo and
-[workflows/release.yml](workflows/release.yml) releases `v*` tags on a macOS
-runner. If go-broadcast ever syncs workflows into this repo, keep that change
-(or exclude `fortress.yml`): otherwise a tag also starts a Fortress release
-that fails on Linux.
+**Releases** go through GoFortress too. CI runs on Linux runners (the module
+builds and tests there), but the release build needs the macOS SDK for its cgo
+binaries, so `RELEASE_RUNNER=macos-15` in `90-project.env` runs the release
+job alone on macOS. On a `v*` tag, the lint, tests and security scans run first.
+The AAC tests skip on Linux, so run `magex test:race` on a Mac before tagging.
 
 <br>
 

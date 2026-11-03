@@ -470,9 +470,11 @@ Latest baseline — Apple M1 Max · darwin/arm64 · Go 1.26 · `time=2s`:
 > Local-machine numbers, not targets: compare runs on the same hardware.
 > Last measured: 2026-11-02
 
-**Releasing.** `magex version:bump bump=patch branch=master push` tags
-and pushes the release; `.github/workflows/release.yml` then tests and builds
-both macOS binaries on a macOS runner and publishes them with GoReleaser.
+**Releasing.** Run `magex test:race` on a Mac first (the AAC tests skip on
+Linux CI), then `magex version:bump bump=patch branch=master push` tags and
+pushes the release. On the tag, GoFortress runs lint, tests and security scans,
+then builds both macOS binaries on a macOS runner (`RELEASE_RUNNER` in
+`.github/env/90-project.env`) and publishes them with GoReleaser.
 From a Mac, `GITHUB_TOKEN=… goreleaser release --clean` does the same locally.
 
 </details>
