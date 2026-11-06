@@ -45,11 +45,16 @@ func (e *Engine) stopCapture() {
 }
 
 // sink receives captured blocks on the capture goroutine: it spools them
-// and tracks when audio was last above the silence floor.
+// and tracks when audio last arrived, and when it was last above the
+// silence floor.
 func (e *Engine) sink(b capture.Block) {
 	f := e.cfg.Source.Format()
+	at := int64(b.At.Sub(e.capStart))
+	if b.Frames > 0 {
+		e.heardAt.Store(max(at, 0)) // audio captured before Start was still heard
+	}
 	if capture.Peak(b.PCM[:min(len(b.PCM), b.Frames*f.BytesPerFrame())], f) > silenceFloor {
-		e.loudAt.Store(int64(b.At.Sub(e.capStart)))
+		e.loudAt.Store(at)
 	}
 	e.spoolMu.Lock()
 	defer e.spoolMu.Unlock()
@@ -175,6 +180,32 @@ func (e *Engine) checkSilence(now time.Time) {
 	}
 }
 
+// checkPlaysHere ends the session when Spotify plays a song for
+// playsHereWindow while the process tap receives no audio at all. The tap's
+// aggregate device runs only while Spotify sends sound on this Mac, so its
+// audio stops the moment Spotify plays on another device (Spotify Connect),
+// and every song after would play there unrecorded (at full volume, with
+// --mute). A tap that hears Spotify but only silence still receives audio:
+// that is checkSilence's case. A capture device receives audio whatever
+// Spotify does, so this is the tap's alone.
+func (e *Engine) checkPlaysHere(now time.Time) {
+	t := e.cur
+	if t == nil || !t.recording || e.last.State != spotify.StatePlaying ||
+		e.cfg.Source == nil || e.cfg.Source.Method() != capture.MethodTap {
+		return
+	}
+	quietSince := t.startedAt
+	if heard := e.heardAt.Load(); heard >= 0 {
+		if at := e.capStart.Add(time.Duration(heard)); at.After(quietSince) {
+			quietSince = at
+		}
+	}
+	if now.Sub(quietSince) < playsHereWindow || !advanced(t, quietSince, playsHereWindow) {
+		return
+	}
+	e.fail(ErrPlaysElsewhere)
+}
+
 // advanced reports whether playback position moved at least d since t0.
 func advanced(t *take, t0 time.Time, d time.Duration) bool {
 	first, last := -1.0, -1.0
@@ -214,7 +245,9 @@ func (e *Engine) pruneSpool() {
 }
 
 // setupSpotify saves the player settings, then turns shuffle off (and
-// repeat on to follow a playlist, and the volume up when recording muted).
+// repeat on to follow a playlist). The volume a muted session records at
+// is saved too, but raised only once the tap hears Spotify on this Mac
+// (raiseMutedVolume).
 func (e *Engine) setupSpotify(ctx context.Context) error {
 	snap := e.cfg.Player.Poll(ctx)
 	if snap.Err != nil {
@@ -251,9 +284,46 @@ func (e *Engine) setupSpotify(ctx context.Context) error {
 		e.command(ctx, "repeat", func(c context.Context) error { return e.cfg.Player.SetRepeat(c, *v) })
 	}
 	if v := st.Set.Volume; v != nil {
-		e.command(ctx, "volume", func(c context.Context) error { return e.cfg.Player.SetVolume(c, *v) })
+		if e.opts.Mute && snap.Volume != *v {
+			e.muteVolume = v
+		} else {
+			e.command(ctx, "volume", func(c context.Context) error { return e.cfg.Player.SetVolume(c, *v) })
+		}
 	}
 	return nil
+}
+
+// raiseMutedVolume turns Spotify up to the volume a muted session records
+// at, once the tap has heard Spotify on this Mac: only then is Spotify
+// muted on the speakers. Raised any earlier, Spotify Connect would play
+// the songs at that volume on a speaker elsewhere, where the tap neither
+// hears nor mutes them (checkPlaysHere then ends the session).
+//
+// The audio heard so far is at the old volume, and it may be the start of
+// a song mixtape records: the one recording, which is let go and started
+// over from the top in a fresh take (no attempt), or one requested or
+// followed that Spotify has begun before mixtape saw it, which is started
+// over in place (a take that began meanwhile restarts as a false start).
+func (e *Engine) raiseMutedVolume(ctx context.Context) {
+	v := e.muteVolume
+	if v == nil || e.stopping || e.heardAt.Load() < 0 {
+		return
+	}
+	e.muteVolume = nil
+	e.command(ctx, "volume", func(c context.Context) error { return e.cfg.Player.SetVolume(c, *v) })
+	switch t := e.cur; {
+	case t != nil && t.ad:
+		return // an ad plays: the song after it starts at the new volume
+	case t != nil && t.recording:
+		it := t.item
+		e.abandon()
+		e.restartFromTop(ctx, it, e.now())
+	case e.waiting != nil || (e.follow != nil && e.follow.active):
+		e.command(ctx, "restart", func(c context.Context) error { return e.cfg.Player.SetPosition(c, 0) })
+	default:
+		return // nothing mixtape records has begun
+	}
+	e.restartedAt = e.now()
 }
 
 // restoreSpotify puts back the settings the session changed.

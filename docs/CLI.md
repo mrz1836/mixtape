@@ -55,7 +55,7 @@ failure, one error document. In text mode errors read
 | 0 | | Success: complete, or stopped on request |
 | 1 | `error` | General error (also: `verify` found problems) |
 | 2 | `usage` | Wrong command line: unknown flag or command, bad link, invalid setting |
-| 3 | `not_ready` | A prerequisite is missing: Spotify not running, crossfade on, capture not routed or silent, no sound reaching mixtape, songs not starting in Spotify |
+| 3 | `not_ready` | A prerequisite is missing: Spotify not running, crossfade on, capture not routed or silent, Spotify playing on another device, no sound reaching mixtape, songs not starting in Spotify |
 | 4 | `not_found` | A link Spotify does not know, or no session |
 | 5 | `permission` | macOS refused: Automation or audio-capture permission, a library that cannot be written (also mid-session), update refused |
 | 6 | `busy` | Another recording session (or library writer) holds the lock |
@@ -107,7 +107,7 @@ always agree.
 | `--artwork` | Embed album artwork (one image download per song) |
 | `--capture auto\|tap\|device` | Capture method |
 | `--device NAME` | Capture device (substring) for `--capture device` |
-| `--mute` | Tap only: silence Spotify on the speakers while recording (volume raised to 100 meanwhile) |
+| `--mute` | Tap only: silence Spotify on the speakers while recording (volume raised to 100 meanwhile, once Spotify is heard playing on this Mac; a song caught at the old volume starts over) |
 | `--idle-timeout D` | End after D with nothing to record (default 10m; 0 = never) |
 | `--max-failures N` | End after N failed attempts in a row; a song is tried twice (default 3; 0 = never) |
 | `--allow-crossfade` | Record even though crossfade or automix is on (songs will overlap) |
@@ -144,8 +144,10 @@ mixtape` (Spotify plays on another device or is muted; exit 3), `the songs
 keep not starting in Spotify` (signed out or offline; exit 3), or `the
 songs keep failing` (mixed causes; exit 7). A library that cannot take a
 file (an unplugged drive, a full disk) ends the session at once (exit 5), as
-does audio that cannot be buffered to disk (exit 1). Songs not saved stay
-pending for the next run.
+does audio that cannot be buffered to disk (exit 1). With the process tap,
+Spotify playing on another device (Spotify Connect) ends it within about 3 s
+of playback: `spotify is playing on another device, not on this Mac` (exit
+3). Songs not saved stay pending for the next run.
 
 **Keys and signals.** On a terminal: `space` pause/resume, `n` skip the song
 (not retried), `q` quit; Ctrl-C quits after the current song is settled, a

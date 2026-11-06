@@ -174,14 +174,18 @@ matter:
   Mixtape stops (exit 3) when it sees either.
 - **Volume at maximum:** recordings are made at Spotify's own volume slider
   (the Mac's volume does not matter). With the process tap, `--mute` does
-  this for you and silences the speakers while it records.
+  this for you and silences the speakers while it records. It turns Spotify
+  up only once it hears Spotify playing on this Mac, so a speaker Spotify is
+  casting to is never turned up.
 - **Streaming quality as high as your account allows:** Settings → Audio
   quality → *Streaming quality* (*Lossless* where your plan has it).
   *Automatic* can drop the quality mid-song on a slow connection.
 - **Normalize volume and the equalizer:** both change the sound that is
   recorded. Turn them off to keep each song as it was mastered.
-- **Play on this Mac:** with Spotify Connect playing on another device, no
-  sound reaches Mixtape.
+- **Play on this Mac:** with Spotify Connect playing on another device (a
+  speaker, a TV), no sound reaches Mixtape, and `--mute` cannot silence that
+  device. With the process tap, Mixtape stops within about 3 seconds and says
+  so (exit 3).
 
 ### 2. Record
 
@@ -412,6 +416,7 @@ set artwork true`).
 | `spotify crossfade is on` or `crossfade appears to be on` (exit 3) | Spotify → Settings → Playback → turn off *Crossfade songs* and *Automix*. Newer Spotify versions keep crossfade where it cannot be read, so Mixtape also detects it from playback. `--allow-crossfade` records anyway (songs will overlap). |
 | `… may not record system audio yet` or `the process tap is silent` (exit 5) | Run `mixtape setup`, or add your terminal app under *System Audio Recording Only* (see above; not the screen-recording list). If it is already there, quit and reopen the terminal app. Or use `--capture device`. |
 | `the capture device is silent` (exit 3) | Select the Multi-Output Device (with BlackHole) as the Mac's sound output. |
+| `spotify is playing on another device, not on this Mac` (exit 3) | Spotify Connect is casting to a speaker, a TV or a phone: click the speaker icon at the bottom right of Spotify and choose this computer. |
 | `spotify is playing, but no sound reaches mixtape` or `songs keep playing without any sound reaching mixtape` (exit 3) | Spotify is playing somewhere else: click the speaker icon at the bottom right of Spotify and choose this Mac. Also check that Spotify's own volume is not at 0. |
 | `the songs keep not starting in Spotify` (exit 3) | Check that Spotify is signed in and online, and that a song plays when you click it. |
 | `could not save the recording` (exit 5) | The library folder is gone or full: reconnect the drive or free some space, then run the same command again. Songs not saved stay pending. |

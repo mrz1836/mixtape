@@ -82,6 +82,9 @@ type fakeSpotify struct {
 	hold     time.Duration // position frozen at 0 while it re-buffers
 	// ignorePlay makes "play track" do nothing (signed out, offline).
 	ignorePlay bool
+	// elsewhere plays on another device (Spotify Connect): Spotify reports
+	// playback as usual, but this Mac sends no sound.
+	elsewhere bool
 	// oldTrackOnPlay and oldTrackOnNext replay Spotify reporting the track
 	// it is leaving, as it was, for this many observations after "play
 	// track" or "next" (seen live after play track, even paused on a later
@@ -461,6 +464,10 @@ type fakeSource struct {
 	bits   int // capture depth, as Format reports it: 0 (16), 16 or 24
 	// method is the backend it poses as ("" is a capture device).
 	method capture.Method
+	// autostart delivers audio only while Spotify plays on this Mac, as the
+	// process tap does (its aggregate device starts IO with Spotify's
+	// output); otherwise audio arrives all the time, as from a device.
+	autostart bool
 	// startErr makes Start fail.
 	startErr error
 }
@@ -734,10 +741,15 @@ func (s *sim) drive(ctx context.Context, done <-chan struct{}, eng *Engine) {
 		}
 		s.spotify.mu.Lock()
 		_, ok := s.spotify.current()
-		loud := ok && s.spotify.playing
+		here := ok && s.spotify.playing && !s.spotify.elsewhere
 		s.spotify.mu.Unlock()
 		s.spotify.advance(stepDur)
-		s.source.emit(int(stepDur.Seconds()*float64(s.source.Format().Rate)), now.Add(-stepDur), loud)
+		s.source.mu.Lock()
+		autostart := s.source.autostart
+		s.source.mu.Unlock()
+		if here || !autostart {
+			s.source.emit(int(stepDur.Seconds()*float64(s.source.Format().Rate)), now.Add(-stepDur), here)
+		}
 
 		sincePoll += stepDur
 		if sincePoll < pollDur {

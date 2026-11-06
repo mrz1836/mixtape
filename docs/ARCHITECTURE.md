@@ -248,6 +248,19 @@ goes somewhere else (Spotify Connect, a muted Spotify), and the error says
 so (exit 3). After the first audible sample, silence only invalidates the
 song it falls in.
 
+**Spotify on another device.** The tap's aggregate device runs IO only while
+Spotify sends sound on this Mac: Core Audio registers it as an autostart
+context of the tap. So while Spotify Connect casts to a speaker, the tap
+receives no audio at all, not even silence. Seen live on macOS 15.8 with
+Spotify 1.3.6: Core Audio never started the tap's IO (or the speakers')
+while Spotify reported the song playing. When a recording song's position
+advances 3 s (`playsHereWindow`) with no audio arriving, the session ends at
+once (exit 3), well before the 10 s watchdog: every later song would play
+there too, at full volume with `--mute`. Audio reaches the tap within
+milliseconds of Spotify's output, and Spotify's position runs at most ~0.6 s
+ahead of its sound, so 3 s leaves a wide margin. A capture device receives
+audio whatever Spotify does: only its silence tells.
+
 **Failures in a row.** Each attempt that cannot be recorded for a reason
 outside mixtape's and the listener's control is a setback: a silent take, a
 request Spotify does not start, a cut-short take, a failed render. A skip, a
@@ -288,8 +301,14 @@ For each song to record, in order:
 - A pause the user makes mid-song is respected: nothing is steered until
   playback resumes.
 
-Shuffle is turned off for the session. Spotify is paused when the queue is
-done. Every setting changed is saved to `session.json` first and restored at
+Shuffle is turned off for the session. With `--mute` the volume is raised to
+100 too, but only once the tap has heard Spotify on this Mac, which is when
+the tap mutes it. Raised earlier, a song Spotify Connect casts to a speaker
+would play there at full volume. The audio heard before the raise is at the
+old volume, so the song it may belong to (the one recording, or one just
+requested that Spotify began before mixtape saw it) is started over from the
+top, which is no attempt; observations taken before that restart are
+dropped as stale. Spotify is paused when the queue is done. Every setting changed is saved to `session.json` first and restored at
 the end, but only where Spotify still holds the value mixtape set; a crashed
 session's changes are restored by the next `record` (any `record`, even one
 that only copies). When they cannot be put back yet (Spotify is closed, or

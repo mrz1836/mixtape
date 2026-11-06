@@ -164,6 +164,11 @@ func rules() []rule {
 			"route Spotify's output to the capture device with a Multi-Output Device (see 'mixtape setup'), " +
 				"and check that Spotify plays on this Mac, not on another device",
 		},
+		{
+			engine.ErrPlaysElsewhere, ExitNotReady,
+			"in Spotify, click the speaker icon at the bottom right and choose this computer: " +
+				"Spotify Connect is playing on another device (a speaker, a TV, a phone)",
+		},
 		{errTapHearsNothing, ExitNotReady, hintNoSound},
 		{engine.ErrNoSound, ExitNotReady, hintNoSound},
 		{

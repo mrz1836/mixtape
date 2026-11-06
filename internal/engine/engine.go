@@ -56,6 +56,11 @@ var (
 	// ErrSilentTap reports that the process tap delivered only silence
 	// while Spotify played: macOS has not granted audio-capture permission.
 	ErrSilentTap = errors.New("the process tap is silent while Spotify plays")
+	// ErrPlaysElsewhere reports that Spotify played while the process tap
+	// received no audio at all. The tap runs only while Spotify sends sound
+	// on this Mac, so Spotify plays on another device (Spotify Connect),
+	// where nothing mixtape does can record or mute it.
+	ErrPlaysElsewhere = errors.New("spotify is playing on another device, not on this Mac: no sound from it reaches mixtape")
 	// ErrCaptureStopped reports that audio capture died mid-session.
 	ErrCaptureStopped = errors.New("audio capture stopped")
 	// ErrSpotifyGone reports that Spotify stayed unreachable.
@@ -83,7 +88,9 @@ type Options struct {
 	KeepWAV     bool
 	Artwork     bool
 	// Mute is set when the tap records muted; the volume is raised to 100
-	// for the session so the recording is not quiet.
+	// for the session so the recording is not quiet. It is raised only once
+	// the tap hears Spotify on this Mac, and so mutes it: before that,
+	// Spotify Connect could be playing on a speaker elsewhere.
 	Mute bool
 	// Limit ends the session after this many songs are recorded (0: none).
 	Limit int
@@ -153,7 +160,8 @@ const (
 	defaultStartTimeout = 15 * time.Second
 	maxTakes            = 2 // a song is tried at most this often
 	silenceWindow       = 10 * time.Second
-	silenceFloor        = 64 // |sample| at or below this, in 16-bit units at any depth (capture.Peak), counts as silence
+	playsHereWindow     = 3 * time.Second // a tap that receives nothing for this long of playback: Spotify plays elsewhere
+	silenceFloor        = 64              // |sample| at or below this, in 16-bit units at any depth (capture.Peak), counts as silence
 	spotifyGoneAfter    = time.Minute
 	audioWait           = 3 * time.Second // how long a finished song waits for its trailing audio
 	tickEvery           = 500 * time.Millisecond
@@ -192,10 +200,11 @@ type captureState struct {
 	spool    *spool.Spool // guarded by spoolMu
 	spoolErr error        // the first spool write error (guarded by spoolMu)
 	// capStart is when capture began (set before it starts); loudAt is the
-	// offset from it of the last block above the silence floor (−1 before
-	// any).
+	// offset from it of the last block above the silence floor, and heardAt
+	// that of the last block of any level (both −1 before any).
 	capStart time.Time
 	loudAt   atomic.Int64
+	heardAt  atomic.Int64
 }
 
 // workerState connects the engine goroutine to the library worker.
@@ -225,6 +234,9 @@ type takeState struct {
 	// earlyEnds holds how early (seconds before their end) consecutive
 	// songs changed on their own, to recognize crossfade.
 	earlyEnds []float64
+	// restartedAt is when raiseMutedVolume last started the song over:
+	// observations taken until then show the position before the restart.
+	restartedAt time.Time
 }
 
 // sessionState is the engine goroutine's account of the session.
@@ -236,12 +248,16 @@ type sessionState struct {
 	streak       []setbackKind
 	lastSetback  string
 	spotifyState session.SpotifyState
-	counts       session.Counts
-	recorded     int
-	lastActive   time.Time
-	lastTick     time.Time
-	goneSince    time.Time
-	warned       map[string]bool
+	// muteVolume is the volume a muted session raises Spotify to once the
+	// tap hears it on this Mac (see raiseMutedVolume); nil when nothing
+	// waits.
+	muteVolume *int
+	counts     session.Counts
+	recorded   int
+	lastActive time.Time
+	lastTick   time.Time
+	goneSince  time.Time
+	warned     map[string]bool
 }
 
 // New validates cfg and returns an engine.
@@ -271,6 +287,7 @@ func New(cfg Config) (*Engine, error) {
 		sessionState: sessionState{warned: map[string]bool{}},
 	}
 	e.loudAt.Store(-1)
+	e.heardAt.Store(-1)
 	return e, nil
 }
 
@@ -350,6 +367,7 @@ func (e *Engine) loop(ctx context.Context, controls <-chan Control) {
 				e.fail(ErrSpotifyGone)
 				continue
 			}
+			e.raiseMutedVolume(ctx)
 			e.onSnapshot(ctx, s)
 		case ev, ok := <-events:
 			if !ok {
@@ -366,6 +384,7 @@ func (e *Engine) loop(ctx context.Context, controls <-chan Control) {
 		case r := <-e.results:
 			e.onResult(ctx, r)
 		case <-tick.C:
+			e.raiseMutedVolume(ctx)
 			e.onTick(ctx)
 		}
 		e.updateProgress()
@@ -427,6 +446,7 @@ func (e *Engine) onTick(ctx context.Context) {
 	e.lastTick = now
 	e.checkSpool()
 	e.finalizeReady(false)
+	e.checkPlaysHere(now)
 	e.checkSilence(now)
 	e.pruneSpool()
 	if e.stopping {

@@ -83,6 +83,9 @@ func (e *Engine) onSnapshot(ctx context.Context, s spotify.Snapshot) {
 		e.onPlayerError(s)
 		return
 	}
+	if !e.restartedAt.IsZero() && !s.At.After(e.restartedAt) {
+		return // taken before mixtape started the song over: its position is stale
+	}
 	t := e.cur
 	if t == nil || s.Track.URI == t.key {
 		e.pending = nil

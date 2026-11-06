@@ -5,6 +5,8 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -118,6 +120,88 @@ func TestSilentTapEndsTheSessionAsMissingPermission(t *testing.T) {
 	_, res := s.run(singles(long), Options{}, nil)
 	require.ErrorIs(t, res.Err, ErrSilentTap, "a silent tap means macOS withholds the audio")
 	assert.Equal(t, OutcomeIncomplete, res.Outcome)
+}
+
+// tapSim is a session whose capture behaves like the process tap: audio
+// arrives only while Spotify plays on this Mac.
+func tapSim(t *testing.T, tracks ...simTrack) *sim {
+	t.Helper()
+	s := newSim(t, tracks...)
+	s.source.method, s.source.autostart = capture.MethodTap, true
+	return s
+}
+
+func TestSpotifyPlayingOnAnotherDeviceEndsATapSessionAtOnce(t *testing.T) {
+	t.Parallel()
+	long := longSong("0000000000000000000eee", 30*time.Second)
+	s := tapSim(t, long)
+	s.spotify.elsewhere = true // Spotify Connect: a speaker plays it, this Mac sends nothing
+
+	_, res := s.run(singles(long), Options{}, nil)
+	require.ErrorIs(t, res.Err, ErrPlaysElsewhere)
+	assert.Equal(t, OutcomeIncomplete, res.Outcome)
+	assert.Equal(t, 1, res.Counts.Remaining, "the song stays pending for the next run")
+	discarded := s.eventsOf(EventTrackDiscarded)
+	require.Len(t, discarded, 1)
+	assert.Less(t, discarded[0].Time.Sub(s.start), silenceWindow, "it ends long before the silence watchdog would")
+	cmds := s.spotify.Commands()
+	assert.Equal(t, "pause", cmds[len(cmds)-1], "the other device is paused, not left playing")
+}
+
+func TestCaptureDeviceStillHearsSilenceWhenSpotifyPlaysElsewhere(t *testing.T) {
+	t.Parallel()
+	long := longSong("0000000000000000000ddd", 30*time.Second)
+	s := newSim(t, long)
+	s.spotify.elsewhere = true // a device receives audio regardless: only its silence tells
+
+	_, res := s.run(singles(long), Options{}, nil)
+	require.ErrorIs(t, res.Err, ErrSilentDevice)
+}
+
+func TestMuteRaisesTheVolumeOnlyOnceSpotifyIsHeardOnThisMac(t *testing.T) {
+	t.Parallel()
+	s := tapSim(t, songA) // the volume at 50
+
+	_, res := s.run(singles(songA), Options{Mute: true}, nil)
+	requireComplete(t, res)
+	assert.Equal(t, 1, res.Counts.Recorded)
+	assert.Empty(t, s.eventsOf(EventTrackDiscarded), "the take at the old volume is let go, not discarded")
+	saved := s.eventsOf(EventTrackSaved)
+	require.Len(t, saved, 1)
+	assert.Equal(t, 1, saved[0].Track.Attempt, "the restart is no attempt")
+	cmds := s.spotify.Commands()
+	play := slices.IndexFunc(cmds, func(c string) bool { return strings.HasPrefix(c, "play ") })
+	volume, seek := slices.Index(cmds, "volume"), slices.Index(cmds, "seek")
+	assert.True(t, play >= 0 && volume > play && seek > volume,
+		"played, heard on this Mac, turned up, then started over from the top: %v", cmds)
+	assert.Equal(t, 50, s.spotify.volume, "the volume is put back at the end")
+}
+
+func TestMuteTurnsUpWithoutARestartWhenSpotifyIsHeardBeforeTheFirstSong(t *testing.T) {
+	t.Parallel()
+	s := tapSim(t, songA, songB)
+	// The listener's music already plays on this Mac: the tap hears it at once.
+	s.spotify.queue, s.spotify.idx, s.spotify.playing = []string{songB.id}, 0, true
+
+	_, res := s.run(singles(songA), Options{Mute: true}, nil)
+	requireComplete(t, res)
+	cmds := s.spotify.Commands()
+	play := slices.IndexFunc(cmds, func(c string) bool { return strings.HasPrefix(c, "play ") })
+	volume := slices.Index(cmds, "volume")
+	assert.True(t, volume >= 0 && volume < play, "turned up before the first song: %v", cmds)
+	assert.NotContains(t, cmds, "seek", "nothing recorded at the old volume, so nothing starts over")
+}
+
+func TestMuteNeverTurnsUpSpotifyPlayingOnAnotherDevice(t *testing.T) {
+	t.Parallel()
+	long := longSong("0000000000000000000mmm", 30*time.Second)
+	s := tapSim(t, long)
+	s.spotify.elsewhere = true // casting to a speaker, which --mute cannot silence
+
+	_, res := s.run(singles(long), Options{Mute: true}, nil)
+	require.ErrorIs(t, res.Err, ErrPlaysElsewhere)
+	assert.NotContains(t, s.spotify.Commands(), "volume", "the speaker keeps the listener's volume")
+	assert.Equal(t, 50, s.spotify.volume)
 }
 
 func TestPeakCountsNegativeSamplesByTheirMagnitude(t *testing.T) {
