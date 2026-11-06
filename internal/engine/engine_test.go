@@ -669,6 +669,33 @@ func TestTransitionalSnapshotIsIgnored(t *testing.T) {
 	assert.False(t, e.transitional(glitch))
 }
 
+func TestNextSongsDurationAtATrackChangeIsNotTaken(t *testing.T) {
+	t.Parallel()
+	// Seen live on an album: right before a change, Spotify reported the
+	// next song's duration under the playing song's URI and title. A longer
+	// next song made the playing one look cut short (discarded); a shorter
+	// one, by a crossfade's few seconds, would end the session as crossfade.
+	one := simTrack{id: "0000000000000000000t01", name: "One", artist: "X", dur: 6 * time.Second}
+	two := simTrack{id: "0000000000000000000t02", name: "Two", artist: "X", dur: 10 * time.Second}
+	three := simTrack{id: "0000000000000000000t03", name: "Three", artist: "X", dur: 7 * time.Second}
+	s := newSim(t, one, two, three)
+	s.spotify.nextDurEarly = 2 * pollDur
+	pl := s.playlist("pl0000000000000000000t", "Torn", true, one, two, three)
+
+	_, res := s.run([]spotify.Collection{pl}, Options{}, nil)
+	requireComplete(t, res)
+	assert.Equal(t, 3, res.Counts.Recorded)
+	assert.Empty(t, s.eventsOf(EventTrackDiscarded))
+	saved := s.eventsOf(EventTrackSaved)
+	require.Len(t, saved, 3)
+	for i, song := range []simTrack{one, two, three} {
+		got := saved[i].Track
+		assert.Equal(t, song.dur.Milliseconds(), got.DurationMS, "%s keeps its own duration", song.name)
+		assert.InDelta(t, song.dur.Milliseconds(), got.RecordedMS, float64(pollDur.Milliseconds()),
+			"%s is cut to its own length, not the next song's", song.name)
+	}
+}
+
 func TestFalseStartIsNotAFailedAttempt(t *testing.T) {
 	t.Parallel()
 	s := newSim(t, songA, songB)

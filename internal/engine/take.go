@@ -38,6 +38,10 @@ type take struct {
 	announced bool
 	// silent: the song played on while capture heard nothing.
 	silent bool
+	// newDur is a duration Spotify reported that differs from the track's,
+	// first seen at newDurAt; it is taken once it holds (see refineDuration).
+	newDur   time.Duration
+	newDurAt time.Time
 }
 
 func (t *take) lastPos() float64 {
@@ -280,15 +284,31 @@ const (
 )
 
 // refineDuration follows Spotify's updates to the current song's duration.
+// A new duration counts once Spotify reports it for blipWindow: right
+// before a track change, Spotify can report the next song's duration under
+// the playing song's URI and title for a poll or two, and taking it would
+// judge the song by another's length.
+//
 // A song that shrinks by a few seconds right after it starts is Spotify
 // trimming it for crossfade, which would overlap every song: unless
 // crossfade was allowed, the session ends at once.
 func (e *Engine) refineDuration(s spotify.Snapshot) {
 	t := e.cur
 	d := s.Track.Duration
-	if d <= 0 || d == t.track.Duration || s.State != spotify.StatePlaying {
+	if d <= 0 || s.State != spotify.StatePlaying {
 		return
 	}
+	switch {
+	case d == t.track.Duration:
+		t.newDur = 0 // the change did not hold
+		return
+	case d != t.newDur:
+		t.newDur, t.newDurAt = d, s.At
+		return
+	case s.At.Sub(t.newDurAt) < blipWindow:
+		return
+	}
+	t.newDur = 0
 	shrink := t.track.Duration - d
 	if shrink >= crossfadeShrinkMin && shrink <= crossfadeMax && !e.opts.AllowCrossfade && !t.ad {
 		e.fail(fmt.Errorf("%w (Spotify shortened %q by %.1fs to blend it into the next song)",

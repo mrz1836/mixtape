@@ -58,6 +58,10 @@ type fakeSpotify struct {
 	pos       time.Duration
 	playing   bool
 	crossfade time.Duration // change to the next track this long before the end
+	// nextDurEarly replays Spotify reporting the next track's duration this
+	// long before it changes to it, under the playing track's URI and title
+	// (its snapshot fields are read one by one, so a change can tear it).
+	nextDurEarly time.Duration
 	// startGlitch replays Spotify's habit of starting a freshly played song
 	// over about 0.2 s in; glitched is set once it happened for this play.
 	startGlitch, glitched bool
@@ -242,6 +246,9 @@ func (f *fakeSpotify) snapshot() spotify.Snapshot {
 		dur := t.dur
 		if f.crossfade > 0 && f.pos > time.Second {
 			dur -= f.crossfade // like Spotify: the duration shrinks once playback settles
+		}
+		if f.nextDurEarly > 0 && !blip && f.idx+1 < len(f.queue) && f.pos >= t.dur-f.nextDurEarly {
+			dur = f.tracks[f.queue[f.idx+1]].dur // torn: the next song's duration, this song's URI
 		}
 		s.Track = spotify.Track{
 			ID: t.id, URI: spotify.TrackURI(t.id), Name: t.name, Artist: t.artist, Duration: dur,
